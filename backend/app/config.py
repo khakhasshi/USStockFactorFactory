@@ -95,8 +95,8 @@ DEFAULT_MINER_TEMPLATE = {
 
 # ---- 新版引擎配置 (B组: 高预算 + 多种子) ----
 DEFAULT_ENGINE_CONFIG_V2 = {
-    "inner_budget_per_outer_step": 50,    # P0: 10→50, 压噪声
-    "n_seeds_per_candidate": 3,            # 每个候选跑 3 seeds
+    "inner_budget_per_outer_step": 20,    # 快速验证: 20 (完整实验: 50)
+    "n_seeds_per_candidate": 2,            # 快速验证: 2 (完整实验: 3)
     "outer_accept_p_value": 0.10,          # 配对 t 检验接受阈值
     "incumbent_remeasure_every": 3,        # 每 3 步重测在位者
     "incumbent_remeasure_budget": 30,      # 重测时用 30 次评估 (节省算力)

@@ -6,6 +6,7 @@
 - 无 LLM 时回退随机 (系统可无钥运行)
 """
 
+import json
 import logging
 import random
 from copy import deepcopy
@@ -66,7 +67,9 @@ def validate_template(template: dict) -> str | None:
 
 
 def clamp_template(raw: dict, base: dict | None = None) -> dict:
-    """将 LLM 输出合并到基础模板, 做安全裁剪。"""
+    """将 LLM 输出合并到基础模板, 做安全裁剪。自动修复 LLM 的类型错误 (字符串→dict/list)。"""
+    import ast as _ast
+
     base = deepcopy(base or DEFAULT_MINER_TEMPLATE)
     for key in READONLY_KEYS:
         raw.pop(key, None)
@@ -81,30 +84,48 @@ def clamp_template(raw: dict, base: dict | None = None) -> dict:
         if key in raw and isinstance(raw[key], str) and len(raw[key]) > 20:
             base[key] = raw[key][:3000]  # 长度限制
 
-    # 评分权重: 允许微调, 边界约束
-    if "scoring_weights" in raw and isinstance(raw["scoring_weights"], dict):
+    # 评分权重: LLM 可能返回字符串, 自动修复
+    if "scoring_weights" in raw:
         sw = raw["scoring_weights"]
-        base["scoring_weights"] = {
-            "icir_weight": max(0.1, min(0.8, float(sw.get("icir_weight", 0.45)))),
-            "consistency_weight": max(0.05, min(0.5, float(sw.get("consistency_weight", 0.25)))),
-            "turnover_weight": max(0.1, min(0.7, float(sw.get("turnover_weight", 0.30)))),
-        }
+        if isinstance(sw, str):
+            try:
+                sw = json.loads(sw)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    sw = _ast.literal_eval(sw)
+                except (ValueError, SyntaxError):
+                    sw = None
+        if isinstance(sw, dict):
+            base["scoring_weights"] = {
+                "icir_weight": max(0.1, min(0.8, float(sw.get("icir_weight", 0.45)))),
+                "consistency_weight": max(0.05, min(0.5, float(sw.get("consistency_weight", 0.25)))),
+                "turnover_weight": max(0.1, min(0.7, float(sw.get("turnover_weight", 0.30)))),
+            }
 
-    # DSL 模板: 允许替换, 数量限制
-    if "dsl_exploration_templates" in raw and isinstance(raw["dsl_exploration_templates"], list):
-        templates = []
-        for t in raw["dsl_exploration_templates"]:
-            if isinstance(t, str) and 5 < len(t) < 200:
-                # 安全检查
-                safe = True
-                for word in FORBIDDEN_WORDS:
-                    if word.lower() in t.lower():
-                        safe = False
-                        break
-                if safe:
-                    templates.append(t)
-        if len(templates) >= 3:
-            base["dsl_exploration_templates"] = templates[:15]
+    # DSL 模板: LLM 可能返回字符串, 自动修复
+    if "dsl_exploration_templates" in raw:
+        tpls = raw["dsl_exploration_templates"]
+        if isinstance(tpls, str):
+            try:
+                tpls = json.loads(tpls)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    tpls = _ast.literal_eval(tpls)
+                except (ValueError, SyntaxError):
+                    tpls = None
+        if isinstance(tpls, list):
+            templates = []
+            for t in tpls:
+                if isinstance(t, str) and 5 < len(t) < 200:
+                    safe = True
+                    for word in FORBIDDEN_WORDS:
+                        if word.lower() in t.lower():
+                            safe = False
+                            break
+                    if safe:
+                        templates.append(t)
+            if len(templates) >= 2:
+                base["dsl_exploration_templates"] = templates[:15]
 
     # 微调参数 (允许小幅调整)
     if "min_public_icir" in raw:
@@ -214,14 +235,18 @@ async def propose_template(
                 f"3)指令是否足够具体 4)是否缺少多样性约束。"
             )
 
+            logger.info("外层 LLM 调用中...")
             text = await llm.chat(provider, _SYSTEM_V2, user, 0.7)
+            logger.info("外层 LLM 返回 %d 字符", len(text))
             data = llm.extract_json(text)
 
             changed = data.get("changed_fields", [])
             if not changed:
+                logger.info("外层 LLM 判定无需改动")
                 return deepcopy(incumbent_template), "外层 LLM 判定无需改动", "llm"
 
             raw_updates = data.get("template", {})
+            logger.info("外层 LLM 拟改动 %d 个字段: %s", len(raw_updates), list(raw_updates.keys())[:10])
             new_template = clamp_template(raw_updates, incumbent_template)
             note = str(data.get("note", ""))[:300]
 
@@ -231,10 +256,17 @@ async def propose_template(
                 logger.warning("外层模板安全检查拒绝: %s", err)
                 return deepcopy(incumbent_template), f"安全检查拒绝: {err}", "llm_rejected"
 
+            # 检查实质改动
+            changed_keys = [k for k in new_template if new_template.get(k) != incumbent_template.get(k)]
+            if changed_keys:
+                logger.info("外层模板实质改动 %d 个字段: %s", len(changed_keys), changed_keys)
+            else:
+                logger.warning("外层模板无实质改动 (LLM返回了changed_fields但clamp后无变化)")
+
             return new_template, note, "llm"
 
         except Exception as e:
-            logger.warning("外层 LLM 回退随机: %s", str(e)[:200])
+            logger.warning("外层 LLM 异常, 回退随机: %s", str(e)[:300])
 
     t, note = random_jitter(incumbent_template)
     return t, note, "random"
