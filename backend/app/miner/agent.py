@@ -67,15 +67,21 @@ def mutate_expression(expr: str, templates: list[str] | None = None) -> str:
 # ============================================================
 
 def _build_system_prompt(template: dict) -> str:
-    """从模板组装 system prompt。JSON 输出指令强制追加 (外层不可移除)。"""
+    """从模板组装 system prompt。约束块强制置顶 (外层不可稀释)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = template.get("anti_overfit_instruction", "")
     sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
-    base = sys_tpl.format(fields=", ".join(_FIELDS), ops=ops_doc, anti=anti)
-    # 强制追加 JSON 输出格式 (外层改写不能移除)
-    if "只回复 JSON" not in base and "reply JSON" not in base.lower():
-        base += '\n只回复 JSON: {"expression": "...", "hypothesis": "一句话经济学假设"}'
-    return base
+    strategy_part = sys_tpl.format(fields=", ".join(_FIELDS), ops=ops_doc, anti=anti)
+
+    # 强制约束块 (置顶, 外层改写不能削弱)
+    constraints = (
+        f"【硬约束 — 违反者无效】\n"
+        f"可用字段 (仅此6个): {', '.join(_FIELDS)}\n"
+        f"可用算子 (仅此{len(OPERATORS_DOC)}个):\n{ops_doc}\n"
+        f"窗口: 1..250 整数\n"
+        f"输出格式: 只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"...\"}}\n"
+    )
+    return constraints + "\n" + strategy_part
 
 
 def _build_context_block(top_nodes: list[dict], template: dict) -> str:
