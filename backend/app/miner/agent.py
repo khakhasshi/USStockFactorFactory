@@ -67,11 +67,15 @@ def mutate_expression(expr: str, templates: list[str] | None = None) -> str:
 # ============================================================
 
 def _build_system_prompt(template: dict) -> str:
-    """从模板组装 system prompt。"""
+    """从模板组装 system prompt。JSON 输出指令强制追加 (外层不可移除)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = template.get("anti_overfit_instruction", "")
     sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
-    return sys_tpl.format(fields=", ".join(_FIELDS), ops=ops_doc, anti=anti)
+    base = sys_tpl.format(fields=", ".join(_FIELDS), ops=ops_doc, anti=anti)
+    # 强制追加 JSON 输出格式 (外层改写不能移除)
+    if "只回复 JSON" not in base and "reply JSON" not in base.lower():
+        base += '\n只回复 JSON: {"expression": "...", "hypothesis": "一句话经济学假设"}'
+    return base
 
 
 def _build_context_block(top_nodes: list[dict], template: dict) -> str:
