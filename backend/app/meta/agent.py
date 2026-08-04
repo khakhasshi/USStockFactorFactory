@@ -212,9 +212,11 @@ async def propose_template(
             # 构造历史上下文
             hist_lines = []
             for h in history[-12:]:
+                ms = h.get('meta_score')
+                meta_str = f"{ms:.3f}" if ms is not None else "?"
                 hist_lines.append(
-                    f"- v{h['version_no']} meta={h.get('meta_score','?'):.3f} "
-                    f"status={h['status']} note={h.get('template_note','?')[:80]}"
+                    f"- v{h['version_no']} meta={meta_str} "
+                    f"status={h['status']} note={str(h.get('template_note','?'))[:80]}"
                 )
             hist_text = "\n".join(hist_lines) if hist_lines else "(无历史)"
 
