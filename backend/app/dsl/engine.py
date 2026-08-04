@@ -176,11 +176,23 @@ class _Builder:
         raise ValueError(f"未知算子: {fn}")
 
 
+def _degenerate_check(root: ast.expr) -> None:
+    """拒绝数学退化子式 (恒常数经 rank 放大浮点噪声可刷分, 实验1已被随机搜索利用)."""
+    for n in ast.walk(root):
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Sub, ast.Div)):
+            if ast.dump(n.left) == ast.dump(n.right):
+                raise ValueError("退化表达式: x-x / x/x 恒为常数")
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "ts_corr":
+            if len(n.args) >= 2 and ast.dump(n.args[0]) == ast.dump(n.args[1]):
+                raise ValueError("退化表达式: ts_corr(x, x, w) 恒为 1")
+
+
 def parse(expression: str) -> FactorPipeline:
     """解析 DSL 表达式为 FactorPipeline; 非法即抛 ValueError."""
     if len(expression) > 500:
         raise ValueError("表达式过长")
     tree = ast.parse(expression, mode="eval")
+    _degenerate_check(tree.body)
     b = _Builder()
     final = b.build(tree.body)
     return FactorPipeline(b.stages, final)

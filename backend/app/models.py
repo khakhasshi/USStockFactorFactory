@@ -12,11 +12,23 @@ class Setting(Base):
     value: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class Experiment(Base):
+    """研究任务 (一次独立实验运行): 挖掘产物按 experiment_id 隔离."""
+
+    __tablename__ = "experiments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open/archived
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class MinerVersion(Base):
     """内层 Miner 的一个版本 = 一份 HarnessSpec (声明式白名单)"""
 
     __tablename__ = "miner_versions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     version_no: Mapped[int] = mapped_column(Integer, index=True)
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("miner_versions.id"), nullable=True)
     harness_spec: Mapped[dict] = mapped_column(JSON)
@@ -29,6 +41,7 @@ class MinerVersion(Base):
 class OuterStep(Base):
     __tablename__ = "outer_steps"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     step_no: Mapped[int] = mapped_column(Integer, index=True)
     candidate_id: Mapped[int] = mapped_column(ForeignKey("miner_versions.id"))
     incumbent_id: Mapped[int] = mapped_column(ForeignKey("miner_versions.id"))
@@ -44,6 +57,7 @@ class Node(Base):
 
     __tablename__ = "nodes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     miner_version_id: Mapped[int] = mapped_column(ForeignKey("miner_versions.id"), index=True)
     outer_step_no: Mapped[int] = mapped_column(Integer, index=True, default=0)
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"), nullable=True)
@@ -63,8 +77,9 @@ class Node(Base):
 class Factor(Base):
     __tablename__ = "factors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     name: Mapped[str] = mapped_column(String(128))
-    expression: Mapped[str] = mapped_column(Text, unique=True)
+    expression: Mapped[str] = mapped_column(Text)  # 唯一性改为实验内注册时检查
     hypothesis: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="public-leading", index=True)
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"), nullable=True)
@@ -80,6 +95,7 @@ class Trial(Base):
 
     __tablename__ = "trials"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     expression_hash: Mapped[str] = mapped_column(String(64), index=True)
     layer: Mapped[str] = mapped_column(String(24))
     task_name: Mapped[str] = mapped_column(String(64), default="")

@@ -31,7 +31,7 @@ const Dashboard = {
     <div class="grid cols-4" style="margin-bottom:14px">
       <div class="card"><h3>引擎状态</h3>
         <div class="big-num" :style="{color: st.state==='running' ? 'var(--green)' : 'var(--red)'}">{{ st.state }}</div>
-        <div class="sub">外层步 {{ st.outer_step }} · 内层评估 {{ st.inner_evals }}</div>
+        <div class="sub">实验: {{ st.experiment?.name ?? '—' }} · 外层步 {{ st.outer_step }} · 内层评估 {{ st.inner_evals }}</div>
         <div style="margin-top:10px; display:flex; gap:8px">
           <button class="btn primary" @click="start" :disabled="st.state==='running'">启动 7×24</button>
           <button class="btn danger" @click="stop" :disabled="st.state!=='running'">停止</button>
@@ -435,9 +435,95 @@ const SettingsView = {
   },
 };
 
+/* ============ 实验管理 ============ */
+const ExperimentsView = {
+  template: `
+  <div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>新建研究任务</h3>
+      <div class="form-row">
+        <div style="flex:1"><label>名称</label><input v-model="form.name" placeholder="如: 实验2-修复评估器" /></div>
+        <div style="flex:2"><label>描述</label><input v-model="form.description" placeholder="研究假设 / 变更点" /></div>
+        <div style="align-self:flex-end"><button class="btn primary" @click="create">创建</button></div>
+      </div>
+      <div v-if="err" style="color:var(--red); margin-top:8px">{{ err }}</div>
+    </div>
+    <div class="card">
+      <h3>研究任务列表 ({{ exps.length }})</h3>
+      <table>
+        <tr><th>#</th><th>名称</th><th>描述</th><th>状态</th><th>因子</th><th>节点</th><th>外层步</th><th>创建时间</th><th style="min-width:260px">操作</th></tr>
+        <tr v-for="e in exps" :key="e.id" :style="{background: e.active ? '#1c2733' : ''}">
+          <td>{{ e.id }}</td>
+          <td>
+            <input v-if="editing===e.id" v-model="editForm.name" style="width:180px" />
+            <template v-else><b>{{ e.name }}</b> <span v-if="e.active" class="tag green">活动</span></template>
+          </td>
+          <td style="max-width:300px">
+            <input v-if="editing===e.id" v-model="editForm.description" style="width:100%" />
+            <span v-else class="sub">{{ e.description }}</span>
+          </td>
+          <td><span class="tag" :class="{green: e.status==='open', amber: e.status==='archived'}">{{ e.status }}</span></td>
+          <td>{{ e.counts.factors }}</td><td>{{ e.counts.nodes }}</td><td>{{ e.counts.outer_steps }}</td>
+          <td class="sub">{{ e.created_at?.slice(0,16) }}</td>
+          <td>
+            <template v-if="editing===e.id">
+              <button class="btn primary" @click="saveEdit(e)">保存</button>
+              <button class="btn" @click="editing=null">取消</button>
+            </template>
+            <template v-else>
+              <button class="btn" v-if="!e.active && e.status==='open'" @click="activate(e)">设为活动</button>
+              <button class="btn" @click="startEdit(e)">编辑</button>
+              <button class="btn" v-if="e.status==='open'" @click="setStatus(e,'archived')">归档</button>
+              <button class="btn" v-else @click="setStatus(e,'open')">重新开放</button>
+              <button class="btn danger" v-if="!e.active" @click="del(e)">删除</button>
+            </template>
+          </td>
+        </tr>
+      </table>
+      <div class="sub" style="margin-top:8px">切换活动实验需先停止引擎; 删除会级联清除该实验全部因子/节点/步进记录, 不可恢复。</div>
+    </div>
+  </div>`,
+  setup() {
+    const exps = ref([]);
+    const form = reactive({ name: "", description: "" });
+    const editForm = reactive({ name: "", description: "" });
+    const editing = ref(null), err = ref("");
+    async function refresh() { exps.value = (await api("/experiments")).experiments; }
+    async function create() {
+      err.value = "";
+      try { await api("/experiments", { method: "POST", body: { ...form } }); form.name = ""; form.description = ""; refresh(); }
+      catch (e) { err.value = e.message; }
+    }
+    function startEdit(e) { editing.value = e.id; editForm.name = e.name; editForm.description = e.description; }
+    async function saveEdit(e) {
+      err.value = "";
+      try { await api(`/experiments/${e.id}`, { method: "PATCH", body: { ...editForm } }); editing.value = null; refresh(); }
+      catch (ex) { err.value = ex.message; }
+    }
+    async function setStatus(e, status) {
+      err.value = "";
+      try { await api(`/experiments/${e.id}`, { method: "PATCH", body: { status } }); refresh(); }
+      catch (ex) { err.value = ex.message; }
+    }
+    async function activate(e) {
+      err.value = "";
+      try { await api(`/experiments/${e.id}/activate`, { method: "POST" }); location.reload(); }
+      catch (ex) { err.value = ex.message; }
+    }
+    async function del(e) {
+      if (!confirm(`删除实验「${e.name}」及其全部 ${e.counts.factors} 个因子、${e.counts.nodes} 个节点? 不可恢复!`)) return;
+      err.value = "";
+      try { await api(`/experiments/${e.id}`, { method: "DELETE" }); refresh(); }
+      catch (ex) { err.value = ex.message; }
+    }
+    onMounted(refresh);
+    return { exps, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, del };
+  },
+};
+
 /* ============ App ============ */
 const App = {
-  components: { Dashboard, ResearchTree, FactorLibrary, BacktestView, SettingsView },
+  components: { Dashboard, ResearchTree, FactorLibrary, BacktestView, SettingsView, ExperimentsView },
   template: `
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
@@ -445,6 +531,11 @@ const App = {
       <button v-for="t in tabs" :key="t.id" :class="{active: tab===t.id}" @click="tab=t.id">{{ t.label }}</button>
     </div>
     <div class="spacer"></div>
+    <select v-model="selExp" @change="switchExp" style="margin-right:10px; max-width:220px" title="切换活动研究任务">
+      <option v-for="e in exps" :key="e.id" :value="e.id" :disabled="e.status==='archived' && !e.active">
+        {{ e.name }}{{ e.status==='archived' ? ' (归档)' : '' }}
+      </option>
+    </select>
     <span class="state-badge" :class="engState==='running' ? 'state-running' : 'state-stopped'">● {{ engState }}</span>
   </div>
   <div class="main">
@@ -452,22 +543,36 @@ const App = {
     <ResearchTree v-else-if="tab==='tree'" />
     <FactorLibrary v-else-if="tab==='factors'" />
     <BacktestView v-else-if="tab==='backtest'" />
+    <ExperimentsView v-else-if="tab==='exps'" />
     <SettingsView v-else />
   </div>`,
   setup() {
     const tab = ref("dash");
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
-      { id: "factors", label: "因子库" }, { id: "backtest", label: "回测" }, { id: "settings", label: "设置" },
+      { id: "factors", label: "因子库" }, { id: "backtest", label: "回测" },
+      { id: "exps", label: "实验" }, { id: "settings", label: "设置" },
     ];
     const engState = ref("…");
+    const exps = ref([]), selExp = ref(null);
     let timer = null;
     async function poll() {
       try { engState.value = (await api("/engine/status")).state; } catch (e) {}
     }
-    onMounted(() => { poll(); timer = setInterval(poll, 5000); });
+    async function loadExps() {
+      try {
+        const d = await api("/experiments");
+        exps.value = d.experiments;
+        selExp.value = d.active_id;
+      } catch (e) {}
+    }
+    async function switchExp() {
+      try { await api(`/experiments/${selExp.value}/activate`, { method: "POST" }); location.reload(); }
+      catch (e) { alert("切换失败: " + e.message); loadExps(); }
+    }
+    onMounted(() => { poll(); loadExps(); timer = setInterval(poll, 5000); });
     onUnmounted(() => clearInterval(timer));
-    return { tab, tabs, engState };
+    return { tab, tabs, engState, exps, selExp, switchExp };
   },
 };
 

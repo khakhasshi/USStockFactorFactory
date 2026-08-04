@@ -27,8 +27,8 @@ def _layer_metrics(daily: pl.DataFrame) -> dict:
     overall_sign = 1.0 if ic_mean >= 0 else -1.0
     consistency = float((signs == overall_sign).mean()) if era_means.height else 0.0
     turnover = float(daily["turnover"].mean() or 0.0)
-    # 分数: |ICIR| × era 一致性惩罚 × 换手惩罚 (方向由 IC 符号在组合层处理)
-    score = abs(icir) * min(1.0, consistency / 0.6) * math.exp(-2.0 * turnover)
+    # 分数: |ICIR| × era 一致性惩罚 × 换手硬截断 (日换手 ≥50% 归零; 实验1的 exp 衰减惩罚过弱)
+    score = abs(icir) * min(1.0, consistency / 0.6) * max(0.0, 1.0 - turnover / 0.5)
     return {
         "n_days": daily.height,
         "ic_mean": round(ic_mean, 5),

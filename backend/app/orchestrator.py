@@ -9,16 +9,16 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import DEFAULT_ENGINE_CONFIG, DEFAULT_HARNESS_SPEC
 from .data.panel import PanelStore
-from .db import SessionLocal
+from .db import SessionLocal, get_active_experiment_id
 from .dsl.engine import normalize_hash
 from .eval.harness import evaluate
 from .meta.agent import propose_spec
 from .miner.agent import propose
-from .models import EngineEvent, Factor, MinerVersion, Node, OuterStep, Setting, Trial
+from .models import EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
 
 import random
 
@@ -29,7 +29,8 @@ class Engine:
     def __init__(self) -> None:
         self.running = False
         self.task: asyncio.Task | None = None
-        self.status: dict = {"state": "stopped", "outer_step": 0, "inner_evals": 0}
+        self.exp_id: int = 1
+        self.status: dict = {"state": "stopped", "outer_step": 0, "inner_evals": 0, "experiment_id": None}
         self.logbuf: deque[dict] = deque(maxlen=300)
 
     @classmethod
@@ -62,7 +63,15 @@ class Engine:
 
     async def _run(self) -> None:
         try:
-            await self.log("引擎启动: 加载数据面板...")
+            self.exp_id = await get_active_experiment_id()
+            async with SessionLocal() as s:
+                exp = await s.get(Experiment, self.exp_id)
+                if not exp:
+                    raise RuntimeError(f"活动实验 {self.exp_id} 不存在")
+                if exp.status == "archived":
+                    raise RuntimeError(f"实验「{exp.name}」已归档, 请先切换到开放实验")
+            self.status["experiment_id"] = self.exp_id
+            await self.log(f"引擎启动: 实验[{exp.name}] 加载数据面板...")
             await asyncio.to_thread(PanelStore.get().ensure_loaded)
             await self.log(f"面板就绪: {PanelStore.get().summary()['rows']} 行")
             incumbent = await self._ensure_incumbent()
@@ -85,6 +94,7 @@ class Engine:
         cand_spec, note, source = await propose_spec(incumbent.harness_spec, history, provider)
         async with SessionLocal() as s:
             cand = MinerVersion(
+                experiment_id=self.exp_id,
                 version_no=len(history) + 1, parent_id=incumbent.id,
                 harness_spec=cand_spec, status="candidate", proposal_note=f"[{source}] {note}",
             )
@@ -105,6 +115,7 @@ class Engine:
         accepted = cand_score > inc_score + float(cfg["outer_accept_epsilon"])
         async with SessionLocal() as s:
             s.add(OuterStep(
+                experiment_id=self.exp_id,
                 step_no=step_no, candidate_id=cand.id, incumbent_id=incumbent.id,
                 candidate_score=cand_score, incumbent_score=inc_score, accepted=accepted,
                 detail={"note": note, "source": source, "budget": budget},
@@ -141,6 +152,7 @@ class Engine:
             expr, hypo, source = await propose(spec, op, task, top_nodes, provider)
 
             node = Node(
+                experiment_id=self.exp_id,
                 miner_version_id=miner.id, outer_step_no=step_no,
                 parent_id=top_nodes[0]["id"] if (op == "improve" and top_nodes) else None,
                 op=op, expression=expr, hypothesis=hypo, source=source, task_name=task["name"],
@@ -159,6 +171,7 @@ class Engine:
             async with SessionLocal() as s:
                 s.add(node)
                 s.add(Trial(
+                    experiment_id=self.exp_id,
                     expression_hash=normalize_hash(expr) if node.status == "ok" else "invalid",
                     layer="INNER_PUBLIC+META_TRAIN", task_name=task["name"],
                     statistic={"public_score": node.public_score},
@@ -182,11 +195,14 @@ class Engine:
         if abs(pm.get("icir") or 0) < float(spec.get("min_public_icir", 0.25)):
             return
         async with SessionLocal() as s:
-            exists = await s.scalar(select(Factor).where(Factor.expression == node.expression))
+            exists = await s.scalar(select(Factor).where(
+                Factor.expression == node.expression, Factor.experiment_id == self.exp_id))
             if exists:
                 return
-            n = await s.scalar(select(Factor.id).order_by(Factor.id.desc()).limit(1)) or 0
+            n = await s.scalar(
+                select(func.count(Factor.id)).where(Factor.experiment_id == self.exp_id)) or 0
             s.add(Factor(
+                experiment_id=self.exp_id,
                 name=f"F{n + 1:05d}", expression=node.expression, hypothesis=node.hypothesis,
                 status="public-leading", node_id=node.id, task_name=node.task_name,
                 public_metrics=node.public_metrics, gate_metrics=node.gate_metrics,
@@ -203,11 +219,13 @@ class Engine:
     async def _ensure_incumbent(self) -> MinerVersion:
         async with SessionLocal() as s:
             inc = await s.scalar(
-                select(MinerVersion).where(MinerVersion.status == "incumbent").order_by(MinerVersion.id.desc())
+                select(MinerVersion)
+                .where(MinerVersion.status == "incumbent", MinerVersion.experiment_id == self.exp_id)
+                .order_by(MinerVersion.id.desc())
             )
             if inc:
                 return inc
-            inc = MinerVersion(version_no=0, harness_spec=DEFAULT_HARNESS_SPEC,
+            inc = MinerVersion(experiment_id=self.exp_id, version_no=0, harness_spec=DEFAULT_HARNESS_SPEC,
                                status="incumbent", proposal_note="Miner_0 基线")
             s.add(inc)
             await s.commit()
@@ -224,12 +242,16 @@ class Engine:
 
     async def _next_step_no(self) -> int:
         async with SessionLocal() as s:
-            last = await s.scalar(select(OuterStep.step_no).order_by(OuterStep.step_no.desc()).limit(1))
+            last = await s.scalar(
+                select(OuterStep.step_no).where(OuterStep.experiment_id == self.exp_id)
+                .order_by(OuterStep.step_no.desc()).limit(1))
             return (last or 0) + 1
 
     async def _version_history(self) -> list[dict]:
         async with SessionLocal() as s:
-            rows = (await s.scalars(select(MinerVersion).order_by(MinerVersion.id))).all()
+            rows = (await s.scalars(
+                select(MinerVersion).where(MinerVersion.experiment_id == self.exp_id)
+                .order_by(MinerVersion.id))).all()
             return [
                 {"version_no": m.version_no, "harness_spec": m.harness_spec,
                  "meta_score": m.meta_score, "status": m.status}
