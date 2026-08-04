@@ -18,9 +18,16 @@ router = APIRouter(prefix="/api")
 
 # ---------- 引擎 ----------
 
+class EngineStartReq(BaseModel):
+    mode: str = "v1"  # "v1" (A组兼容) 或 "v2" (B组: MinerTemplate + multi-seed + t-test)
+
+
 @router.post("/engine/start")
-async def engine_start():
-    return await Engine.get().start()
+async def engine_start(req: EngineStartReq | None = None):
+    mode = req.mode if req else "v1"
+    if mode not in ("v1", "v2"):
+        raise HTTPException(400, "mode 必须为 v1 或 v2")
+    return await Engine.get().start(mode)
 
 
 @router.post("/engine/stop")

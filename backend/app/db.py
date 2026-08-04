@@ -38,6 +38,9 @@ async def init_db() -> None:
 
 
 async def get_active_experiment_id() -> int:
+    import os
+    if override := os.environ.get("FF_EXPERIMENT_ID"):
+        return int(override)
     from .models import Setting
 
     async with SessionLocal() as s:

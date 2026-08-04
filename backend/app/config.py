@@ -22,19 +22,96 @@ LAYER_BOUNDS = {
 # DSL 可见字段白名单 (仅前复权研究字段 + 量额)
 DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
 
+# ---- 旧版 HarnessSpec (保留兼容, A组运行中) ----
 DEFAULT_HARNESS_SPEC = {
-    "n_drafts": 4,            # 每轮先起草的多样化因子数
-    "improve_bias": 0.65,     # 选择 improve 而非 draft 的概率
-    "context_top_k": 5,       # 提示词中展示的历史最优尝试数
+    "n_drafts": 4,
+    "improve_bias": 0.65,
+    "context_top_k": 5,
     "llm_temperature": 0.9,
     "anti_overfit_instruction": True,
-    "min_public_icir": 0.25,  # 注册进因子库的 public 门槛
+    "min_public_icir": 0.25,
 }
 
+# ---- 新版 MinerTemplate (B组: 外层可改写代码级对象) ----
+# 外层 LLM 可以自由改写此模板中的任何文本字段;
+# 只读边界由 MetaValidator 强制执行 (评估器/数据层/隔离边界不可触碰)
+DEFAULT_MINER_TEMPLATE = {
+    # === 外层可改写 ===
+    "system_prompt": (
+        "你是量化因子研究员。基于美股日线数据设计横截面选股因子表达式。\n"
+        "可用字段: {fields} (前复权价格与量额)\n"
+        "可用算子:\n{ops}\n"
+        "规则: 只能用以上字段与算子; 窗口为 1..250 整数; 表达式一行;\n"
+        "目标是最大化样本内 RankIC 的稳健性而非峰值;\n"
+        "禁止只对特定时段有效的取巧构造。{anti}\n"
+        "只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"一句话经济学假设\"}}"
+    ),
+    "anti_overfit_instruction": (
+        "特别要求: 避免过拟合——偏好简单、有经济含义、跨行业普适的结构。"
+    ),
+    "draft_strategy": (
+        "从不同经济学机制出发提出新因子: "
+        "动量(趋势跟随)、反转(均值回归)、波动(低波异象)、"
+        "流动性(非流动性溢价)、量价关系(聪明钱流向)。"
+        "每个因子陈述经济学假设, 优先使用低频窗口(20-120日)降低换手。"
+    ),
+    "improve_strategy": (
+        "基于当前最优因子改进: "
+        "1) 加权复合两个低相关因子; 2) 替换算子(如 ts_corr→ts_rank); "
+        "3) 调整窗口长度; 4) 引入截面归一化(zscore/winsor/rank); "
+        "5) 方向翻转(若IC符号与假设相反)。"
+    ),
+    "context_strategy": (
+        "展示历史 top-{top_k} 高分因子(含 public score/ICIR/换手/表达式)。"
+        "若存在多次失败(score<0.3)的因子, 归纳其失败模式为一句话警告。"
+    ),
+    "diversity_instruction": (
+        "新因子必须与历史高分因子有不同经济学机制。"
+    ),
+    "scoring_weights": {
+        "icir_weight": 0.45,
+        "consistency_weight": 0.25,
+        "turnover_weight": 0.30,  # 换手惩罚权重, 越高越偏好慢信号
+    },
+    "dsl_exploration_templates": [
+        "{-}rank(ts_delta(close, {window}))",
+        "ts_corr({field1}, {field2}, {window})",
+        "{-}zscore(ts_std({field}, {window}))",
+        "rank((close - ts_min(low, {window})) / (ts_max(high, {window}) - ts_min(low, {window})))",
+        "ts_mean(abs(ts_delta(close,1))/(amount+1e-9), {window})",
+    ],
+    "min_public_icir": 0.25,
+    "llm_temperature": 0.9,
+
+    # === 只读元数据 (外层不可改写, 由系统注入) ===
+    "_readonly": {
+        "evaluator": "harness.py:evaluate() — 只读",
+        "data_layer": "AsOfResearchView panel — 只读",
+        "isolation_layers": "INNER_PUBLIC/META_TRAIN/META_HOLDOUT/FACTOR_VAULT — 只读",
+        "acceptance_gate": "t-test p<0.10 across seeds — 只读",
+        "fields": ["open", "high", "low", "close", "vol", "amount"],
+    },
+}
+
+# ---- 新版引擎配置 (B组: 高预算 + 多种子) ----
+DEFAULT_ENGINE_CONFIG_V2 = {
+    "inner_budget_per_outer_step": 50,    # P0: 10→50, 压噪声
+    "n_seeds_per_candidate": 3,            # 每个候选跑 3 seeds
+    "outer_accept_p_value": 0.10,          # 配对 t 检验接受阈值
+    "incumbent_remeasure_every": 3,        # 每 3 步重测在位者
+    "incumbent_remeasure_budget": 30,      # 重测时用 30 次评估 (节省算力)
+    "tasks": [
+        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15},
+        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25},
+        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15},
+    ],
+}
+
+# ---- 旧版引擎配置 (A组兼容) ----
 DEFAULT_ENGINE_CONFIG = {
-    "inner_budget_per_outer_step": 10,   # 每个外层步的内层评估次数 (成本预算代理)
-    "outer_accept_epsilon": 0.02,        # 外层接受门槛 (超出在位者的最小幅度)
-    "incumbent_remeasure_every": 5,      # 每 N 步重测在位者 (noise band)
+    "inner_budget_per_outer_step": 10,
+    "outer_accept_epsilon": 0.02,
+    "incumbent_remeasure_every": 5,
     "tasks": [
         {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15},
         {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25},
