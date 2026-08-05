@@ -2581,15 +2581,15 @@ async def prometheus_metrics():
         "# TYPE factorfactory_feedback_coverage_ratio gauge",
         (
             'factorfactory_feedback_coverage_ratio{artifact="node"} '
-            f'{feedback_coverage.get("nodes_ratio", 0)}'
+            f'{feedback_coverage.get("nodes_ratio") or 0}'
         ),
         (
             'factorfactory_feedback_coverage_ratio{artifact="outer_report"} '
-            f'{feedback_coverage.get("reports_ratio", 0)}'
+            f'{feedback_coverage.get("reports_ratio") or 0}'
         ),
         (
             'factorfactory_feedback_coverage_ratio{artifact="outer_reflection"} '
-            f'{feedback_coverage.get("reflections_ratio", 0)}'
+            f'{feedback_coverage.get("reflections_ratio") or 0}'
         ),
     ]
     for status, count in (llm_calls.get("by_status") or {}).items():
