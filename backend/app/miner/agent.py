@@ -76,8 +76,8 @@ def _build_system_prompt(template: dict) -> str:
     # 强制约束块 (置顶, 外层改写不能削弱)
     constraints = (
         f"【硬约束 — 违反者无效】\n"
-        f"可用字段 (仅此6个): {', '.join(_FIELDS)}\n"
-        f"可用算子 (仅此{len(OPERATORS_DOC)}个):\n{ops_doc}\n"
+        f"可用字段 ({len(_FIELDS)}个): {', '.join(_FIELDS)}\n"
+        f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
         f"窗口: 1..250 整数\n"
         f"输出格式: 只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"...\"}}\n"
     )
