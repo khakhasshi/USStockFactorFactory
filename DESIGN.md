@@ -1,6 +1,6 @@
 # USStockFactorFactory — 双层优化 LLM 因子挖掘工厂设计
 
-> 机构级设计蓝图 v0.3 · 2026-08-05（Evaluation Protocol V3）
+> 机构级设计蓝图 v0.4 · 2026-08-05（Evaluation Protocol V4）
 > 灵感来源：Weco AIDE²（bi-level autoresearch）× 机构因子投研全生命周期
 > 定位：**全新独立系统（greenfield）**，不依赖、不迁移任何既有因子平台
 
@@ -164,7 +164,7 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 
 ## 4. 评估流水线（Layer 2）—— 系统的心脏
 
-> 当前运行协议：`v3.0 / NON_PIT_RESEARCH`。按当前研究要求，PIT 不进入评分，
+> 当前运行协议：`v4.0 / NON_PIT_RESEARCH`。按当前研究要求，PIT 不进入评分，
 > 但来源标签仍保留；任何 F5 只表示通过非 PIT 的执行可行性评价，不是生产批准。
 
 ### 4.1 四级数据隔离 + 不可变协议世代
@@ -180,8 +180,8 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 |---|---|---|---|
 | **INNER_PUBLIC** | 内层 Miner 可见 | 因子挖掘的优化信号；约 6 个月一个 era，报告 era 分布 | 内层训练集 |
 | **META_TRAIN** | 外层可反复查询（仅分布摘要） | 外层接受/拒绝 Miner 版本的依据；因子 `public-gate-pass` 判定 | **外层的自适应训练证据**，不冒充 OOS |
-| **META_HOLDOUT** | 从不参与任何选择决策 | 事后度量 Miner 版本的二阶泛化，仅出报告 | 外层的真样本外 |
-| **FACTOR_VAULT** | 物理隔离，独立仲裁进程持钥 | 因子晋级 `vault-pass` 的一次性仲裁；每协议世代限额动用，动用记录哈希链追加 | 因子的终审样本外 |
+| **META_HOLDOUT** | Miner/外层不可见；研究员审计可见 | 生成冻结的实盘排序分，度量二阶泛化 | 外层的真样本外 |
+| **FACTOR_VAULT** | Miner/排序公式不可见 | 一次性晋级封印及“排序能否预测后续费后盈利”的校准目标 | 因子的终审样本外 |
 
 - **ProtocolGeneration（不可变协议世代）**：每代冻结 `{数据快照哈希, 切分边界, 成本参数, 种子, 评分器版本}`。同代内所有 Miner 版本在完全相同协议下比较；新数据只能开启下一代 G(n+1)，跨代分数不直接比较；曝光过的 holdout 时段在后续世代永久标记 `contaminated`，不得再充当任何隔离层。**没有滚动切分**——滚动会让历史 private 反馈渗入模型上下文并破坏同协议可比性（v0.1 方案已废弃）。
 - **二阶泛化的外部证据**（对齐 AIDE² 方法论）：META_HOLDOUT 之外，Miner 版本还须在**从未参与外层选择的外部保留任务**（不同 universe 构建规则、不同 horizon）上事后评测，写入泛化报告。
@@ -189,11 +189,13 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 
 ### 4.2 指标体系
 
-**V3 的核心变化**：搜索阶段和准入阶段使用不同结果。挖掘循环只能读取
-`INNER_PUBLIC + META_TRAIN` 的 discovery score；`META_HOLDOUT + FACTOR_VAULT`
-只允许由研究员显式发起一次完整审计，审计结果持久化但永不回流 Miner。
+**V4 的核心变化**：搜索发现、实盘排序和最终校准使用三个不同目标。挖掘循环只能读取
+`INNER_PUBLIC + META_TRAIN` 的 discovery score；研究员显式审计后，系统用
+`PUBLIC + META_TRAIN + META_HOLDOUT` 生成 0–100 的 pre-vault 实盘排序分。
+`FACTOR_VAULT` 的具体收益数值不进入排序公式，只提供通过/失败封印，并在因子样本足够时检验
+冻结排序与 Vault 费后收益的 Spearman、Top/Bottom 组盈利率和分组单调性。所有审计结果都不回流 Miner。
 
-V3 不再用因子排名变化近似组合换手，而是在与预测周期一致的非重叠调仓点生成
+V4 延续真实目标权重换手：在与预测周期一致的非重叠调仓点生成
 实际目标权重并计算双边交易额 `Σ|w_t-w_{t-1}|`；离开股票池的持仓也按归零计入。
 报告同时给出每次调仓、单边与日均等效换手。A股纯多头同时报告绝对净收益与相对等权基准的主动收益；
 美股多空拆分 long leg、short leg、双边换手、交易成本和借券成本代理。
@@ -205,6 +207,9 @@ V3 不再用因子排名变化近似组合换手，而是在与预测周期一�
 - 分位数组合单调性、top-bottom spread、era/年度稳定性；
 - 实际持仓换手、成本压力矩阵、目标资本占 ADV 的参与率代理、组合市场 Beta/相关性；
 - 覆盖率、有效样本量和明确的失败原因。
+- 费后收益 HAC t、概率 Sharpe、90% 收益/Sharpe 下置信界、成本盈亏平衡 bps；
+- 按费后结果计算的 era/年度盈利率、最差 era Sharpe 和训练到 HOLDOUT 的 Sharpe 保持率；
+- 预声明试验次数对应的多重检验门槛；高 ICIR 不能补偿负收益下界或不足的成本缓冲。
 
 准入采用硬门与最弱环节约束，而非让高 ICIR 抵消负费后收益：
 

@@ -19,6 +19,7 @@ from ..config import (
     default_panel_glob,
     evaluation_config,
     get_dsl_fields,
+    resolve_engine_tasks,
 )
 from ..data.panel import PanelStore
 from ..db import SessionLocal, get_active_experiment_id
@@ -29,6 +30,7 @@ from ..dsl.engine import (
     validate,
 )
 from ..eval.harness import evaluate, evaluate_full
+from ..eval.ranking import ranking_diagnostics
 from ..factors.similarity import (
     build_similarity_index,
     expression_fingerprint,
@@ -51,6 +53,24 @@ async def _experiment_context(experiment_id: int | None = None) -> tuple[int, di
     return eid, (exp.research_config or {})
 
 
+def _resolved_task_pool(cfg: dict, global_engine: Setting | None) -> list[dict]:
+    market = cfg.get("market", "us")
+    mode = cfg.get(
+        "portfolio_mode",
+        "long_only" if market == "ashare" else "long_short",
+    )
+    direction = int(cfg.get("direction", 1))
+    local_tasks = (cfg.get("engine_config") or {}).get("tasks")
+    global_tasks = (global_engine.value if global_engine else {}).get("tasks")
+    return resolve_engine_tasks(
+        local_tasks or global_tasks or DEFAULT_ENGINE_CONFIG["tasks"],
+        market,
+        mode,
+        direction,
+        preserve_declared_costs=bool(local_tasks),
+    )
+
+
 def _compact_layer_metrics(metrics: dict | None) -> dict:
     metrics = metrics or {}
     compact = {
@@ -64,6 +84,10 @@ def _compact_layer_metrics(metrics: dict | None) -> dict:
             "monotonicity",
             "turnover",
             "daily_turnover",
+            "cost_breakeven_bps",
+            "cost_cushion_multiple",
+            "profitable_era_rate",
+            "worst_era_sharpe",
             "score",
             "portfolio_mode",
         )
@@ -80,7 +104,42 @@ def _compact_layer_metrics(metrics: dict | None) -> dict:
     return compact
 
 
+def _compact_ranking(metrics: dict | None) -> dict:
+    ranking = (metrics or {}).get("ranking") or {}
+    if not isinstance(ranking, dict):
+        return {}
+    compact = {
+        key: ranking.get(key)
+        for key in (
+            "available",
+            "score",
+            "score_pre_vault",
+            "status",
+            "vault_seal",
+            "policy_label",
+        )
+        if key in ranking
+    }
+    evidence = ranking.get("evidence")
+    if isinstance(evidence, dict):
+        compact["evidence"] = {
+            key: evidence.get(key)
+            for key in (
+                "holdout_sharpe",
+                "holdout_ann_return",
+                "holdout_sharpe_lcb",
+                "holdout_ann_return_lcb",
+                "holdout_return_hac_t",
+                "cost_breakeven_bps",
+                "cost_cushion_multiple",
+                "worst_stress_sharpe",
+            )
+        }
+    return compact
+
+
 def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
+    validation = f.validation_metrics or {}
     payload = {
         "id": f.id,
         "experiment_id": f.experiment_id,
@@ -104,11 +163,16 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
         "research_meta": f.research_meta or {},
         "evaluation_protocol": f.evaluation_protocol or "legacy_unoriented",
         "eligibility": f.eligibility or {},
+        "ranking": (
+            validation.get("ranking") or {}
+            if include_validation
+            else _compact_ranking(validation)
+        ),
         "evaluated_at": str(f.evaluated_at) if f.evaluated_at else None,
         "created_at": str(f.created_at),
     }
     if include_validation:
-        payload["validation"] = f.validation_metrics or {}
+        payload["validation"] = validation
         payload["fingerprint"] = f.fingerprint or {}
     return payload
 
@@ -219,7 +283,7 @@ async def list_factors(
     lifecycle: str | None = None,
     experiment_id: int | None = None,
     q: str | None = None,
-    sort: str = "score",
+    sort: str = "live_rank",
     direction: str = "desc",
     limit: int = 500,
 ):
@@ -235,7 +299,29 @@ async def list_factors(
             query = query.where((Factor.name.ilike(needle)) | (Factor.expression.ilike(needle)) | (Factor.hypothesis.ilike(needle)))
         query = query.limit(max(1, min(limit, 2000)))
         rows = (await s.scalars(query)).all()
-    if sort == "score":
+    if sort == "live_rank":
+        def live_rank_key(factor: Factor) -> tuple:
+            validation = factor.validation_metrics or {}
+            ranking = validation.get("ranking") or {}
+            grade = str((factor.eligibility or {}).get("grade") or "F0")
+            try:
+                grade_number = int(grade.removeprefix("F"))
+            except ValueError:
+                grade_number = 0
+            is_current_audit = (
+                factor.evaluation_protocol == EVALUATION_PROTOCOL_VERSION
+                and bool(ranking.get("available"))
+                and ranking.get("score") is not None
+            )
+            return (
+                int(is_current_audit),
+                float(ranking.get("score") or -1.0),
+                grade_number,
+                float((factor.public_metrics or {}).get("score") or 0.0),
+            )
+
+        rows.sort(key=live_rank_key, reverse=direction != "asc")
+    elif sort == "score":
         rows.sort(key=lambda f: float((f.public_metrics or {}).get("score") or 0), reverse=direction != "asc")
     elif sort == "icir":
         rows.sort(key=lambda f: float((f.public_metrics or {}).get("icir") or 0), reverse=direction != "asc")
@@ -244,9 +330,60 @@ async def list_factors(
             key=lambda f: str((f.eligibility or {}).get("grade") or "F0"),
             reverse=direction != "asc",
         )
+    payloads = [_factor_payload(f) for f in rows]
+    if sort == "live_rank":
+        position = 0
+        for payload in payloads:
+            ranking = payload.get("ranking") or {}
+            if ranking.get("available"):
+                position += 1
+                ranking["position"] = position
     return {
-        "factors": [_factor_payload(f) for f in rows],
+        "factors": payloads,
         "protocol_version": EVALUATION_PROTOCOL_VERSION,
+        "sort": sort,
+    }
+
+
+@router.get("/factors/ranking-diagnostics")
+async def factor_ranking_diagnostics(experiment_id: int | None = None):
+    """Validate the frozen V4 rank against fee-after Vault outcomes."""
+    eid, cfg = await _experiment_context(experiment_id)
+    async with SessionLocal() as s:
+        rows = (
+            await s.scalars(
+                select(Factor).where(
+                    Factor.experiment_id == eid,
+                    Factor.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+        ).all()
+    items = []
+    for factor in rows:
+        provenance_status = (factor.provenance_status or "").lower()
+        if (
+            "invalid" in provenance_status
+            or factor.lifecycle_stage == "configuration_changed_requires_reaudit"
+        ):
+            continue
+        validation = factor.validation_metrics or {}
+        ranking = validation.get("ranking") or {}
+        vault = (validation.get("layers") or {}).get("vault") or {}
+        # Profit means fee-after absolute P&L for A-share long-only and fee-after
+        # market-neutral P&L for US long/short.  In both cases that is `net`.
+        outcome = vault.get("net") or {}
+        if ranking.get("available"):
+            items.append({
+                "factor_id": factor.id,
+                "score_pre_vault": ranking.get("score_pre_vault"),
+                "vault_ann_return": outcome.get("ann_return"),
+                "vault_sharpe": outcome.get("sharpe"),
+            })
+    return {
+        "experiment_id": eid,
+        "market": cfg.get("market", "us"),
+        "protocol_version": EVALUATION_PROTOCOL_VERSION,
+        **ranking_diagnostics(items),
     }
 
 
@@ -333,11 +470,7 @@ async def factor_detail(fid: int):
     cfg = (exp.research_config or {}) if exp else {}
     market = cfg.get("market", "us")
     resolved_eval = evaluation_config(market, cfg.get("evaluation_config"))
-    task_pool = (
-        (cfg.get("engine_config") or {}).get("tasks")
-        or (global_engine.value if global_engine else {}).get("tasks")
-        or DEFAULT_ENGINE_CONFIG["tasks"]
-    )
+    task_pool = _resolved_task_pool(cfg, global_engine)
     task = next((row for row in task_pool if row.get("name") == f.task_name), {})
     audit_defaults = {
         "universe_n": int(task.get("universe_n", 500)),
@@ -387,7 +520,7 @@ class FactorAuditReq(BaseModel):
 
 @router.post("/factors/{fid}/audit")
 async def audit_factor(fid: int, req: FactorAuditReq | None = None):
-    """Run and persist an explicit four-layer V3 audit.
+    """Run and persist an explicit four-layer V4 audit.
 
     This endpoint is intentionally separate from mining so HOLDOUT/VAULT never
     become proposal feedback.
@@ -401,14 +534,21 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
         if not exp:
             raise HTTPException(404, "研究任务不存在")
         global_engine = await s.get(Setting, "engine_config")
+        actual_trials = int(
+            await s.scalar(
+                select(func.count(Trial.id)).where(
+                    Trial.experiment_id == f.experiment_id
+                )
+            )
+            or 0
+        )
     cfg = exp.research_config or {}
     market = cfg.get("market", "us")
-    mode = cfg.get("portfolio_mode", "long_short")
-    task_pool = (
-        (cfg.get("engine_config") or {}).get("tasks")
-        or (global_engine.value if global_engine else {}).get("tasks")
-        or DEFAULT_ENGINE_CONFIG["tasks"]
+    mode = cfg.get(
+        "portfolio_mode",
+        "long_only" if market == "ashare" else "long_short",
     )
+    task_pool = _resolved_task_pool(cfg, global_engine)
     task = next((row for row in task_pool if row.get("name") == f.task_name), {})
     universe_n = req.universe_n or int(task.get("universe_n", 500))
     horizon = req.horizon or int(task.get("horizon", 5))
@@ -422,7 +562,12 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
         raise HTTPException(400, "direction 必须为 1 或 -1")
     if req.cost_bps is not None and req.cost_bps < 0:
         raise HTTPException(400, "cost_bps 不能为负数")
-    overrides = dict(cfg.get("evaluation_config") or {})
+    overrides = evaluation_config(market, cfg.get("evaluation_config"))
+    overrides["multiple_testing_trials"] = max(
+        int(overrides["multiple_testing_trials"]),
+        actual_trials,
+        1,
+    )
     if req.target_capital is not None:
         if req.target_capital <= 0:
             raise HTTPException(400, "target_capital 必须为正数")
@@ -448,9 +593,20 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
         audit["source_provenance_warning"] = provenance_warning
         provenance_status = "revalidated_expression_source_invalid"
     else:
-        provenance_status = "v3_validated_on_configured_panel"
+        provenance_status = "v4_validated_on_configured_panel"
     async with SessionLocal() as s:
         factor = await s.get(Factor, fid)
+        meta = dict(factor.research_meta or {})
+        previous_validation = factor.validation_metrics or {}
+        if previous_validation:
+            audit_history = list(meta.get("audit_history") or [])
+            audit_history.append({
+                "evaluation_protocol": factor.evaluation_protocol,
+                "evaluated_at": str(factor.evaluated_at) if factor.evaluated_at else None,
+                "eligibility": factor.eligibility or {},
+                "validation": previous_validation,
+            })
+            meta["audit_history"] = audit_history
         factor.public_metrics = {
             **audit["public"],
             "discovery": audit["discovery"],
@@ -467,22 +623,24 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             **(factor.fingerprint or {}),
             **expression_fingerprint(factor.expression),
         }
-        meta = dict(factor.research_meta or {})
         meta.update({
             "direction": direction,
             "last_audit_universe_n": universe_n,
             "last_audit_horizon": horizon,
             "policy_label": "NON_PIT_RESEARCH",
+            "multiple_testing_trials": overrides["multiple_testing_trials"],
         })
         factor.research_meta = meta
         s.add(Trial(
             experiment_id=factor.experiment_id,
             expression_hash=(factor.fingerprint or {}).get("expr_hash", "audit"),
-            layer="FULL_AUDIT_V3",
+            layer="FULL_AUDIT_V4",
             task_name=factor.task_name,
             statistic={
                 "grade": audit["eligibility"]["grade"],
                 "stage": audit["eligibility"]["stage"],
+                "live_rank_score": audit["ranking"].get("score"),
+                "score_pre_vault": audit["ranking"].get("score_pre_vault"),
                 "protocol_version": EVALUATION_PROTOCOL_VERSION,
             },
         ))
@@ -974,9 +1132,16 @@ async def get_settings():
         {**p, "api_key": (p.get("api_key", "")[:6] + "..." if p.get("api_key") else "")}
         for p in llm_val.get("providers", [])
     ]}
+    engine_value = {**DEFAULT_ENGINE_CONFIG, **(eng.value if eng else {})}
+    engine_value["tasks"] = resolve_engine_tasks(
+        engine_value.get("tasks", []),
+        "us",
+        "long_short",
+        1,
+    )
     return {
         "llm_providers": masked,
-        "engine_config": {**DEFAULT_ENGINE_CONFIG, **(eng.value if eng else {})},
+        "engine_config": engine_value,
         "evaluation_protocol": {
             "version": EVALUATION_PROTOCOL_VERSION,
             "defaults": DEFAULT_EVALUATION_CONFIG,

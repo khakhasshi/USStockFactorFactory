@@ -96,10 +96,11 @@ def get_dsl_fields(market: str | None = None) -> list[str]:
     return list(ASHARE_DSL_FIELDS if market == "ashare" else US_DSL_FIELDS if market == "us" else DSL_FIELDS)
 
 
-# ---- Evaluation Protocol V3 ----
-# These are research/execution-readiness defaults.  PIT is deliberately not part
-# of this score; the API keeps the panel's NON_PIT label visible separately.
-EVALUATION_PROTOCOL_VERSION = "v3.0"
+# ---- Evaluation Protocol V4 ----
+# V4 keeps the mining score isolated from HOLDOUT/VAULT and adds a separate
+# live-oriented audit rank.  PIT is deliberately outside this score at the
+# user's request; the API keeps the panel's NON_PIT label visible separately.
+EVALUATION_PROTOCOL_VERSION = "v4.0"
 DEFAULT_EVALUATION_CONFIG = {
     "protocol_version": EVALUATION_PROTOCOL_VERSION,
     "top_fraction": 0.20,
@@ -109,9 +110,12 @@ DEFAULT_EVALUATION_CONFIG = {
     "min_research_score": 1.00,
     "min_oos_sharpe": 0.50,
     "min_stress_sharpe": 0.00,
+    "min_return_hac_t": 1.2816,
     "max_hac_p_value": 0.10,
     "min_era_consistency": 0.60,
+    "min_profitable_era_rate": 0.60,
     "min_monotonicity": 0.35,
+    "min_cost_cushion_multiple": 1.50,
     "max_drawdown": 0.35,
     "max_market_beta_long_short": 0.35,
     "max_daily_turnover": {"ashare": 0.35, "us": 0.50},
@@ -121,11 +125,20 @@ DEFAULT_EVALUATION_CONFIG = {
     "stress_borrow_cost_bps_annual": {"ashare": 0.0, "us": 600.0},
     "target_capital": {"ashare": 10_000_000.0, "us": 1_000_000.0},
     "max_adv_participation": 0.05,
+    # Rank calibration targets are scale anchors, not promotion promises.
+    "target_rank_sharpe": 1.50,
+    "target_rank_ann_return": {"ashare": 0.10, "us": 0.12},
+    "target_absolute_ann_return": {"ashare": 0.15, "us": 0.12},
+    "target_cost_cushion_multiple": 3.00,
+    "return_lcb_confidence": 0.90,
+    # Pre-declared search budget.  Explicit audits use max(this, actual trials).
+    "multiple_testing_trials": 1000,
+    "multiple_testing_alpha": 0.10,
 }
 
 
 def evaluation_config(market: str, overrides: dict | None = None) -> dict:
-    """Resolve market-specific V3 settings while preserving a serialisable snapshot."""
+    """Resolve market-specific V4 settings while preserving a serialisable snapshot."""
     if market not in {"ashare", "us"}:
         raise ValueError("market 必须是 ashare 或 us")
     src = DEFAULT_EVALUATION_CONFIG
@@ -138,9 +151,12 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         "min_research_score": src["min_research_score"],
         "min_oos_sharpe": src["min_oos_sharpe"],
         "min_stress_sharpe": src["min_stress_sharpe"],
+        "min_return_hac_t": src["min_return_hac_t"],
         "max_hac_p_value": src["max_hac_p_value"],
         "min_era_consistency": src["min_era_consistency"],
+        "min_profitable_era_rate": src["min_profitable_era_rate"],
         "min_monotonicity": src["min_monotonicity"],
+        "min_cost_cushion_multiple": src["min_cost_cushion_multiple"],
         "max_drawdown": src["max_drawdown"],
         "max_market_beta_long_short": src["max_market_beta_long_short"],
         "max_daily_turnover": src["max_daily_turnover"][market],
@@ -150,6 +166,13 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         "stress_borrow_cost_bps_annual": src["stress_borrow_cost_bps_annual"][market],
         "target_capital": src["target_capital"][market],
         "max_adv_participation": src["max_adv_participation"],
+        "target_rank_sharpe": src["target_rank_sharpe"],
+        "target_rank_ann_return": src["target_rank_ann_return"][market],
+        "target_absolute_ann_return": src["target_absolute_ann_return"][market],
+        "target_cost_cushion_multiple": src["target_cost_cushion_multiple"],
+        "return_lcb_confidence": src["return_lcb_confidence"],
+        "multiple_testing_trials": src["multiple_testing_trials"],
+        "multiple_testing_alpha": src["multiple_testing_alpha"],
     }
     cfg.update(overrides or {})
     for key in (
@@ -159,9 +182,12 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         "min_research_score",
         "min_oos_sharpe",
         "min_stress_sharpe",
+        "min_return_hac_t",
         "max_hac_p_value",
         "min_era_consistency",
+        "min_profitable_era_rate",
         "min_monotonicity",
+        "min_cost_cushion_multiple",
         "max_drawdown",
         "max_market_beta_long_short",
         "max_daily_turnover",
@@ -170,6 +196,12 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         "stress_borrow_cost_bps_annual",
         "target_capital",
         "max_adv_participation",
+        "target_rank_sharpe",
+        "target_rank_ann_return",
+        "target_absolute_ann_return",
+        "target_cost_cushion_multiple",
+        "return_lcb_confidence",
+        "multiple_testing_alpha",
     ):
         try:
             cfg[key] = float(cfg[key])
@@ -177,6 +209,7 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
             raise ValueError(f"evaluation_config.{key} 必须是数值") from exc
     try:
         cfg["min_layer_days"] = int(cfg["min_layer_days"])
+        cfg["multiple_testing_trials"] = int(cfg["multiple_testing_trials"])
         cfg["stress_cost_bps"] = [float(value) for value in cfg["stress_cost_bps"]]
     except (TypeError, ValueError) as exc:
         raise ValueError("evaluation_config 的样本天数或压力成本格式错误") from exc
@@ -188,6 +221,8 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         raise ValueError("max_hac_p_value 必须在 [0, 1] 内")
     if not 0 <= cfg["min_era_consistency"] <= 1:
         raise ValueError("min_era_consistency 必须在 [0, 1] 内")
+    if not 0 <= cfg["min_profitable_era_rate"] <= 1:
+        raise ValueError("min_profitable_era_rate 必须在 [0, 1] 内")
     if not -1 <= cfg["min_monotonicity"] <= 1:
         raise ValueError("min_monotonicity 必须在 [-1, 1] 内")
     if not 0 < cfg["max_drawdown"] <= 1:
@@ -200,6 +235,12 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         raise ValueError("max_adv_participation 必须在 (0, 1] 内")
     if cfg["min_layer_days"] < 30:
         raise ValueError("min_layer_days 不能少于 30")
+    if not 0.50 < cfg["return_lcb_confidence"] < 1:
+        raise ValueError("return_lcb_confidence 必须在 (0.5, 1) 内")
+    if cfg["multiple_testing_trials"] < 1:
+        raise ValueError("multiple_testing_trials 不能少于 1")
+    if not 0 < cfg["multiple_testing_alpha"] < 0.5:
+        raise ValueError("multiple_testing_alpha 必须在 (0, 0.5) 内")
     if not cfg["stress_cost_bps"] or any(value < 0 for value in cfg["stress_cost_bps"]):
         raise ValueError("stress_cost_bps 必须是非负数列表")
     for key in (
@@ -207,11 +248,73 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         "borrow_cost_bps_annual",
         "stress_borrow_cost_bps_annual",
         "max_market_beta_long_short",
+        "min_return_hac_t",
+        "min_cost_cushion_multiple",
+        "target_rank_sharpe",
+        "target_rank_ann_return",
+        "target_absolute_ann_return",
+        "target_cost_cushion_multiple",
     ):
         if cfg[key] < 0:
             raise ValueError(f"{key} 不能为负数")
     cfg["protocol_version"] = EVALUATION_PROTOCOL_VERSION
     return cfg
+
+
+def default_task_cost_bps(market: str, universe_n: int, horizon: int) -> float:
+    """Market-aware research cost, with an illiquidity premium for broad pools."""
+    if market not in {"ashare", "us"}:
+        raise ValueError("market 必须是 ashare 或 us")
+    base = 20.0 if market == "ashare" else 15.0
+    illiquidity_premium = 10.0 if universe_n > 1000 or horizon == 10 else 0.0
+    return base + illiquidity_premium
+
+
+def resolve_engine_tasks(
+    tasks: list[dict],
+    market: str,
+    portfolio_mode: str,
+    direction: int,
+    *,
+    preserve_declared_costs: bool = False,
+) -> list[dict]:
+    """Resolve one task list without leaking another market's mode or costs."""
+    resolved = []
+    for task in tasks:
+        row = dict(task)
+        universe_n = int(row.get("universe_n", 500))
+        horizon = int(row.get("horizon", 5))
+        costs_by_market = row.get("cost_bps_by_market") or {}
+        if market in costs_by_market:
+            cost_bps = float(costs_by_market[market])
+        elif preserve_declared_costs and row.get("cost_bps") is not None:
+            cost_bps = float(row["cost_bps"])
+        else:
+            cost_bps = default_task_cost_bps(market, universe_n, horizon)
+        row.update({
+            "market": market,
+            "mode": portfolio_mode,
+            "direction": direction,
+            "universe_n": universe_n,
+            "horizon": horizon,
+            "cost_bps": cost_bps,
+            "cost_bps_by_market": {
+                "ashare": float(
+                    costs_by_market.get(
+                        "ashare",
+                        default_task_cost_bps("ashare", universe_n, horizon),
+                    )
+                ),
+                "us": float(
+                    costs_by_market.get(
+                        "us",
+                        default_task_cost_bps("us", universe_n, horizon),
+                    )
+                ),
+            },
+        })
+        resolved.append(row)
+    return resolved
 
 # ---- 旧版 HarnessSpec (保留兼容, A组运行中) ----
 DEFAULT_HARNESS_SPEC = {
@@ -292,9 +395,9 @@ DEFAULT_ENGINE_CONFIG_V2 = {
     "incumbent_remeasure_every": 3,        # 每 3 步重测在位者
     "incumbent_remeasure_budget": 30,      # 重测时用 30 次评估 (节省算力)
     "tasks": [
-        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
-        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "mode": DEFAULT_PORTFOLIO_MODE},
-        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "cost_bps_by_market": {"ashare": 20, "us": 15}, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "cost_bps_by_market": {"ashare": 30, "us": 25}, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15, "cost_bps_by_market": {"ashare": 20, "us": 15}, "mode": DEFAULT_PORTFOLIO_MODE},
     ],
 }
 
@@ -304,8 +407,8 @@ DEFAULT_ENGINE_CONFIG = {
     "outer_accept_epsilon": 0.02,
     "incumbent_remeasure_every": 5,
     "tasks": [
-        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
-        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "mode": DEFAULT_PORTFOLIO_MODE},
-        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "cost_bps_by_market": {"ashare": 20, "us": 15}, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "cost_bps_by_market": {"ashare": 30, "us": 25}, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15, "cost_bps_by_market": {"ashare": 20, "us": 15}, "mode": DEFAULT_PORTFOLIO_MODE},
     ],
 }

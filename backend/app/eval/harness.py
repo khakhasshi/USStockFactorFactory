@@ -1,4 +1,4 @@
-"""Evaluation Protocol V3.
+"""Evaluation Protocol V4.
 
 The mining loop is allowed to see only INNER_PUBLIC and META_TRAIN.  A full
 audit is an explicit, persisted action that adds META_HOLDOUT and FACTOR_VAULT.
@@ -8,7 +8,9 @@ The protocol evaluates an executable portfolio, not IC in isolation:
 * realised target-weight turnover
 * long-only absolute and benchmark-relative returns
 * long/short leg attribution and borrow proxy
+* return confidence bounds, cost breakeven and multiple-testing evidence
 * cost stress, drawdown, monotonicity, era/year stability and capacity proxy
+* a pre-vault live rank whose calibration is measured on the frozen vault
 
 PIT is intentionally outside this score at the user's request.  Every result is
 therefore labelled NON_PIT_RESEARCH; an F5 result means execution-ready under
@@ -25,6 +27,7 @@ import polars as pl
 from ..config import EVALUATION_PROTOCOL_VERSION, evaluation_config, get_dsl_fields
 from ..data.panel import PanelStore
 from ..dsl.engine import parse
+from .ranking import build_live_ranking
 
 DISCOVERY_LAYERS = ["INNER_PUBLIC", "META_TRAIN"]
 FULL_LAYERS = ["INNER_PUBLIC", "META_TRAIN", "META_HOLDOUT", "FACTOR_VAULT"]
@@ -90,12 +93,19 @@ def _series_stats(values: list[float], periods_per_year: float = 252.0) -> dict:
     }
 
 
-def _newey_west_t(values: list[float], lag: int) -> tuple[float | None, float | None]:
-    """HAC t-stat for the mean and a two-sided normal p-value."""
+def _newey_west_mean(values: list[float], lag: int) -> dict:
+    """HAC mean inference with a Bartlett kernel."""
     x = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     n = len(x)
     if n < 30:
-        return None, None
+        return {
+            "t_stat": None,
+            "p_value_two_sided": None,
+            "standard_error": None,
+            "mean": sum(x) / n if x else None,
+            "n": n,
+            "lag": min(max(0, lag), max(0, n - 1)),
+        }
     mean = sum(x) / n
     residuals = [v - mean for v in x]
     gamma0 = sum(v * v for v in residuals) / n
@@ -106,10 +116,124 @@ def _newey_west_t(values: list[float], lag: int) -> tuple[float | None, float | 
         long_run_var += 2.0 * (1.0 - k / (use_lag + 1.0)) * covariance
     standard_error = math.sqrt(max(long_run_var, 0.0) / n)
     if standard_error <= 1e-12:
-        return 0.0, 1.0
+        return {
+            "t_stat": 0.0,
+            "p_value_two_sided": 1.0,
+            "standard_error": 0.0,
+            "mean": mean,
+            "n": n,
+            "lag": use_lag,
+        }
     t_stat = mean / standard_error
     p_value = 2.0 * (1.0 - NormalDist().cdf(abs(t_stat)))
-    return round(t_stat, 4), round(max(0.0, min(1.0, p_value)), 6)
+    return {
+        "t_stat": round(t_stat, 4),
+        "p_value_two_sided": round(max(0.0, min(1.0, p_value)), 6),
+        "standard_error": standard_error,
+        "mean": mean,
+        "n": n,
+        "lag": use_lag,
+    }
+
+
+def _newey_west_t(values: list[float], lag: int) -> tuple[float | None, float | None]:
+    """Compatibility wrapper returning t-stat and two-sided p-value."""
+    result = _newey_west_mean(values, lag)
+    return result["t_stat"], result["p_value_two_sided"]
+
+
+def _probabilistic_sharpe_gt_zero(values: list[float]) -> float | None:
+    """Probability that the period Sharpe is positive, adjusted for moments."""
+    x = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    n = len(x)
+    if n < 30:
+        return None
+    mean = sum(x) / n
+    variance = sum((value - mean) ** 2 for value in x) / max(1, n - 1)
+    std = math.sqrt(max(variance, 0.0))
+    if std <= 1e-12:
+        return 0.5
+    centered = [(value - mean) / std for value in x]
+    skew = sum(value**3 for value in centered) / n
+    kurtosis = sum(value**4 for value in centered) / n
+    sharpe = mean / std
+    denominator = math.sqrt(
+        max(
+            1e-12,
+            1.0 - skew * sharpe + ((kurtosis - 1.0) / 4.0) * sharpe * sharpe,
+        )
+    )
+    z_score = sharpe * math.sqrt(n - 1) / denominator
+    return round(NormalDist().cdf(z_score), 6)
+
+
+def _return_confidence(
+    values: list[float],
+    periods_per_year: float,
+    cfg: dict,
+) -> dict:
+    """Conservative lower bounds for the mean and Sharpe of a return stream."""
+    clean = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    lag = max(1, min(8, round(len(clean) ** (1.0 / 3.0)))) if clean else 1
+    inference = _newey_west_mean(clean, lag)
+    if not clean or inference["standard_error"] is None:
+        return {
+            "available": False,
+            "hac_t_stat": inference["t_stat"],
+            "hac_p_value": inference["p_value_two_sided"],
+            "hac_lag": inference["lag"],
+            "probabilistic_sharpe_gt_zero": None,
+            "mean_lcb": None,
+            "ann_return_lcb": None,
+            "sharpe_lcb": None,
+            "confidence_level": cfg["return_lcb_confidence"],
+        }
+    mean = sum(clean) / len(clean)
+    variance = sum((value - mean) ** 2 for value in clean) / max(1, len(clean) - 1)
+    std = math.sqrt(max(variance, 0.0))
+    confidence_level = float(cfg["return_lcb_confidence"])
+    z_score = NormalDist().inv_cdf(confidence_level)
+    mean_lcb = mean - z_score * float(inference["standard_error"])
+    sharpe_lcb = (
+        mean_lcb / std * math.sqrt(periods_per_year)
+        if std > 1e-12
+        else 0.0
+    )
+    return {
+        "available": True,
+        "hac_t_stat": inference["t_stat"],
+        "hac_p_value": inference["p_value_two_sided"],
+        "hac_lag": inference["lag"],
+        "probabilistic_sharpe_gt_zero": _probabilistic_sharpe_gt_zero(clean),
+        "mean_lcb": round(mean_lcb, 8),
+        # Arithmetic annualisation is intentionally conservative and avoids
+        # exploding a noisy lower-bound estimate through compounding.
+        "ann_return_lcb": round(mean_lcb * periods_per_year, 6),
+        "sharpe_lcb": round(sharpe_lcb, 4),
+        "confidence_level": confidence_level,
+    }
+
+
+def _grouped_performance(
+    keys: list[int],
+    returns: list[float],
+    periods_per_year: float,
+    key_name: str,
+) -> list[dict]:
+    grouped: dict[int, list[float]] = {}
+    for key, value in zip(keys, returns):
+        grouped.setdefault(int(key), []).append(float(value))
+    rows = []
+    for key in sorted(grouped):
+        stats = _series_stats(grouped[key], periods_per_year)
+        rows.append({
+            key_name: key,
+            "n_periods": len(grouped[key]),
+            "ann_return": stats["ann_return"],
+            "sharpe": stats["sharpe"],
+            "max_drawdown": stats["max_drawdown"],
+        })
+    return rows
 
 
 def _linear_correlation(xs: list[float], ys: list[float]) -> float | None:
@@ -378,6 +502,32 @@ def _layer_metrics(
         if portfolio_mode == "long_only"
         else list(net)
     )
+    periods_per_year = 252.0 / horizon
+    ranking_returns = active if portfolio_mode == "long_only" else net
+    return_confidence = _return_confidence(ranking_returns, periods_per_year, cfg)
+    absolute_return_confidence = (
+        _return_confidence(net, periods_per_year, cfg)
+        if portfolio_mode == "long_only"
+        else return_confidence
+    )
+    pre_transaction_cost = (
+        [g - b for g, b in zip(gross, benchmark)]
+        if portfolio_mode == "long_only"
+        else [g - borrow_period for g in gross]
+    )
+    mean_turnover = sum(turnover) / len(turnover)
+    cost_breakeven_bps = (
+        (sum(pre_transaction_cost) / len(pre_transaction_cost))
+        / mean_turnover
+        * 10_000.0
+        if mean_turnover > 1e-12
+        else None
+    )
+    cost_cushion_multiple = (
+        cost_breakeven_bps / base_cost_bps
+        if cost_breakeven_bps is not None and base_cost_bps > 0
+        else None
+    )
     ic = [_safe_float(v) for v in sub["ic"].to_list()]
     ic_mean = sum(ic) / len(ic)
     ic_var = sum((value - ic_mean) ** 2 for value in ic) / max(1, len(ic) - 1)
@@ -420,6 +570,34 @@ def _layer_metrics(
         }
         for row in years.iter_rows(named=True)
     ]
+    era_performance = _grouped_performance(
+        [int(value) for value in sub["era"].to_list()],
+        ranking_returns,
+        periods_per_year,
+        "era",
+    )
+    year_performance = _grouped_performance(
+        [value.year for value in sub["trade_date"].to_list()],
+        ranking_returns,
+        periods_per_year,
+        "year",
+    )
+    profitable_era_rate = (
+        sum(_safe_float(row.get("ann_return"), -1.0) > 0 for row in era_performance)
+        / len(era_performance)
+        if era_performance
+        else 0.0
+    )
+    profitable_year_rate = (
+        sum(_safe_float(row.get("ann_return"), -1.0) > 0 for row in year_performance)
+        / len(year_performance)
+        if year_performance
+        else 0.0
+    )
+    worst_era_sharpe = min(
+        (_safe_float(row.get("sharpe"), -99.0) for row in era_performance),
+        default=-99.0,
+    )
 
     decile_sub = deciles.filter(pl.col("layer") == layer)
     decile_rows = [
@@ -466,7 +644,6 @@ def _layer_metrics(
             "max_drawdown": stats["max_drawdown"],
         })
 
-    periods_per_year = 252.0 / horizon
     gross_stats = _series_stats(gross, periods_per_year)
     net_stats = _series_stats(net, periods_per_year)
     active_stats = _series_stats(active, periods_per_year)
@@ -504,6 +681,16 @@ def _layer_metrics(
         "turnover_p95": round(sorted_turnover[int(0.95 * (len(sorted_turnover) - 1))], 6),
         "adv_participation_p95": round(max(participation), 6) if participation else None,
         "capacity_metric": "trade_notional_to_daily_amount_p95_proxy",
+        "cost_breakeven_bps": (
+            round(cost_breakeven_bps, 4)
+            if cost_breakeven_bps is not None
+            else None
+        ),
+        "cost_cushion_multiple": (
+            round(cost_cushion_multiple, 4)
+            if cost_cushion_multiple is not None
+            else None
+        ),
         "gross": gross_stats,
         "net": net_stats,
         "active": active_stats,
@@ -518,10 +705,17 @@ def _layer_metrics(
         "deciles": decile_rows,
         "era_series": era_series,
         "year_series": year_series,
+        "era_performance": era_performance,
+        "year_performance": year_performance,
+        "profitable_era_rate": round(profitable_era_rate, 4),
+        "profitable_year_rate": round(profitable_year_rate, 4),
+        "worst_era_sharpe": round(worst_era_sharpe, 4),
         "cost_stress": stress,
         "base_cost_bps": base_cost_bps,
         "borrow_cost_bps_annual": borrow_bps,
         "market_exposure": _market_exposure(net, benchmark, periods_per_year),
+        "return_confidence": return_confidence,
+        "absolute_return_confidence": absolute_return_confidence,
         # Compatibility fields used by the existing UI/search context.
         "direction": 1.0,
     }
@@ -558,6 +752,26 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
         _safe_float(gate.get("daily_turnover", gate.get("turnover"))),
     )
     stress = min(_worst_stress_sharpe(public), _worst_stress_sharpe(gate))
+    return_t = min(
+        _safe_float((public.get("return_confidence") or {}).get("hac_t_stat"), -99.0),
+        _safe_float((gate.get("return_confidence") or {}).get("hac_t_stat"), -99.0),
+    )
+    sharpe_lcb = min(
+        _safe_float((public.get("return_confidence") or {}).get("sharpe_lcb"), -99.0),
+        _safe_float((gate.get("return_confidence") or {}).get("sharpe_lcb"), -99.0),
+    )
+    ann_return_lcb = min(
+        _safe_float((public.get("return_confidence") or {}).get("ann_return_lcb"), -99.0),
+        _safe_float((gate.get("return_confidence") or {}).get("ann_return_lcb"), -99.0),
+    )
+    profitable_era_rate = min(
+        _safe_float(public.get("profitable_era_rate")),
+        _safe_float(gate.get("profitable_era_rate")),
+    )
+    cost_cushion = min(
+        _safe_float(public.get("cost_cushion_multiple"), -99.0),
+        _safe_float(gate.get("cost_cushion_multiple"), -99.0),
+    )
     hac_p = max(
         _safe_float(public.get("hac_p_value"), 1.0),
         _safe_float(gate.get("hac_p_value"), 1.0),
@@ -570,32 +784,59 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
         reasons.append("训练层 HAC 显著性不足")
     if sharpe <= 0:
         reasons.append("训练层成本后组合 Sharpe 非正")
+    if return_t < float(cfg["min_return_hac_t"]):
+        reasons.append("训练层成本后收益的 HAC 置信度不足")
+    if sharpe_lcb <= 0 or ann_return_lcb <= 0:
+        reasons.append("训练层成本后收益下置信界非正")
     if consistency < float(cfg["min_era_consistency"]):
         reasons.append("跨 era 方向一致性不足")
+    if profitable_era_rate < float(cfg["min_profitable_era_rate"]):
+        reasons.append("跨 era 费后盈利比例不足")
     if monotonicity < 0:
         reasons.append("分位数组合没有正向单调性")
     if turnover > float(cfg["max_daily_turnover"]):
         reasons.append("实际持仓换手超过任务上限")
     if stress < float(cfg["min_stress_sharpe"]):
         reasons.append("保守成本压力下 Sharpe 为负")
+    if cost_cushion < float(cfg["min_cost_cushion_multiple"]):
+        reasons.append("成本盈亏平衡缓冲不足")
 
+    trials = max(1, int(cfg["multiple_testing_trials"]))
+    alpha = float(cfg["multiple_testing_alpha"])
+    selection_hurdle = NormalDist().inv_cdf(1.0 - alpha / trials)
+    public_sharpe = _relevant_sharpe(public, portfolio_mode)
+    gate_sharpe = _relevant_sharpe(gate, portfolio_mode)
+    sharpe_retention = min(1.0, max(0.0, gate_sharpe / max(0.25, public_sharpe)))
     components = {
         "predictive": min(1.0, max(0.0, icir / 2.0)),
-        "portfolio": min(1.0, max(0.0, sharpe / 1.5)),
-        "stability": min(1.0, max(0.0, consistency / 0.75)),
+        "portfolio_lcb": min(1.0, max(0.0, sharpe_lcb / float(cfg["target_rank_sharpe"]))),
+        "selection_confidence": min(1.0, max(0.0, return_t / selection_hurdle)),
+        "stability": min(
+            1.0,
+            max(0.0, 0.5 * consistency / 0.75 + 0.5 * profitable_era_rate / 0.75),
+        ),
+        "generalization": sharpe_retention,
         "monotonicity": min(1.0, max(0.0, monotonicity)),
         "cost_survival": min(1.0, max(0.0, (stress + 0.5) / 1.5)),
-        "turnover": math.exp(-turnover / max(0.01, float(cfg["max_daily_turnover"]))),
-        "coverage": min(1.0, max(0.0, coverage)),
+        "implementability": (
+            0.50
+            * min(
+                1.0,
+                max(0.0, cost_cushion / float(cfg["target_cost_cushion_multiple"])),
+            )
+            + 0.30 * math.exp(-turnover / max(0.01, float(cfg["max_daily_turnover"])))
+            + 0.20 * min(1.0, max(0.0, coverage))
+        ),
     }
     weights = {
-        "predictive": 0.20,
-        "portfolio": 0.25,
+        "predictive": 0.10,
+        "portfolio_lcb": 0.25,
+        "selection_confidence": 0.15,
         "stability": 0.15,
-        "monotonicity": 0.10,
+        "generalization": 0.10,
+        "monotonicity": 0.05,
         "cost_survival": 0.15,
-        "turnover": 0.10,
-        "coverage": 0.05,
+        "implementability": 0.05,
     }
     geometric = math.exp(
         sum(weights[key] * math.log(max(1e-6, value)) for key, value in components.items())
@@ -607,6 +848,14 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
         "score": round(score, 4),
         "passed": passed,
         "components": {key: round(value, 4) for key, value in components.items()},
+        "selection_evidence": {
+            "multiple_testing_trials": trials,
+            "hurdle_t": round(selection_hurdle, 4),
+            "worst_training_return_hac_t": round(return_t, 4),
+            "worst_training_sharpe_lcb": round(sharpe_lcb, 4),
+            "worst_training_ann_return_lcb": round(ann_return_lcb, 6),
+            "worst_training_cost_cushion_multiple": round(cost_cushion, 4),
+        },
         "failure_reasons": reasons,
     }
 
@@ -628,6 +877,13 @@ def _layer_gate(metrics: dict, portfolio_mode: str, cfg: dict, label: str) -> tu
         reasons.append(f"{label}: HAC 显著性不足")
     if _relevant_sharpe(metrics, portfolio_mode) < float(cfg["min_oos_sharpe"]):
         reasons.append(f"{label}: 成本后 Sharpe 未达标")
+    confidence = metrics.get("return_confidence") or {}
+    if _safe_float(confidence.get("hac_t_stat"), -99.0) < float(cfg["min_return_hac_t"]):
+        reasons.append(f"{label}: 成本后收益 HAC 置信度不足")
+    if _safe_float(confidence.get("sharpe_lcb"), -99.0) <= 0:
+        reasons.append(f"{label}: 成本后 Sharpe 下置信界非正")
+    if _safe_float(confidence.get("ann_return_lcb"), -99.0) <= 0:
+        reasons.append(f"{label}: 成本后年化收益下置信界非正")
     relevant = metrics.get("active") if portfolio_mode == "long_only" else metrics.get("net")
     if _safe_float((relevant or {}).get("ann_return")) <= 0:
         reasons.append(f"{label}: 成本后年化收益非正")
@@ -647,10 +903,18 @@ def _layer_gate(metrics: dict, portfolio_mode: str, cfg: dict, label: str) -> tu
         reasons.append(f"{label}: 多空组合市场 Beta 超限")
     if _safe_float(metrics.get("era_consistency")) < float(cfg["min_era_consistency"]):
         reasons.append(f"{label}: era 稳定性不足")
+    if _safe_float(metrics.get("profitable_era_rate")) < float(
+        cfg["min_profitable_era_rate"]
+    ):
+        reasons.append(f"{label}: era 费后盈利比例不足")
     if _safe_float(metrics.get("monotonicity")) < float(cfg["min_monotonicity"]):
         reasons.append(f"{label}: 分层单调性不足")
     if _worst_stress_sharpe(metrics) < float(cfg["min_stress_sharpe"]):
         reasons.append(f"{label}: 压力成本下失效")
+    if _safe_float(metrics.get("cost_cushion_multiple"), -99.0) < float(
+        cfg["min_cost_cushion_multiple"]
+    ):
+        reasons.append(f"{label}: 成本盈亏平衡缓冲不足")
     return not reasons, reasons
 
 
@@ -695,7 +959,7 @@ def _eligibility(layers: dict, discovery: dict, portfolio_mode: str, cfg: dict) 
         "failure_reasons": reasons,
         "production_approved": False,
         "policy_label": "NON_PIT_RESEARCH",
-        "meaning": "F5 仅表示通过非 PIT 的实战化评价协议，不等于生产批准",
+        "meaning": "F5 仅表示通过 V4 非 PIT 实战审计，不等于生产批准",
     }
 
 
@@ -747,7 +1011,7 @@ def evaluate(
     market: str = "us",
     evaluation_overrides: dict | None = None,
 ) -> dict:
-    """Mining-safe V3 discovery evaluation; no holdout/vault access."""
+    """Mining-safe V4 discovery evaluation; no holdout/vault access."""
     layers, cfg = _evaluate_layers(
         expression,
         universe_n,
@@ -780,6 +1044,7 @@ def evaluate(
         "public": layers["public"],
         "gate": layers["gate"],
         "discovery": discovery,
+        "ranking_policy": "发现分仅供 Miner；实盘排序必须显式审计且不读取 Vault 数值",
     }
 
 
@@ -811,6 +1076,7 @@ def evaluate_full(
     layers["public"]["score"] = discovery["score"]
     layers["gate"]["score"] = discovery["score"]
     eligibility = _eligibility(layers, discovery, portfolio_mode, cfg)
+    ranking = build_live_ranking(layers, eligibility, portfolio_mode, cfg)
     return {
         "protocol_version": EVALUATION_PROTOCOL_VERSION,
         "scope": "full_audit",
@@ -826,6 +1092,9 @@ def evaluate_full(
             "borrow_cost_bps_annual": cfg["borrow_cost_bps_annual"],
             "target_capital": cfg["target_capital"],
             "max_adv_participation": cfg["max_adv_participation"],
+            "multiple_testing_trials": cfg["multiple_testing_trials"],
+            "multiple_testing_alpha": cfg["multiple_testing_alpha"],
+            "return_lcb_confidence": cfg["return_lcb_confidence"],
         },
         "layers": layers,
         "public": layers["public"],
@@ -834,6 +1103,7 @@ def evaluate_full(
         "vault": layers["vault"],
         "discovery": discovery,
         "eligibility": eligibility,
+        "ranking": ranking,
     }
 
 
@@ -846,7 +1116,7 @@ def era_detail(
     portfolio_mode: str = "long_short",
     direction: int = 1,
 ) -> dict:
-    """Compatibility view backed by the V3 full audit."""
+    """Compatibility view backed by the V4 full audit."""
     audit = evaluate_full(
         expression,
         universe_n,

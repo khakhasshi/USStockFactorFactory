@@ -47,12 +47,20 @@ async def init_db() -> None:
             "NOT NULL DEFAULT 'legacy_unoriented'"
         ))
         await conn.execute(text(
-            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS lifecycle_stage VARCHAR(32) "
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS lifecycle_stage VARCHAR(64) "
             "NOT NULL DEFAULT 'legacy_unreviewed'"
         ))
         await conn.execute(text(
-            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS provenance_status VARCHAR(32) "
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS provenance_status VARCHAR(64) "
             "NOT NULL DEFAULT 'unverified'"
+        ))
+        # Some explicit re-audit states are longer than the original 32-char
+        # columns.  Widening is lossless and keeps historical labels intact.
+        await conn.execute(text(
+            "ALTER TABLE factors ALTER COLUMN lifecycle_stage TYPE VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ALTER COLUMN provenance_status TYPE VARCHAR(64)"
         ))
         await conn.execute(text(
             "ALTER TABLE factors ADD COLUMN IF NOT EXISTS validation_metrics JSONB NOT NULL DEFAULT '{}'::jsonb"

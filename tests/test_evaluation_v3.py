@@ -152,6 +152,10 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertTrue(result["eligibility"]["vault_pass"])
         self.assertEqual(result["eligibility"]["grade"], "F5")
         self.assertFalse(result["eligibility"]["production_approved"])
+        self.assertTrue(result["ranking"]["available"])
+        self.assertIsNotNone(result["ranking"]["score"])
+        self.assertIn("return_confidence", result["holdout"])
+        self.assertGreater(result["holdout"]["cost_cushion_multiple"], 1.0)
 
     def test_long_short_reports_separate_legs_and_borrow(self):
         with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):

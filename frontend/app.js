@@ -385,12 +385,12 @@ const FactorLibraryWorkbench = {
   template: `
   <div class="factor-workbench">
     <div class="card" style="margin-bottom:14px">
-      <div class="panel-title-row"><div><div class="eyebrow">FACTOR LIBRARY / STRUCTURAL INDEX</div><h1>因子研究资产库</h1><span class="sub">生命周期、实战审计与结构相似度索引统一管理；HOLDOUT / VAULT 仅在显式审计时读取。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag green">{{ groupStats.groups || 0 }} 个结构组</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
+      <div class="panel-title-row"><div><div class="eyebrow">LIVE-RANKED FACTOR RESEARCH</div><h1>因子研究资产库</h1><span class="sub">V4 把训练发现分与实盘排序分彻底分开；排序只使用 PUBLIC、META_TRAIN、HOLDOUT，Vault 数值仅用于校准检验。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag green">{{ groupStats.groups || 0 }} 个结构组</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
       <div class="form-row" style="margin-top:14px">
         <input style="flex:3" v-model="query" @keyup.enter="refresh" placeholder="搜索名称、表达式、经济学假设…" />
         <select v-model="status"><option value="">全部生命周期</option><option value="discovery_only">F1 · discovery_only</option><option value="research_pass">F2 · research_pass</option><option value="oos_pass">F3 · oos_pass</option><option value="paper_candidate">F4 · paper_candidate</option><option value="live_candidate_non_pit">F5 · live_candidate_non_pit</option><option value="legacy_unreviewed">旧协议未审计</option><option value="invalid_provenance">来源无效</option><option value="configuration_changed_requires_reaudit">配置变更待复审</option></select>
         <select v-model="groupFilter"><option value="">全部相似组</option><option v-for="g in groups" :key="g.id" :value="g.id">{{ g.id }} · {{ familyLabel(g.family) }} · {{ g.size }}个</option></select>
-        <select v-model="sort"><option value="score">按研究分</option><option value="grade">按实战等级</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
+        <select v-model="sort"><option value="live_rank">按实盘排序</option><option value="score">按研究分</option><option value="grade">按实战等级</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
         <button class="btn" @click="refresh">刷新</button><button class="btn primary" @click="compare" :disabled="selected.length<2">比较 {{ selected.length }} 个</button>
       </div>
       <div class="similarity-summary">
@@ -399,11 +399,20 @@ const FactorLibraryWorkbench = {
         <b>{{ pct(groupStats.redundancy_ratio) }}</b><small>结构冗余率</small>
         <button class="text-btn" @click="groupFilter=''">清除分组筛选</button>
       </div>
+      <div class="rank-calibration" :class="rankingDiagnostics.status">
+        <div><span>排序校准</span><b>{{ calibrationLabel(rankingDiagnostics.status) }}</b><small>{{ rankingDiagnostics.message || '等待 V4 审计样本' }}</small></div>
+        <template v-if="rankingDiagnostics.metrics">
+          <div><span>Rank ↔ Vault</span><b>{{ f(rankingDiagnostics.metrics.spearman_score_vs_vault_return) }}</b><small>Spearman</small></div>
+          <div><span>Top 组盈利率</span><b>{{ pct(rankingDiagnostics.metrics.top_quartile_positive_rate) }}</b><small>Bottom {{ pct(rankingDiagnostics.metrics.bottom_quartile_positive_rate) }}</small></div>
+          <div><span>分组单调性</span><b>{{ f(rankingDiagnostics.metrics.bucket_monotonicity) }}</b><small>{{ rankingDiagnostics.sample_size }} 个冻结样本</small></div>
+        </template>
+        <div v-else><span>有效样本</span><b>{{ rankingDiagnostics.sample_size || 0 }} / {{ rankingDiagnostics.minimum_sample || 8 }}</b><small>不足时拒绝给出校准结论</small></div>
+      </div>
     </div>
 
     <div class="grid cols-2" v-if="comparison">
       <div class="card">
-        <div class="panel-title-row"><h2>V3 训练层复评</h2><span class="tag amber">{{ comparison.portfolio_mode }}</span></div>
+        <div class="panel-title-row"><h2>V4 训练层复评</h2><span class="tag amber">{{ comparison.portfolio_mode }}</span></div>
         <table><tr><th>表达式</th><th>PUB ICIR</th><th>GATE ICIR</th><th>GATE 费后 Sharpe</th><th>研究分</th></tr>
           <tr v-for="r in comparison.results" :key="r.expression"><td class="mono-expr">{{ r.expression }}</td><td>{{ f(r.public?.icir) }}</td><td>{{ f(r.gate?.icir) }}</td><td>{{ f(layerSharpe(r.gate)) }}</td><td><b>{{ f(r.discovery?.score) }}</b></td></tr></table>
       </div>
@@ -416,15 +425,16 @@ const FactorLibraryWorkbench = {
 
     <div class="card">
       <div class="panel-title-row"><h2>研究资产</h2><span class="sub">{{ visibleFactors.length }} 条 · 点击行读取详情与相似因子</span></div>
-      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>结构组</th><th>表达式</th><th>协议</th><th>生命周期</th><th>等级</th><th>PUB ICIR</th><th>GATE Sharpe</th><th>研究分</th><th>来源</th></tr>
+      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>实盘排序</th><th>判断</th><th>结构组</th><th>表达式</th><th>协议</th><th>等级</th><th>HOLDOUT Sharpe LCB</th><th>成本缓冲</th><th>研究分</th><th>来源</th></tr>
         <tr v-for="fa in visibleFactors" :key="fa.id" class="clickable" @click="open(fa)">
           <td @click.stop><input type="checkbox" :value="fa.id" v-model="selected" /></td><td><b>{{ fa.name }}</b></td>
+          <td><div class="live-rank-cell"><b>{{ fa.ranking?.score == null ? '—' : Number(fa.ranking.score).toFixed(1) }}</b><small v-if="fa.ranking?.position">#{{ fa.ranking.position }}</small></div></td>
+          <td><span class="tag" :class="rankStatusClass(fa.ranking?.status)">{{ rankStatusLabel(fa.ranking?.status) }}</span></td>
           <td><button class="group-chip" @click.stop="groupFilter=groupFor(fa.id)">{{ groupFor(fa.id) || '—' }}</button></td>
           <td class="mono-expr factor-expression">{{ fa.expression }}</td>
-          <td><span class="tag" :class="fa.evaluation_protocol==='v3.0' ? 'green' : 'amber'">{{ fa.evaluation_protocol }}</span></td>
-          <td><span class="tag" :class="{green:fa.lifecycle_stage?.includes('live'), blue:fa.lifecycle_stage==='research_pass', amber:fa.lifecycle_stage?.includes('paper'), red:fa.lifecycle_stage==='legacy_unreviewed'}">{{ fa.lifecycle_stage }}</span></td>
+          <td><span class="tag" :class="fa.evaluation_protocol==='v4.0' ? 'green' : 'amber'">{{ fa.evaluation_protocol }}</span></td>
           <td><b :class="gradeClass(fa.eligibility?.grade)">{{ fa.eligibility?.grade || '—' }}</b></td>
-          <td>{{ f(fa.public?.icir) }}</td><td>{{ f(layerSharpe(fa.gate)) }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
+          <td>{{ f(fa.ranking?.evidence?.holdout_sharpe_lcb) }}</td><td>{{ fa.ranking?.evidence?.cost_cushion_multiple == null ? '—' : f(fa.ranking.evidence.cost_cushion_multiple) + '×' }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
           <td><span class="tag" :class="fa.provenance_status?.includes('invalid') ? 'red' : ''">{{ fa.provenance_status }}</span></td>
         </tr></table>
       <div v-if="!visibleFactors.length" class="selector-empty"><h2>当前筛选没有结果</h2><p>降低筛选条件，或清除相似组筛选。</p></div>
@@ -432,7 +442,7 @@ const FactorLibraryWorkbench = {
 
     <div class="drawer" v-if="detail">
       <button class="btn close" @click="detail=null">✕ 关闭</button>
-      <div class="panel-title-row"><div><h2>{{ detail.factor.name }}</h2><div class="sub">{{ detail.factor.lifecycle_stage }} · {{ detail.factor.provenance_status }}</div></div><div><span class="tag" :class="detail.factor.evaluation_protocol==='v3.0'?'green':'amber'">{{ detail.factor.evaluation_protocol }}</span> <span class="tag amber">NON_PIT</span></div></div>
+      <div class="panel-title-row"><div><h2>{{ detail.factor.name }}</h2><div class="sub">{{ detail.factor.lifecycle_stage }} · {{ detail.factor.provenance_status }}</div></div><div><span class="tag" :class="detail.factor.evaluation_protocol==='v4.0'?'green':'amber'">{{ detail.factor.evaluation_protocol }}</span> <span class="tag amber">NON_PIT</span></div></div>
       <div class="expression-display">
         <label class="latex-toggle"><input type="checkbox" v-model="showLatex" /> 以 Web LaTeX 渲染 DSL</label>
         <div v-if="showLatex" ref="latexEl" class="latex-expression"></div>
@@ -440,6 +450,21 @@ const FactorLibraryWorkbench = {
         <div class="sub">DSL: <code>{{ detail.factor.expression }}</code></div>
       </div>
       <p class="sub">{{ detail.factor.hypothesis }}</p>
+      <div class="live-rank-hero" v-if="detail.factor.ranking?.available">
+        <div class="live-rank-score"><span>实盘排序分</span><b>{{ Number(detail.factor.ranking.score).toFixed(1) }}</b><small>{{ rankStatusLabel(detail.factor.ranking.status) }} · Vault {{ detail.factor.ranking.vault_seal }}</small></div>
+        <div class="live-rank-evidence">
+          <div><span>HOLDOUT Sharpe LCB</span><b>{{ f(detail.factor.ranking.evidence?.holdout_sharpe_lcb) }}</b></div>
+          <div><span>年化收益 LCB</span><b>{{ pct(detail.factor.ranking.evidence?.holdout_ann_return_lcb) }}</b></div>
+          <div><span>收益 HAC t</span><b>{{ f(detail.factor.ranking.evidence?.holdout_return_hac_t) }}</b></div>
+          <div><span>成本缓冲</span><b>{{ f(detail.factor.ranking.evidence?.cost_cushion_multiple) }}×</b></div>
+        </div>
+        <div class="rank-components">
+          <div v-for="(value,key) in detail.factor.ranking.components" :key="key"><span>{{ componentLabel(key) }}</span><i><em :style="{width:(Number(value)*100).toFixed(0)+'%'}"></em></i><b>{{ (Number(value)*100).toFixed(0) }}</b></div>
+        </div>
+        <div class="sub">排序分不使用 Vault 数值；Vault 只作为通过/失败封印。详细 Vault 结果只用于全库校准诊断。</div>
+        <div v-if="detail.factor.ranking.warnings?.length" class="failure-list"><b>排序警告</b><ul><li v-for="warning in detail.factor.ranking.warnings" :key="warning">{{ warning }}</li></ul></div>
+      </div>
+      <div v-else class="warn-banner">尚无 V4 实盘排序。旧研究分不能用于实盘优先级，请运行完整 V4 审计。</div>
       <div class="card similarity-detail" v-if="detail.similarity">
         <div class="panel-title-row"><div><h3>结构近邻</h3><span class="sub">{{ detail.similarity.group_id || '单因子组' }} · 不读取未来收益</span></div><span class="tag blue">{{ detail.similarity.nearest?.length || 0 }} 个近邻</span></div>
         <div class="similar-factor-list">
@@ -448,18 +473,18 @@ const FactorLibraryWorkbench = {
       </div>
       <div v-if="detail.factor.validation?.source_provenance_warning" class="warn-banner">{{ detail.factor.validation.source_provenance_warning }}</div>
       <div class="card audit-controls">
-        <div class="panel-title-row"><div><h3>完整 V3 审计</h3><span class="sub">显式读取 HOLDOUT 与 VAULT，并把结果持久化；不会反馈给 Miner。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
+        <div class="panel-title-row"><div><h3>完整 V4 审计</h3><span class="sub">生成费后实盘排序并持久化；HOLDOUT/Vault 不会反馈给 Miner，Vault 数值也不进入排序公式。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
         <div class="form-row"><div><label>股票池</label><input type="number" v-model.number="auditForm.universe_n" /></div><div><label>持有期</label><select v-model.number="auditForm.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="10">10日</option><option :value="20">20日</option></select></div><div><label>基础成本 bps</label><input type="number" v-model.number="auditForm.cost_bps" /></div><div><label>目标资金规模</label><input type="number" v-model.number="auditForm.target_capital" /></div></div>
         <div v-if="auditErr" style="color:var(--red)">{{ auditErr }}</div>
       </div>
       <div class="card" v-if="detail.factor.validation?.layers">
         <div class="panel-title-row"><h3>四层实战指标</h3><div><span class="grade-pill" :class="gradeClass(detail.factor.eligibility?.grade)">{{ detail.factor.eligibility?.grade }}</span> <span class="tag">{{ detail.factor.eligibility?.stage }}</span></div></div>
-        <table><tr><th>层</th><th>ICIR</th><th>费后 Sharpe</th><th>年化</th><th>最大回撤</th><th>日均等效换手</th><th>单调性</th><th>压力最差</th></tr>
-          <tr v-for="(m,k) in detail.factor.validation.layers" :key="k"><td>{{ k.toUpperCase() }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(layerReturn(m)) }}</td><td>{{ pct(m?.net?.max_drawdown) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.monotonicity) }}</td><td>{{ f(worstStress(m)) }}</td></tr>
+        <table><tr><th>层</th><th>费后 Sharpe</th><th>Sharpe LCB</th><th>年化 LCB</th><th>收益 t</th><th>成本盈亏平衡</th><th>盈利 era</th><th>压力最差</th></tr>
+          <tr v-for="(m,k) in detail.factor.validation.layers" :key="k"><td>{{ k.toUpperCase() }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ f(m?.return_confidence?.sharpe_lcb) }}</td><td>{{ pct(m?.return_confidence?.ann_return_lcb) }}</td><td>{{ f(m?.return_confidence?.hac_t_stat) }}</td><td>{{ f(m?.cost_breakeven_bps) }} bps</td><td>{{ pct(m?.profitable_era_rate) }}</td><td>{{ f(worstStress(m)) }}</td></tr>
         </table>
         <div v-if="detail.factor.eligibility?.failure_reasons?.length" class="failure-list"><b>未通过原因</b><ul><li v-for="reason in detail.factor.eligibility.failure_reasons" :key="reason">{{ reason }}</li></ul></div>
       </div>
-      <div v-else class="card selector-empty"><h3>尚未完成 V3 全层审计</h3><p>旧评分仅作为历史记录。运行审计后才会生成 F1–F5 等级。</p></div>
+      <div v-else class="card selector-empty"><h3>尚未完成 V4 全层审计</h3><p>旧评分仅作为历史记录。运行审计后才会生成 F1–F5 等级与实盘排序分。</p></div>
       <div class="card"><h3>训练反馈层</h3><table><tr><th>层</th><th>ICIR</th><th>一致性</th><th>费后 Sharpe</th><th>日均等效换手</th><th>研究分</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
       <label>标签（逗号分隔）</label><input v-model="review.tags" placeholder="momentum, quality, low-turnover" /><label>研究备注</label><textarea v-model="review.note" rows="5" placeholder="记录经济机制、已知暴露、失败原因和后续动作"></textarea>
       <div style="margin-top:10px"><button class="btn primary" @click="saveReview">保存研究备注</button><span class="sub" style="margin-left:8px">experiment={{ detail.factor.experiment_id }}</span></div>
@@ -467,9 +492,10 @@ const FactorLibraryWorkbench = {
   </div>`,
   setup() {
     const factors = ref([]), selected = ref([]), detail = ref(null), comparison = ref(null);
-    const query = ref(""), status = ref(""), sort = ref("score");
+    const query = ref(""), status = ref(""), sort = ref("live_rank");
     const groups = ref([]), groupFilter = ref("");
     const groupStats = reactive({ groups: 0, duplicate_groups: 0, redundancy_ratio: 0 });
+    const rankingDiagnostics = reactive({ status:"insufficient_sample", sample_size:0, minimum_sample:8, metrics:null, message:"" });
     const showLatex = ref(true), latexEl = ref(null);
     const review = reactive({ tags: "", note: "" });
     const auditForm = reactive({ universe_n: 500, horizon: 5, cost_bps: 20, target_capital: 10000000 });
@@ -481,6 +507,26 @@ const FactorLibraryWorkbench = {
     const layerReturn = m => m?.active?.ann_return ?? m?.net?.ann_return;
     const worstStress = m => m?.cost_stress?.length ? Math.min(...m.cost_stress.map(x=>Number(x.sharpe))) : null;
     const gradeClass = grade => grade === "F5" ? "grade-f5" : grade === "F4" ? "grade-f4" : grade === "F3" ? "grade-f3" : "grade-low";
+    const calibrationLabel = value => ({
+      calibrated:"已校准", needs_review:"未通过", insufficient_sample:"样本不足",
+    })[value] || "未知";
+    const rankStatusLabel = value => ({
+      capital_priority_non_pit:"资本候选", paper_priority:"模拟优先",
+      passed_low_conviction:"低置信通过", capacity_limited:"容量受限",
+      vault_rejected:"Vault 拒绝", holdout_rejected:"OOS 拒绝",
+      research_rejected:"研究拒绝", missing_holdout:"缺少 OOS",
+    })[value] || "未审计";
+    const rankStatusClass = value => (
+      value === "capital_priority_non_pit" ? "green"
+      : value === "paper_priority" ? "blue"
+      : value?.includes("rejected") ? "red"
+      : value ? "amber" : ""
+    );
+    const componentLabel = value => ({
+      net_profitability_lcb:"费后盈利下界", selection_confidence:"选择置信度",
+      cost_regime_robustness:"成本/状态稳健", oos_generalization:"样本外保持",
+      implementability:"可执行性", signal_quality:"信号质量",
+    })[value] || value;
     const factorGroupMap = computed(() => {
       const out = new Map();
       groups.value.forEach(g => (g.factor_ids || []).forEach(id => out.set(Number(id), g.id)));
@@ -509,13 +555,15 @@ const FactorLibraryWorkbench = {
     async function refresh() {
       const params = new URLSearchParams({ limit: "500", sort: sort.value });
       if (query.value) params.set("q", query.value); if (status.value) params.set("lifecycle", status.value);
-      const [factorData, groupData] = await Promise.all([
+      const [factorData, groupData, diagnostics] = await Promise.all([
         api("/factors?" + params.toString(), { cacheTtl: 1000 }),
         api("/factors/similarity-groups", { cacheTtl: 5000 }),
+        api("/factors/ranking-diagnostics", { cacheTtl: 5000 }),
       ]);
       factors.value = factorData.factors;
       groups.value = groupData.groups || [];
       Object.assign(groupStats, groupData.stats || {});
+      Object.assign(rankingDiagnostics, diagnostics || {});
       if (groupFilter.value && !groups.value.some(g => g.id === groupFilter.value)) groupFilter.value = "";
       loadedExperimentVersion = appState.experimentVersion;
     }
@@ -563,9 +611,10 @@ const FactorLibraryWorkbench = {
     onActivated(ensureFresh);
     return {
       factors, visibleFactors, selected, detail, comparison, query, status, sort,
-      groups, groupFilter, groupStats, groupFor, familyLabel, showLatex, latexEl,
+      groups, groupFilter, groupStats, rankingDiagnostics, groupFor, familyLabel, showLatex, latexEl,
       review, auditForm, auditing, auditErr, f, pct, layerSharpe, layerReturn,
-      worstStress, gradeClass, refresh, toggleAll, open, openSimilar, compare,
+      worstStress, gradeClass, calibrationLabel, rankStatusLabel, rankStatusClass,
+      componentLabel, refresh, toggleAll, open, openSimilar, compare,
       runAudit, saveReview,
     };
   },
@@ -815,7 +864,13 @@ const SettingsView = {
         <div><label>OOS 最低 Sharpe</label><input v-model.number="taskForm.min_oos_sharpe" type="number" step="0.1" /></div>
         <div><label>最大回撤</label><input v-model.number="taskForm.max_drawdown" type="number" step="0.05" /></div>
         <div><label>最大日换手</label><input v-model.number="taskForm.max_daily_turnover" type="number" step="0.05" /></div>
-        <div style="align-self:end"><button class="btn primary" @click="createTask">按 V3 创建任务</button></div>
+        <div><label>收益下界置信度</label><input v-model.number="taskForm.return_lcb_confidence" type="number" min="0.51" max="0.99" step="0.01" /></div>
+        <div><label>收益 HAC t 门槛</label><input v-model.number="taskForm.min_return_hac_t" type="number" min="0" step="0.1" /></div>
+        <div><label>最低盈利 era 比例</label><input v-model.number="taskForm.min_profitable_era_rate" type="number" min="0" max="1" step="0.05" /></div>
+        <div><label>最低成本缓冲倍数</label><input v-model.number="taskForm.min_cost_cushion_multiple" type="number" min="0" step="0.25" /></div>
+        <div><label>预声明检验次数</label><input v-model.number="taskForm.multiple_testing_trials" type="number" min="1" step="100" /></div>
+        <div><label>排序目标年化</label><input v-model.number="taskForm.target_rank_ann_return" type="number" min="0.01" step="0.01" /></div>
+        <div style="align-self:end"><button class="btn primary" @click="createTask">按 V4 创建任务</button></div>
       </div>
       <div v-if="taskMsg" :style="{color: taskOk ? 'var(--green)' : 'var(--red)'}">{{ taskMsg }}</div>
     </div>
@@ -853,11 +908,11 @@ const SettingsView = {
         </div>
         <h3 style="margin-top:16px">任务集</h3>
         <table>
-          <tr><th>名称</th><th>股票池</th><th>持有期</th><th>成本bps</th></tr>
-          <tr v-for="t in eng.tasks" :key="t.name"><td>{{ t.name }}</td><td>{{ t.universe_n }}</td><td>{{ t.horizon }}日</td><td>{{ t.cost_bps }}</td></tr>
+          <tr><th>名称</th><th>股票池</th><th>持有期</th><th>A股成本</th><th>美股成本</th></tr>
+          <tr v-for="t in eng.tasks" :key="t.name"><td>{{ t.name }}</td><td>{{ t.universe_n }}</td><td>{{ t.horizon }}日</td><td>{{ t.cost_bps_by_market?.ashare ?? '—' }} bps</td><td>{{ t.cost_bps_by_market?.us ?? t.cost_bps }} bps</td></tr>
         </table>
-        <div class="sub" style="margin-top:8px">挖掘评分仅使用 INNER_PUBLIC + META_TRAIN；HOLDOUT 与 VAULT 只允许通过因子库里的显式 V3 审计读取，绝不进入循环提示词。</div>
-        <div class="protocol-card"><b>Evaluation Protocol {{ evalProtocol.version || 'v3.0' }}</b><span>真实目标权重换手 · 费后收益 · 多头/空头拆分 · 成本压力 · OOS 生命周期</span><small>{{ evalProtocol.policy_label }}</small></div>
+        <div class="sub" style="margin-top:8px">挖掘发现分仅使用 INNER_PUBLIC + META_TRAIN；V4 实盘排序使用 HOLDOUT，但 Vault 数值只做冻结校准，二者都绝不进入循环提示词。</div>
+        <div class="protocol-card"><b>Evaluation Protocol {{ evalProtocol.version || 'v4.0' }}</b><span>费后收益下界 · 多重检验 · 成本盈亏平衡 · OOS 实盘排序校准</span><small>{{ evalProtocol.policy_label }}</small></div>
       </div>
     </div>
     <div style="margin-top:14px; display:flex; gap:10px; align-items:center">
@@ -876,6 +931,9 @@ const SettingsView = {
       base_cost_bps: 20, stress_cost_bps: "10,20,35,50",
       borrow_cost_bps_annual: 0, target_capital: 10000000,
       min_oos_sharpe: 0.5, max_drawdown: 0.35, max_daily_turnover: 0.35,
+      return_lcb_confidence: 0.90, min_return_hac_t: 1.2816,
+      min_profitable_era_rate: 0.60, min_cost_cushion_multiple: 1.50,
+      multiple_testing_trials: 1000, target_rank_ann_return: 0.10,
     });
     const taskMsg = ref(""), taskOk = ref(false);
     async function load() {
@@ -900,13 +958,19 @@ const SettingsView = {
           name: taskForm.name, description: taskForm.description,
           research_config: { market: taskForm.market, portfolio_mode: taskForm.portfolio_mode,
             direction: taskForm.direction, engine_mode: taskForm.engine_mode,
-            panel_glob: taskForm.panel_glob || undefined, evaluation_protocol: "v3.0",
+            panel_glob: taskForm.panel_glob || undefined, evaluation_protocol: evalProtocol.version || "v4.0",
             evaluation_config: {
               top_fraction: taskForm.top_fraction, tail_fraction: taskForm.top_fraction,
               base_cost_bps: taskForm.base_cost_bps, stress_cost_bps: stress,
               borrow_cost_bps_annual: taskForm.borrow_cost_bps_annual,
               target_capital: taskForm.target_capital, min_oos_sharpe: taskForm.min_oos_sharpe,
               max_drawdown: taskForm.max_drawdown, max_daily_turnover: taskForm.max_daily_turnover,
+              return_lcb_confidence: taskForm.return_lcb_confidence,
+              min_return_hac_t: taskForm.min_return_hac_t,
+              min_profitable_era_rate: taskForm.min_profitable_era_rate,
+              min_cost_cushion_multiple: taskForm.min_cost_cushion_multiple,
+              multiple_testing_trials: taskForm.multiple_testing_trials,
+              target_rank_ann_return: taskForm.target_rank_ann_return,
             }},
         }});
         taskOk.value = true; taskMsg.value = "研究任务已创建，可在“实验”页启动";
@@ -918,10 +982,12 @@ const SettingsView = {
         taskForm.portfolio_mode = "long_only"; taskForm.base_cost_bps = 20;
         taskForm.stress_cost_bps = "10,20,35,50"; taskForm.borrow_cost_bps_annual = 0;
         taskForm.target_capital = 10000000; taskForm.max_daily_turnover = 0.35;
+        taskForm.target_rank_ann_return = 0.10;
       } else {
         taskForm.portfolio_mode = "long_short"; taskForm.base_cost_bps = 15;
         taskForm.stress_cost_bps = "5,15,25,40"; taskForm.borrow_cost_bps_annual = 300;
         taskForm.target_capital = 1000000; taskForm.max_daily_turnover = 0.50;
+        taskForm.target_rank_ann_return = 0.12;
       }
     }
     onMounted(load);
@@ -953,7 +1019,7 @@ const ExperimentsView = {
             <template v-else><b>{{ e.name }}</b> <span v-if="e.active" class="tag green">活动</span></template>
           </td>
           <td><span class="tag blue">{{ e.research_config?.market==='ashare' ? 'A股' : '美股' }}</span> <span class="sub">{{ e.research_config?.portfolio_mode==='long_only' ? '纯多头' : '多空' }} · {{ Number(e.research_config?.direction || 1)===1 ? '高值偏多' : '低值偏多' }}</span></td>
-          <td><span class="tag" :class="e.research_config?.evaluation_protocol==='v3.0'?'green':'amber'">{{ e.research_config?.evaluation_protocol || 'legacy' }}</span><div v-if="e.research_config?.provenance_warning" class="provenance-dot" :title="e.research_config.provenance_warning">来源警告</div></td>
+          <td><span class="tag" :class="e.research_config?.evaluation_protocol==='v4.0'?'green':'amber'">{{ e.research_config?.evaluation_protocol || 'legacy' }}</span><div v-if="e.research_config?.provenance_warning" class="provenance-dot" :title="e.research_config.provenance_warning">来源警告</div></td>
           <td><span class="tag" :class="{green: e.status==='open', amber: e.status==='archived'}">{{ e.status }}</span></td>
           <td><span class="tag" :class="{green: runtime[e.id]?.state==='running', amber: runtime[e.id]?.state==='starting', red: runtime[e.id]?.state==='stopped'}">{{ runtime[e.id]?.state || 'stopped' }}</span></td>
           <td>{{ e.counts.factors }}</td><td>{{ e.counts.nodes }}</td><td>{{ e.counts.outer_steps }}</td>

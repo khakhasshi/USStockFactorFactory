@@ -30,6 +30,7 @@ from .config import (
     DEFAULT_PORTFOLIO_MODE,
     EVALUATION_PROTOCOL_VERSION,
     get_dsl_fields,
+    resolve_engine_tasks,
 )
 from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
@@ -436,16 +437,15 @@ class Engine:
             row = await s.get(Setting, "engine_config")
             cfg = {**DEFAULT_ENGINE_CONFIG_V2, **(row.value if row else {})}
             task_cfg = self.task_config.get("engine_config", {})
+            local_tasks = task_cfg.get("tasks")
             cfg.update(task_cfg)
-            cfg["tasks"] = [
-                {
-                    "market": self.task_config.get("market", "us"),
-                    **t,
-                    "mode": self._portfolio_mode(),
-                    "direction": self._signal_direction(),
-                }
-                for t in cfg.get("tasks", [])
-            ]
+            cfg["tasks"] = resolve_engine_tasks(
+                local_tasks or cfg.get("tasks", []),
+                self.task_config.get("market", "us"),
+                self._portfolio_mode(),
+                self._signal_direction(),
+                preserve_declared_costs=bool(local_tasks),
+            )
             return cfg
 
     # ================================================================
@@ -707,16 +707,16 @@ class Engine:
         async with SessionLocal() as s:
             row = await s.get(Setting, "engine_config")
             cfg = {**DEFAULT_ENGINE_CONFIG, **(row.value if row else {})}
-            cfg.update(self.task_config.get("engine_config", {}))
-            cfg["tasks"] = [
-                {
-                    "market": self.task_config.get("market", "us"),
-                    **t,
-                    "mode": self._portfolio_mode(),
-                    "direction": self._signal_direction(),
-                }
-                for t in cfg.get("tasks", [])
-            ]
+            task_cfg = self.task_config.get("engine_config", {})
+            local_tasks = task_cfg.get("tasks")
+            cfg.update(task_cfg)
+            cfg["tasks"] = resolve_engine_tasks(
+                local_tasks or cfg.get("tasks", []),
+                self.task_config.get("market", "us"),
+                self._portfolio_mode(),
+                self._signal_direction(),
+                preserve_declared_costs=bool(local_tasks),
+            )
             return cfg
 
 
