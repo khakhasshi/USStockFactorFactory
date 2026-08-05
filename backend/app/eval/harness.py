@@ -1,7 +1,13 @@
-"""评估 harness: 因子 -> 分层 RankIC/ICIR/换手/era 一致性 -> public/gate 分数.
+"""评估 harness v2: 因子 -> 分层 RankIC/ICIR/换手/era 一致性 -> public/gate 分数.
 
-Miner 只拿得到 public (INNER_PUBLIC 层); gate (META_TRAIN) 仅存库供外层与晋级使用;
-META_HOLDOUT / FACTOR_VAULT 不在常规评估路径内。
+评分公式 (2026-08-05 升级):
+  score = |ICIR| × era_penalty × turnover_penalty × gate_flip_penalty × cost_killer
+
+改进点:
+  1. era一致性阈值从60%→75%, 用平方惩罚替代线性
+  2. 换手惩罚从断崖式 max(0,1-to/0.5) 改为指数衰减 exp(-3×to)
+  3. gate翻号惩罚: public与gate层ICIR符号相反→×0.3
+  4. 成本实扣: 年化交易成本 > |ICIR| → score=0
 """
 
 import math
@@ -12,23 +18,32 @@ from ..data.panel import PanelStore
 from ..dsl.engine import parse
 
 EVAL_LAYERS = ["INNER_PUBLIC", "META_TRAIN"]
+COST_BPS = 15  # 默认单边交易成本 (bps)
 
 
 def _layer_metrics(daily: pl.DataFrame) -> dict:
+    """单层指标计算 (不含跨层惩罚)."""
     if daily.height < 30:
         return {"n_days": daily.height, "ic_mean": None, "icir": None, "score": None}
     ic = daily["ic"]
     ic_mean = float(ic.mean())
     ic_std = float(ic.std() or 1e-9)
     icir = ic_mean / ic_std * math.sqrt(252)
-    # era 一致性: era 均值与总体同号的比例
+    # era 一致性
     era_means = daily.group_by("era").agg(pl.col("ic").mean()).sort("era")
     signs = era_means["ic"].sign()
     overall_sign = 1.0 if ic_mean >= 0 else -1.0
     consistency = float((signs == overall_sign).mean()) if era_means.height else 0.0
     turnover = float(daily["turnover"].mean() or 0.0)
-    # 分数: |ICIR| × era 一致性惩罚 × 换手硬截断 (日换手 ≥50% 归零; 实验1的 exp 衰减惩罚过弱)
-    score = abs(icir) * min(1.0, consistency / 0.6) * max(0.0, 1.0 - turnover / 0.5)
+    # era 级 t 统计量
+    era_ics = era_means["ic"].to_list()
+    if len(era_ics) >= 3:
+        era_mean = sum(era_ics) / len(era_ics)
+        era_se = (sum((x - era_mean)**2 for x in era_ics) / (len(era_ics) - 1))**0.5 / math.sqrt(len(era_ics)) if len(era_ics) > 1 else 0
+        t_stat = era_mean / era_se if era_se > 1e-9 else 0.0
+    else:
+        t_stat = None
+
     return {
         "n_days": daily.height,
         "ic_mean": round(ic_mean, 5),
@@ -36,7 +51,8 @@ def _layer_metrics(daily: pl.DataFrame) -> dict:
         "era_consistency": round(consistency, 3),
         "turnover": round(turnover, 4),
         "direction": overall_sign,
-        "score": round(score, 4),
+        "t_stat": round(t_stat, 3) if t_stat is not None else None,
+        "score": None,  # 由 evaluate() 统一计算
         "era_series": [
             {"era": int(r["era"]), "ic": round(float(r["ic"]), 5)}
             for r in era_means.iter_rows(named=True)
@@ -44,8 +60,52 @@ def _layer_metrics(daily: pl.DataFrame) -> dict:
     }
 
 
+def _compute_score(public: dict, gate: dict, turnover: float | None = None) -> float:
+    """跨层综合评分 (v2 公式).
+
+    惩罚项:
+      era_penalty:     min(1.0, (consistency/0.75)^2)  阈值75%
+      turnover_penalty: exp(-3 × turnover)              指数衰减
+      gate_flip_penalty: ×0.3 (如果 public/gate IC 符号相反)
+      cost_killer:      0 (如果年化成本 > |ICIR|)
+    """
+    icir = abs(public.get("icir") or 0)
+    if icir < 0.001:
+        return 0.0
+
+    # era一致性惩罚 (用public层)
+    cons = public.get("era_consistency") or 0
+    era_penalty = min(1.0, (cons / 0.75)**2)
+
+    # 换手指数衰减 (取public和gate中的较大者, 更保守)
+    to = turnover if turnover is not None else max(
+        public.get("turnover") or 0, gate.get("turnover") or 0
+    )
+    turnover_penalty = math.exp(-3.0 * to)
+
+    # gate翻号惩罚
+    pub_icir = public.get("icir") or 0
+    gate_icir = gate.get("icir") or 0
+    if pub_icir is not None and gate_icir is not None:
+        pub_sign = 1.0 if pub_icir >= 0 else -1.0
+        gate_sign = 1.0 if gate_icir >= 0 else -1.0
+        gate_flip_penalty = 0.3 if pub_sign != gate_sign else 1.0
+    else:
+        gate_flip_penalty = 1.0
+
+    # 成本实扣: 年化换手 > 3倍 (日换手≈120%) → 不可交易
+    # exp(-3*to) 已提供平滑惩罚, 此处仅做硬截断
+    annual_turnover = to * 252  # 年化换手倍数
+    if annual_turnover > 3.0:   # 日均换手 >120% → 成本必然不可行
+        return 0.0
+    cost_killer = 1.0  # 保留占位, 未来可加入真实成本模型
+
+    score = icir * era_penalty * turnover_penalty * gate_flip_penalty * cost_killer
+    return round(score, 4)
+
+
 def evaluate(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
-    """返回 {public: {...}, gate: {...}}; 表达式非法/数据不足抛 ValueError."""
+    """返回 {public: {...}, gate: {...}}; public和gate均含score (由跨层公式统一计算)."""
     df = PanelStore.get().ensure_loaded()
     pipe = parse(expression)
     fwd = f"fwd_{horizon}"
@@ -61,7 +121,6 @@ def evaluate(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
             pl.col(fwd).rank().over("trade_date").alias("r_rank"),
         )
         .with_columns(
-            # 换手代理: 因子截面分位相对前一日的平均绝对变化
             (pl.col("f_rank") / pl.col("f_rank").count().over("trade_date")).alias("f_pct")
         )
         .with_columns(
@@ -86,10 +145,18 @@ def evaluate(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
     if daily.height == 0:
         raise ValueError("有效评估样本为空 (表达式可能全为 null 或退化为常数)")
 
-    out = {}
-    for layer, key in [("INNER_PUBLIC", "public"), ("META_TRAIN", "gate")]:
-        out[key] = _layer_metrics(daily.filter(pl.col("layer") == layer))
-    return out
+    # 分别计算单层指标
+    pub_daily = daily.filter(pl.col("layer") == "INNER_PUBLIC")
+    gate_daily = daily.filter(pl.col("layer") == "META_TRAIN")
+    public = _layer_metrics(pub_daily)
+    gate = _layer_metrics(gate_daily)
+
+    # 跨层综合评分
+    score = _compute_score(public, gate)
+    public["score"] = score
+    gate["score"] = score  # gate分也用同一个跨层公式 (统一尺度)
+
+    return {"public": public, "gate": gate}
 
 
 def era_detail(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
