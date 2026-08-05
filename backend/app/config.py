@@ -117,11 +117,15 @@ def get_dsl_fields(market: str | None = None) -> list[str]:
     return list(ASHARE_DSL_FIELDS if market == "ashare" else US_DSL_FIELDS if market == "us" else DSL_FIELDS)
 
 
-# ---- Evaluation Protocol V4 ----
-# V4 keeps the mining score isolated from HOLDOUT/VAULT and adds a separate
-# live-oriented audit rank.  PIT is deliberately outside this score at the
-# user's request; the API keeps the panel's NON_PIT label visible separately.
-EVALUATION_PROTOCOL_VERSION = "v4.0"
+# ---- Evaluation Protocol V4.2 ----
+# V4.1 separated the hard admission gate from a continuous failure-aware
+# learning score.  V4.2 additionally evaluates both signal orientations on
+# training-safe layers, pays a two-sided search penalty, then freezes the
+# selected direction before any HOLDOUT/VAULT access.
+EVALUATION_PROTOCOL_VERSION = "v4.2"
+DIRECTION_POLICY_BOTH = "both_train_select"
+DIRECTION_POLICY_FIXED = "fixed"
+DEFAULT_RESEARCH_DIRECTION_POLICY = DIRECTION_POLICY_BOTH
 DEFAULT_EVALUATION_CONFIG = {
     "protocol_version": EVALUATION_PROTOCOL_VERSION,
     "top_fraction": 0.20,
@@ -196,6 +200,10 @@ def evaluation_config(market: str, overrides: dict | None = None) -> dict:
         "multiple_testing_alpha": src["multiple_testing_alpha"],
     }
     cfg.update(overrides or {})
+    # A caller may copy an older experiment snapshot into a new task.  The
+    # implementation version is authoritative and cannot be downgraded through
+    # an override while the evaluator is executing newer score semantics.
+    cfg["protocol_version"] = EVALUATION_PROTOCOL_VERSION
     for key in (
         "top_fraction",
         "tail_fraction",
@@ -296,6 +304,7 @@ def resolve_engine_tasks(
     market: str,
     portfolio_mode: str,
     direction: int,
+    direction_policy: str = DEFAULT_RESEARCH_DIRECTION_POLICY,
     *,
     preserve_declared_costs: bool = False,
 ) -> list[dict]:
@@ -316,6 +325,7 @@ def resolve_engine_tasks(
             "market": market,
             "mode": portfolio_mode,
             "direction": direction,
+            "direction_policy": direction_policy,
             "universe_n": universe_n,
             "horizon": horizon,
             "cost_bps": cost_bps,

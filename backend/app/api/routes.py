@@ -20,6 +20,8 @@ from ..config import (
     DEFAULT_ENGINE_CONFIG,
     DEFAULT_EVALUATION_CONFIG,
     DEFAULT_PORTFOLIO_MODE,
+    DEFAULT_RESEARCH_DIRECTION_POLICY,
+    DIRECTION_POLICY_FIXED,
     EVALUATION_PROTOCOL_VERSION,
     PANEL_GLOB,
     default_panel_glob,
@@ -37,6 +39,10 @@ from ..dsl.engine import (
 )
 from ..eval.harness import evaluate, evaluate_full
 from ..eval.ranking import ranking_diagnostics
+from ..feedback import (
+    FEEDBACK_SCHEMA_VERSION,
+    OUTER_REPORT_SCHEMA_VERSION,
+)
 from ..factors.similarity import (
     build_similarity_index,
     expression_fingerprint,
@@ -108,6 +114,10 @@ def _resolved_task_pool(cfg: dict, global_engine: Setting | None) -> list[dict]:
         "long_only" if market == "ashare" else "long_short",
     )
     direction = int(cfg.get("direction", 1))
+    direction_policy = str(
+        cfg.get("direction_policy")
+        or DEFAULT_RESEARCH_DIRECTION_POLICY
+    )
     local_tasks = (cfg.get("engine_config") or {}).get("tasks")
     global_tasks = (global_engine.value if global_engine else {}).get("tasks")
     return resolve_engine_tasks(
@@ -115,6 +125,7 @@ def _resolved_task_pool(cfg: dict, global_engine: Setting | None) -> list[dict]:
         market,
         mode,
         direction,
+        direction_policy,
         preserve_declared_costs=bool(local_tasks),
     )
 
@@ -395,6 +406,39 @@ async def research_tree(miner_version_id: int | None = None, experiment_id: int 
              "hypothesis": n.hypothesis, "status": n.status,
              "error": redact_text(n.error, 1200),
              "public_score": n.public_score, "source": n.source, "task": n.task_name,
+             "learning_score": n.public_score,
+             "gate_score": float(
+                 ((n.public_metrics or {}).get("discovery") or {}).get(
+                     "gate_score",
+                     0.0,
+                 )
+                 or 0.0
+             ),
+             "selected_direction": int(
+                 ((n.public_metrics or {}).get("discovery") or {}).get(
+                     "selected_direction",
+                     (n.feedback_summary or {}).get(
+                         "direction",
+                         (n.public_metrics or {}).get("direction", 1),
+                     ),
+                 )
+                 or 1
+             ),
+             "direction_policy": (
+                 ((n.public_metrics or {}).get("discovery") or {}).get(
+                     "direction_policy"
+                 )
+             ),
+             "direction_selection": (
+                 ((n.public_metrics or {}).get("discovery") or {}).get(
+                     "direction_selection"
+                 )
+             ),
+             "score_semantics": (
+                 ((n.public_metrics or {}).get("discovery") or {}).get(
+                     "score_semantics"
+                 )
+             ),
              "outer_step": n.outer_step_no, "created_at": str(n.created_at),
              "evaluation_protocol": n.evaluation_protocol, "seed": n.seed,
              "proposal_meta": n.proposal_meta,
@@ -689,6 +733,7 @@ async def factor_detail(fid: int):
                 task.get("direction", cfg.get("direction", 1)),
             )
         ),
+        "direction_policy": DIRECTION_POLICY_FIXED,
         "cost_bps": float(task.get("cost_bps", resolved_eval["base_cost_bps"])),
         "target_capital": float(resolved_eval["target_capital"]),
         "market": market,
@@ -770,10 +815,15 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
         raise HTTPException(400, "direction 必须为 1 或 -1")
     if req.cost_bps is not None and req.cost_bps < 0:
         raise HTTPException(400, "cost_bps 不能为负数")
+    factor_meta = dict(f.research_meta or {})
+    direction_trials_multiplier = max(
+        1,
+        int(factor_meta.get("direction_trials_multiplier") or 1),
+    )
     overrides = evaluation_config(market, cfg.get("evaluation_config"))
     overrides["multiple_testing_trials"] = max(
         int(overrides["multiple_testing_trials"]),
-        actual_trials,
+        actual_trials * direction_trials_multiplier,
         1,
     )
     if req.target_capital is not None:
@@ -792,6 +842,7 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             req.cost_bps if req.cost_bps is not None else task.get("cost_bps"),
             market,
             overrides,
+            DIRECTION_POLICY_FIXED,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -837,6 +888,7 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             "last_audit_horizon": horizon,
             "policy_label": "NON_PIT_RESEARCH",
             "multiple_testing_trials": overrides["multiple_testing_trials"],
+            "direction_trials_multiplier": direction_trials_multiplier,
         })
         factor.research_meta = meta
         s.add(Trial(
@@ -849,6 +901,9 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
                 "stage": audit["eligibility"]["stage"],
                 "live_rank_score": audit["ranking"].get("score"),
                 "score_pre_vault": audit["ranking"].get("score_pre_vault"),
+                "direction": direction,
+                "direction_policy": DIRECTION_POLICY_FIXED,
+                "direction_trials_multiplier": direction_trials_multiplier,
                 "protocol_version": EVALUATION_PROTOCOL_VERSION,
             },
         ))
@@ -931,6 +986,7 @@ class FactorCompareReq(BaseModel):
 
 def _latest_factor_correlation(
     expressions: list[str],
+    directions: list[int],
     panel_glob: str | None,
     universe_n: int,
     market: str,
@@ -940,10 +996,15 @@ def _latest_factor_correlation(
     fields = get_dsl_fields(market)
     target = df["trade_date"].max()
     merged = None
-    for i, expression in enumerate(expressions):
+    for i, (expression, direction) in enumerate(
+        zip(expressions, directions)
+    ):
         frame = parse(expression, fields).apply(df.lazy()).filter(
             (pl.col("trade_date") == target) & (pl.col("univ_rank") <= universe_n)
-        ).select("ts_code", pl.col("factor").alias(f"f{i}")).collect()
+        ).select(
+            "ts_code",
+            (pl.col("factor") * direction).alias(f"f{i}"),
+        ).collect()
         merged = frame if merged is None else merged.join(frame, on="ts_code", how="inner")
     if merged is None or merged.height < 30:
         return {"date": str(target), "n": 0, "matrix": []}
@@ -988,6 +1049,7 @@ async def compare_factors(req: FactorCompareReq):
     if any(direction not in {-1, 1} for _, direction in items):
         raise HTTPException(400, "direction 必须为 1 或 -1")
     expressions = [expression for expression, _ in items]
+    directions = [direction for _, direction in items]
     mode = req.portfolio_mode or cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
     market = cfg.get("market", "us")
     resolved_eval = evaluation_config(market, cfg.get("evaluation_config"))
@@ -1005,6 +1067,7 @@ async def compare_factors(req: FactorCompareReq):
                 resolved_eval["base_cost_bps"],
                 market,
                 cfg.get("evaluation_config"),
+                DIRECTION_POLICY_FIXED,
             )
             results.append({"expression": expression, "direction": direction, **metrics})
         except ValueError as exc:
@@ -1012,6 +1075,7 @@ async def compare_factors(req: FactorCompareReq):
     corr = await asyncio.to_thread(
         _latest_factor_correlation,
         expressions,
+        directions,
         cfg.get("panel_glob"),
         req.universe_n,
         market,
@@ -1022,6 +1086,7 @@ async def compare_factors(req: FactorCompareReq):
         "protocol_version": EVALUATION_PROTOCOL_VERSION,
         "results": results,
         "correlation": corr,
+        "correlation_semantics": "direction_adjusted_signal",
     }
 
 
@@ -1032,6 +1097,7 @@ class EvalReq(BaseModel):
     horizon: int = 5
     portfolio_mode: str | None = None
     direction: int = 1
+    direction_policy: str = DEFAULT_RESEARCH_DIRECTION_POLICY
     panel_glob: str | None = None
     cost_bps: float | None = None
     full_audit: bool = False
@@ -1059,6 +1125,7 @@ async def manual_evaluate(req: EvalReq):
             req.cost_bps,
             market,
             cfg.get("evaluation_config"),
+            req.direction_policy,
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
@@ -1090,6 +1157,8 @@ class BacktestReq(BaseModel):
 async def backtest(req: BacktestReq):
     eid, cfg = await _experiment_context(req.experiment_id)
     market = cfg.get("market", "us")
+    if req.direction not in {-1, 1}:
+        raise HTTPException(400, "direction 必须为 1 或 -1")
     err = validate(req.expression, get_dsl_fields(market))
     if err:
         raise HTTPException(400, f"表达式非法: {err}")
@@ -1454,6 +1523,7 @@ async def create_experiment(req: ExperimentReq):
     direction = int(req.research_config.get("direction", 1))
     if direction not in {-1, 1}:
         raise HTTPException(400, "direction 必须为 1 或 -1")
+    direction_policy = DEFAULT_RESEARCH_DIRECTION_POLICY
     try:
         resolved_evaluation = evaluation_config(
             market,
@@ -1476,6 +1546,7 @@ async def create_experiment(req: ExperimentReq):
                 "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
                 "evaluation_config": resolved_evaluation,
                 "direction": direction,
+                "direction_policy": direction_policy,
             },
         )
         s.add(e)
@@ -1518,6 +1589,7 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             direction = int(merged.get("direction", 1))
             if direction not in {-1, 1}:
                 raise HTTPException(400, "direction 必须为 1 或 -1")
+            direction_policy = DEFAULT_RESEARCH_DIRECTION_POLICY
             market_changed = (
                 "market" in req.research_config
                 and req.research_config["market"] != (e.research_config or {}).get("market")
@@ -1542,12 +1614,14 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             merged["evaluation_protocol"] = EVALUATION_PROTOCOL_VERSION
             merged["engine_mode"] = "v2"
             merged["direction"] = direction
+            merged["direction_policy"] = direction_policy
             e.research_config = merged
             material_keys = {
                 "market",
                 "portfolio_mode",
                 "panel_glob",
                 "direction",
+                "direction_policy",
                 "evaluation_protocol",
                 "evaluation_config",
             }
@@ -1631,6 +1705,7 @@ async def inspect_dsl(req: DSLInspectReq):
 class ScreenerReq(BaseModel):
     factors: list[dict] = Field(default_factory=list)  # [{"expression": "...", "weight": 1.0}, ...]
     expression: str | None = None  # 单个 DSL 直接选股
+    expression_direction: int = 1
     panel_glob: str | None = None
     date: str | None = None  # YYYY-MM-DD, None=最新交易日
     universe_n: int = 500
@@ -1653,7 +1728,11 @@ async def screener(req: ScreenerReq):
         raise HTTPException(400, "top_n 必须在 1 到 500 之间")
     factors = list(req.factors)
     if req.expression:
-        factors = [{"expression": req.expression, "weight": 1.0}]
+        factors = [{
+            "expression": req.expression,
+            "weight": 1.0,
+            "direction": req.expression_direction,
+        }]
     if not factors:
         raise HTTPException(400, "至少需要一个因子")
     for factor in factors:
@@ -1733,6 +1812,10 @@ async def meta(experiment_id: int | None = None, load_panel: bool = False):
         "market": market,
         "portfolio_mode": cfg.get("portfolio_mode"),
         "direction": int(cfg.get("direction", 1)),
+        "direction_policy": cfg.get(
+            "direction_policy",
+            DEFAULT_RESEARCH_DIRECTION_POLICY,
+        ),
         "evaluation_protocol": cfg.get("evaluation_protocol", "legacy"),
         "evaluation_config": evaluation_config(market, cfg.get("evaluation_config")),
         "dsl_fields": get_dsl_fields(cfg.get("market")),
@@ -1955,8 +2038,8 @@ async def _database_observability() -> dict:
             node_covered = int(node_coverage["covered"] or 0)
             version_evaluated = int(version_coverage["evaluated"] or 0)
             result["llm_pipeline"] = {
-                "feedback_schema": "factorfactory.evaluation-feedback/v1",
-                "outer_report_schema": "factorfactory.outer-feedback/v1",
+                "feedback_schema": FEEDBACK_SCHEMA_VERSION,
+                "outer_report_schema": OUTER_REPORT_SCHEMA_VERSION,
                 "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
                 "isolation": {
                     "training_feedback": "PUBLIC + META_TRAIN 保守聚合",
@@ -2111,6 +2194,10 @@ async def _active_configuration_snapshot() -> tuple[dict, dict]:
                 "long_only" if market == "ashare" else "long_short",
             ),
             "direction": int(config.get("direction", 1)),
+            "direction_policy": config.get(
+                "direction_policy",
+                DEFAULT_RESEARCH_DIRECTION_POLICY,
+            ),
             "evaluation_protocol": config.get(
                 "evaluation_protocol",
                 "legacy",

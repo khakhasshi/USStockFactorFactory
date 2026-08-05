@@ -24,6 +24,7 @@ from datetime import datetime
 from sqlalchemy import func, select
 
 from .config import (
+    DEFAULT_RESEARCH_DIRECTION_POLICY,
     DEFAULT_ENGINE_CONFIG,
     DEFAULT_ENGINE_CONFIG_V2,
     DEFAULT_HARNESS_SPEC,
@@ -150,6 +151,12 @@ class Engine:
         if direction not in {-1, 1}:
             raise ValueError("研究任务 direction 必须为 1 或 -1")
         return direction
+
+    def _direction_policy(self) -> str:
+        return str(
+            self.task_config.get("direction_policy")
+            or DEFAULT_RESEARCH_DIRECTION_POLICY
+        )
 
     async def start(self, mode: str = "v2", experiment_id: int | None = None) -> dict:
         if mode != "v2":
@@ -316,6 +323,7 @@ class Engine:
             market=self.task_config.get("market", "us"),
             portfolio_mode=self._portfolio_mode(),
             direction=self._signal_direction(),
+            direction_policy=self._direction_policy(),
             trace_context={
                 "experiment_id": self.exp_id,
                 "outer_step_no": step_no,
@@ -429,11 +437,23 @@ class Engine:
         )
         p_value = test["p_value"]
         p_threshold = float(cfg["outer_accept_p_value"])
+        gate_non_degrading = float(
+            cand_report.get("gate_score_mean") or 0.0
+        ) + 1e-4 >= float(
+            inc_report.get("gate_score_mean") or 0.0
+        )
+        pass_rate_non_degrading = float(
+            cand_report.get("pass_rate") or 0.0
+        ) + 1e-9 >= float(
+            inc_report.get("pass_rate") or 0.0
+        )
         accepted = bool(
             len(cand_scores) == n_seeds
             and len(cand_scores) >= 2
             and cand_mean > inc_mean
             and p_value < p_threshold
+            and gate_non_degrading
+            and pass_rate_non_degrading
         )
         comparison = compare_feedback_reports(cand_report, inc_report)
         outcome_reflection, reflection_source = await reflect_on_outcome(
@@ -475,6 +495,10 @@ class Engine:
                     "cand_scores": cand_scores, "cand_std": cand_std,
                     "inc_scores": inc_scores, "inc_std": inc_std,
                     "p_value": p_value, "test": test, "mode": "v2",
+                    "admission_safety": {
+                        "gate_score_non_degrading": gate_non_degrading,
+                        "pass_rate_non_degrading": pass_rate_non_degrading,
+                    },
                     "candidate_report": cand_report,
                     "incumbent_report": inc_report,
                     "comparison": comparison,
@@ -507,7 +531,13 @@ class Engine:
                 cand_db.status = "rejected"
             await s.commit()
 
-        await self.log(f"[V2] 外层步 {step_no}: cand {cand_mean:.4f}±{cand_std:.3f} vs inc {inc_mean:.4f}±{inc_std:.3f} -> {verdict}")
+        await self.log(
+            f"[V2] 外层步 {step_no}: "
+            f"learn cand {cand_mean:.4f}±{cand_std:.3f} "
+            f"vs inc {inc_mean:.4f}±{inc_std:.3f}; "
+            f"gate_safe={gate_non_degrading} "
+            f"pass_safe={pass_rate_non_degrading} -> {verdict}"
+        )
         if accepted:
             async with SessionLocal() as s:
                 incumbent = await s.get(MinerVersion, cand.id)
@@ -618,6 +648,10 @@ class Engine:
                     self._panel_glob(), task.get("cost_bps", 15),
                     self.task_config.get("market", "us"),
                     self.task_config.get("evaluation_config"),
+                    task.get(
+                        "direction_policy",
+                        self._direction_policy(),
+                    ),
                 )
                 node.status = "ok"
                 node.public_metrics = {
@@ -667,6 +701,19 @@ class Engine:
                     evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
                     statistic={
                         "public_score": node.public_score,
+                        "learning_score": node.public_score,
+                        "gate_score": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("gate_score", 0.0),
+                        "selected_direction": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("selected_direction"),
+                        "direction_policy": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("direction_policy"),
+                        "score_semantics": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("score_semantics"),
                         "seed": seed,
                         "protocol_version": EVALUATION_PROTOCOL_VERSION,
                         "feedback_fingerprint": envelope[
@@ -687,7 +734,12 @@ class Engine:
                 await self._maybe_register_factor_v2(node, min_icir)
                 if i % 10 == 0:
                     await self.log(
-                        f"[V2 s{seed}]  内层[{task['name']}] {op}/{source} score={node.public_score:.3f} {expr[:60]}", "debug"
+                        f"[V2 s{seed}]  内层[{task['name']}] {op}/{source} "
+                        f"learn={node.public_score:.3f} "
+                        f"gate={float((node.public_metrics.get('discovery') or {}).get('gate_score') or 0.0):.3f} "
+                        f"dir={int((node.public_metrics.get('discovery') or {}).get('selected_direction') or task.get('direction', 1)):+d} "
+                        f"{expr[:60]}",
+                        "debug",
                     )
 
         scores = list(task_best_scores.values())
@@ -730,7 +782,26 @@ class Engine:
                     "policy_label": "NON_PIT_RESEARCH",
                     "market": self.task_config.get("market", "us"),
                     "portfolio_mode": self._portfolio_mode(),
-                    "direction": self._signal_direction(),
+                    "direction": int(
+                        discovery.get(
+                            "selected_direction",
+                            self._signal_direction(),
+                        )
+                    ),
+                    "preferred_direction": self._signal_direction(),
+                    "direction_policy": discovery.get(
+                        "direction_policy",
+                        self._direction_policy(),
+                    ),
+                    "direction_selection": discovery.get(
+                        "direction_selection",
+                        {},
+                    ),
+                    "direction_trials_multiplier": int(
+                        (
+                            discovery.get("direction_selection") or {}
+                        ).get("trials_multiplier", 1)
+                    ),
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
@@ -964,6 +1035,7 @@ class Engine:
                 self.task_config.get("market", "us"),
                 self._portfolio_mode(),
                 self._signal_direction(),
+                self._direction_policy(),
                 preserve_declared_costs=bool(local_tasks),
             )
             return cfg
@@ -1101,7 +1173,7 @@ class Engine:
         spec = miner.harness_spec
         provider = await self._provider("inner_provider")
         tasks = cfg["tasks"]
-        task_best_gate: dict[str, float] = {}
+        task_best_scores: dict[str, float] = {}
 
         for i in range(budget):
             if not self.running:
@@ -1152,6 +1224,10 @@ class Engine:
                     self._panel_glob(), task.get("cost_bps", 15),
                     self.task_config.get("market", "us"),
                     self.task_config.get("evaluation_config"),
+                    task.get(
+                        "direction_policy",
+                        self._direction_policy(),
+                    ),
                 )
                 node.status = "ok"
                 node.public_metrics = {
@@ -1161,8 +1237,8 @@ class Engine:
                 }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["discovery"].get("score") or 0.0
-                task_best_gate[task["name"]] = max(
-                    task_best_gate.get(task["name"], 0.0),
+                task_best_scores[task["name"]] = max(
+                    task_best_scores.get(task["name"], 0.0),
                     node.public_score,
                 )
             except Exception as e:
@@ -1199,6 +1275,19 @@ class Engine:
                     evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
                     statistic={
                         "public_score": node.public_score,
+                        "learning_score": node.public_score,
+                        "gate_score": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("gate_score", 0.0),
+                        "selected_direction": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("selected_direction"),
+                        "direction_policy": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("direction_policy"),
+                        "score_semantics": (
+                            node.public_metrics.get("discovery") or {}
+                        ).get("score_semantics"),
                         "protocol_version": EVALUATION_PROTOCOL_VERSION,
                         "feedback_fingerprint": node.feedback_summary[
                             "feedback_fingerprint"
@@ -1214,12 +1303,17 @@ class Engine:
             if node.status == "ok":
                 await self._maybe_register_factor(node, spec)
                 await self.log(
-                    f"  内层[{task['name']}] {op}/{source} score={node.public_score:.3f} {expr[:80]}", "debug"
+                    f"  内层[{task['name']}] {op}/{source} "
+                    f"learn={node.public_score:.3f} "
+                    f"gate={float((node.public_metrics.get('discovery') or {}).get('gate_score') or 0.0):.3f} "
+                    f"dir={int((node.public_metrics.get('discovery') or {}).get('selected_direction') or task.get('direction', 1)):+d} "
+                    f"{expr[:80]}",
+                    "debug",
                 )
             else:
                 await self.log(f"  内层[{task['name']}] {op} 失败: {node.error[:80]}", "debug")
 
-        scores = list(task_best_gate.values())
+        scores = list(task_best_scores.values())
         return round(sum(scores) / len(scores), 4) if scores else 0.0
 
     async def _maybe_register_factor(self, node: Node, spec: dict) -> None:
@@ -1246,7 +1340,26 @@ class Engine:
                     "policy_label": "NON_PIT_RESEARCH",
                     "market": self.task_config.get("market", "us"),
                     "portfolio_mode": self._portfolio_mode(),
-                    "direction": self._signal_direction(),
+                    "direction": int(
+                        discovery.get(
+                            "selected_direction",
+                            self._signal_direction(),
+                        )
+                    ),
+                    "preferred_direction": self._signal_direction(),
+                    "direction_policy": discovery.get(
+                        "direction_policy",
+                        self._direction_policy(),
+                    ),
+                    "direction_selection": discovery.get(
+                        "direction_selection",
+                        {},
+                    ),
+                    "direction_trials_multiplier": int(
+                        (
+                            discovery.get("direction_selection") or {}
+                        ).get("trials_multiplier", 1)
+                    ),
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
@@ -1371,6 +1484,7 @@ class Engine:
                 self.task_config.get("market", "us"),
                 self._portfolio_mode(),
                 self._signal_direction(),
+                self._direction_policy(),
                 preserve_declared_costs=bool(local_tasks),
             )
             return cfg

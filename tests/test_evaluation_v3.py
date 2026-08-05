@@ -10,7 +10,13 @@ import polars as pl
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.config import EVALUATION_PROTOCOL_VERSION, evaluation_config, get_dsl_fields
+from app.config import (
+    DIRECTION_POLICY_BOTH,
+    DIRECTION_POLICY_FIXED,
+    EVALUATION_PROTOCOL_VERSION,
+    evaluation_config,
+    get_dsl_fields,
+)
 from app.dsl.engine import validate
 from app.eval.harness import _prepare_daily, evaluate, evaluate_full
 from app.miner.agent import _build_system_prompt
@@ -173,6 +179,82 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertEqual(result["public"]["borrow_cost_bps_annual"], 300.0)
         self.assertIn("net", result["public"])
 
+    def test_each_new_candidate_tests_both_signs_and_selects_reverse(self):
+        with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):
+            result = evaluate(
+                "-rank(close)",
+                universe_n=100,
+                horizon=5,
+                portfolio_mode="long_only",
+                direction=1,
+                panel_glob="synthetic",
+                cost_bps=20,
+                market="ashare",
+            )
+        selection = result["discovery"]["direction_selection"]
+        self.assertEqual(result["direction_policy"], DIRECTION_POLICY_BOTH)
+        self.assertEqual(result["direction"], -1)
+        self.assertEqual(result["public"]["direction"], -1)
+        self.assertEqual(set(selection["candidates"]), {"+1", "-1"})
+        self.assertGreater(
+            selection["candidates"]["-1"]["learning_score"],
+            selection["candidates"]["+1"]["learning_score"],
+        )
+        self.assertEqual(selection["trials_multiplier"], 2)
+        self.assertEqual(
+            selection["effective_multiple_testing_trials"],
+            2 * evaluation_config("ashare")["multiple_testing_trials"],
+        )
+
+    def test_full_audit_freezes_direction_before_validation_layers(self):
+        reversed_validation = self.frame.with_columns(
+            pl.when(
+                pl.col("layer").is_in(["META_HOLDOUT", "FACTOR_VAULT"])
+            )
+            .then(-pl.col("fwd_5"))
+            .otherwise(pl.col("fwd_5"))
+            .alias("fwd_5")
+        )
+        with patch(
+            "app.eval.harness.PanelStore.get",
+            return_value=_SyntheticPanel(reversed_validation),
+        ):
+            result = evaluate_full(
+                "rank(close)",
+                universe_n=100,
+                horizon=5,
+                portfolio_mode="long_only",
+                direction=1,
+                panel_glob="synthetic",
+                cost_bps=20,
+                market="ashare",
+            )
+        self.assertEqual(result["direction"], 1)
+        self.assertEqual(
+            result["discovery"]["direction_selection"]["selection_scope"],
+            "training_safe_discovery_only",
+        )
+        self.assertLess(result["holdout"]["icir"], 0)
+
+    def test_fixed_direction_remains_available_for_reaudit(self):
+        with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):
+            result = evaluate(
+                "-rank(close)",
+                universe_n=100,
+                horizon=5,
+                portfolio_mode="long_only",
+                direction=1,
+                panel_glob="synthetic",
+                cost_bps=20,
+                market="ashare",
+                direction_policy=DIRECTION_POLICY_FIXED,
+            )
+        self.assertEqual(result["direction"], 1)
+        self.assertEqual(
+            set(result["discovery"]["direction_selection"]["candidates"]),
+            {"+1"},
+        )
+
     def test_turnover_counts_positions_that_leave_the_universe(self):
         frame = _membership_turnover_panel()
         with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(frame)):
@@ -191,7 +273,7 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertAlmostEqual(float(daily["turnover"][0]), 1.0, places=6)
         self.assertAlmostEqual(float(daily["turnover"][1]), 2.0, places=6)
 
-    def test_llm_prompt_receives_long_only_and_frozen_direction(self):
+    def test_llm_prompt_receives_long_only_and_dual_direction_policy(self):
         prompt = _build_system_prompt(
             DEFAULT_MINER_TEMPLATE,
             fields=["close"],
@@ -200,9 +282,20 @@ class EvaluationV3Tests(unittest.TestCase):
             direction=-1,
         )
         self.assertIn("持仓模式: long_only", prompt)
-        self.assertIn("方向冻结为 -1", prompt)
-        self.assertIn("因子值越低", prompt)
+        self.assertIn("同时评价 +1", prompt)
+        self.assertIn("-1（低值偏多）", prompt)
+        self.assertIn("完全同分时优先 -1", prompt)
         self.assertIn("不建立空头", prompt)
+
+        fixed = _build_system_prompt(
+            DEFAULT_MINER_TEMPLATE,
+            fields=["close"],
+            portfolio_mode="long_only",
+            market="ashare",
+            direction=-1,
+            direction_policy=DIRECTION_POLICY_FIXED,
+        )
+        self.assertIn("方向冻结为 -1", fixed)
 
 
 if __name__ == "__main__":

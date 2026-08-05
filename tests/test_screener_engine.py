@@ -61,6 +61,31 @@ class ScreenerEngineTests(unittest.TestCase):
         )
         self.assertLess(first["required_history"], 20)
 
+    def test_reverse_factor_direction_selects_low_raw_values(self):
+        frame, dates = _panel()
+        result = screen_cross_section(
+            df=frame,
+            trading_dates=dates,
+            panel_identity="synthetic-screen-reverse-v1",
+            target_date=dates[-1],
+            factors=[
+                {
+                    "expression": "close",
+                    "weight": 1,
+                    "direction": -1,
+                },
+            ],
+            fields=["open", "high", "low", "close", "vol", "amount"],
+            universe_n=100,
+            top_n=5,
+            direction="top",
+        )
+        self.assertEqual(result["stocks"][0]["ts_code"], "S000")
+        self.assertEqual(
+            result["stocks"][0]["components"][0]["direction"],
+            -1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

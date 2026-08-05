@@ -213,6 +213,39 @@ class EventLedgerRegressionTests(unittest.TestCase):
         self.assertGreater(result["stats"]["borrow_cost"], 0)
         self.assertTrue(result["integrity"]["all_pass"])
 
+    def test_reverse_direction_is_preserved_in_orders_and_statement(self):
+        config = EventBacktestConfig(
+            market="us",
+            mode="long_short",
+            direction=-1,
+            universe_n=4,
+            top_fraction=0.25,
+            initial_capital=100_000,
+            rebalance_every=1,
+            slippage_bps=0,
+            max_volume_participation=1.0,
+            borrow_cost_bps_annual=300,
+        )
+        runner = StepEventBacktester(config)
+        runner.step(
+            trade_date=date(2024, 1, 2),
+            rows=_rows(0, "us"),
+            next_trade_date=date(2024, 1, 3),
+            rebalance=True,
+        )
+        runner.step(
+            trade_date=date(2024, 1, 3),
+            rows=_rows(1, "us"),
+            next_trade_date=None,
+            rebalance=False,
+        )
+        by_symbol = {trade["symbol"]: trade for trade in runner.trades}
+        self.assertEqual(by_symbol["DDD"]["side"], "BUY")
+        self.assertEqual(by_symbol["AAA"]["side"], "SELL")
+        result = runner.result()
+        self.assertEqual(result["config"]["direction"], -1)
+        self.assertTrue(result["integrity"]["all_pass"])
+
     def test_statement_artifacts_are_hashed_and_row_complete(self):
         config = EventBacktestConfig(
             market="ashare",

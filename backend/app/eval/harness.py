@@ -1,9 +1,10 @@
-"""Evaluation Protocol V4.
+"""Evaluation Protocol V4.2.
 
 The mining loop is allowed to see only INNER_PUBLIC and META_TRAIN.  A full
 audit is an explicit, persisted action that adds META_HOLDOUT and FACTOR_VAULT.
 The protocol evaluates an executable portfolio, not IC in isolation:
 
+* two-sided training-only direction selection with an explicit trials penalty
 * direction-adjusted Rank IC and Newey-West significance
 * realised target-weight turnover
 * long-only absolute and benchmark-relative returns
@@ -24,7 +25,13 @@ from statistics import NormalDist
 
 import polars as pl
 
-from ..config import EVALUATION_PROTOCOL_VERSION, evaluation_config, get_dsl_fields
+from ..config import (
+    DIRECTION_POLICY_BOTH,
+    DIRECTION_POLICY_FIXED,
+    EVALUATION_PROTOCOL_VERSION,
+    evaluation_config,
+    get_dsl_fields,
+)
 from ..data.panel import PanelStore
 from ..dsl.engine import parse
 from .ranking import build_live_ranking
@@ -479,6 +486,7 @@ def _layer_metrics(
     layer: str,
     horizon: int,
     portfolio_mode: str,
+    direction: int,
     cfg: dict,
 ) -> dict:
     sub = daily.filter(pl.col("layer") == layer).sort("trade_date")
@@ -717,7 +725,7 @@ def _layer_metrics(
         "return_confidence": return_confidence,
         "absolute_return_confidence": absolute_return_confidence,
         # Compatibility fields used by the existing UI/search context.
-        "direction": 1.0,
+        "direction": direction,
     }
     return result
 
@@ -732,10 +740,30 @@ def _worst_stress_sharpe(metrics: dict) -> float:
     return min(values) if values else -99.0
 
 
+def _sigmoid_margin(value: float, center: float, scale: float) -> float:
+    """Map a signed distance to a stable (0, 1) diagnostic quality.
+
+    Unlike a hard max(0, x), this preserves ordering among failed candidates.
+    It is never used to waive a gate failure.
+    """
+    denominator = max(1e-6, abs(scale))
+    z_score = max(-30.0, min(30.0, (value - center) / denominator))
+    return 1.0 / (1.0 + math.exp(-z_score))
+
+
 def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -> dict:
     reasons: list[str] = []
     if not public.get("available") or not gate.get("available"):
-        return {"score": 0.0, "passed": False, "components": {}, "failure_reasons": ["训练层不完整"]}
+        return {
+            "score": 0.0,
+            "learning_score": 0.0,
+            "gate_score": 0.0,
+            "score_semantics": "continuous_failure_margin_v4.2",
+            "passed": False,
+            "components": {},
+            "gate_components": {},
+            "failure_reasons": ["训练层不完整"],
+        }
     coverage = min(_safe_float(public.get("coverage")), _safe_float(gate.get("coverage")))
     icir = min(_safe_float(public.get("icir")), _safe_float(gate.get("icir")))
     sharpe = min(_relevant_sharpe(public, portfolio_mode), _relevant_sharpe(gate, portfolio_mode))
@@ -792,8 +820,11 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
         reasons.append("跨 era 方向一致性不足")
     if profitable_era_rate < float(cfg["min_profitable_era_rate"]):
         reasons.append("跨 era 费后盈利比例不足")
-    if monotonicity < 0:
-        reasons.append("分位数组合没有正向单调性")
+    if monotonicity < float(cfg["min_monotonicity"]):
+        reasons.append(
+            "分位数组合单调性 "
+            f"{monotonicity:.2f} 低于 {float(cfg['min_monotonicity']):.2f}"
+        )
     if turnover > float(cfg["max_daily_turnover"]):
         reasons.append("实际持仓换手超过任务上限")
     if stress < float(cfg["min_stress_sharpe"]):
@@ -807,7 +838,7 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
     public_sharpe = _relevant_sharpe(public, portfolio_mode)
     gate_sharpe = _relevant_sharpe(gate, portfolio_mode)
     sharpe_retention = min(1.0, max(0.0, gate_sharpe / max(0.25, public_sharpe)))
-    components = {
+    gate_components = {
         "predictive": min(1.0, max(0.0, icir / 2.0)),
         "portfolio_lcb": min(1.0, max(0.0, sharpe_lcb / float(cfg["target_rank_sharpe"]))),
         "selection_confidence": min(1.0, max(0.0, return_t / selection_hurdle)),
@@ -838,16 +869,109 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
         "cost_survival": 0.15,
         "implementability": 0.05,
     }
-    geometric = math.exp(
-        sum(weights[key] * math.log(max(1e-6, value)) for key, value in components.items())
+    gate_geometric = math.exp(
+        sum(
+            weights[key] * math.log(max(1e-6, value))
+            for key, value in gate_components.items()
+        )
+    )
+    gate_weakest = min(gate_components.values())
+    gate_score = 5.0 * gate_geometric * (0.5 + 0.5 * gate_weakest)
+
+    # Continuous learning components retain the severity and direction of
+    # failure.  This gives the inner context and outer A/B loop a usable
+    # gradient before any candidate crosses all hard research gates.
+    public_sharpe = _relevant_sharpe(public, portfolio_mode)
+    gate_sharpe = _relevant_sharpe(gate, portfolio_mode)
+    sharpe_scale = max(0.5, abs(public_sharpe), abs(gate_sharpe))
+    cross_layer_agreement = math.exp(
+        -abs(public_sharpe - gate_sharpe) / sharpe_scale
+    )
+    sharpe_level_quality = _sigmoid_margin(sharpe, 0.0, 0.75)
+    generalization_quality = math.sqrt(
+        max(1e-6, sharpe_level_quality * cross_layer_agreement)
+    )
+    max_turnover = float(cfg["max_daily_turnover"])
+    min_coverage = float(cfg["min_coverage"])
+    cost_quality = _sigmoid_margin(
+        cost_cushion,
+        float(cfg["min_cost_cushion_multiple"]),
+        max(0.75, float(cfg["target_cost_cushion_multiple"]) / 3.0),
+    )
+    turnover_quality = _sigmoid_margin(
+        max_turnover - turnover,
+        0.0,
+        max(0.02, max_turnover * 0.20),
+    )
+    coverage_quality = _sigmoid_margin(
+        coverage,
+        min_coverage,
+        0.10,
+    )
+    components = {
+        "predictive": _sigmoid_margin(icir, 0.0, 0.50),
+        "portfolio_lcb": _sigmoid_margin(
+            sharpe_lcb,
+            0.0,
+            max(0.50, float(cfg["target_rank_sharpe"]) / 3.0),
+        ),
+        "selection_confidence": _sigmoid_margin(
+            return_t,
+            selection_hurdle,
+            1.50,
+        ),
+        "stability": 0.50
+        * _sigmoid_margin(
+            consistency,
+            float(cfg["min_era_consistency"]),
+            0.20,
+        )
+        + 0.50
+        * _sigmoid_margin(
+            profitable_era_rate,
+            float(cfg["min_profitable_era_rate"]),
+            0.20,
+        ),
+        "generalization": generalization_quality,
+        "monotonicity": _sigmoid_margin(
+            monotonicity,
+            float(cfg["min_monotonicity"]),
+            0.25,
+        ),
+        "cost_survival": _sigmoid_margin(
+            stress,
+            float(cfg["min_stress_sharpe"]),
+            0.75,
+        ),
+        "implementability": (
+            0.50 * cost_quality
+            + 0.30 * turnover_quality
+            + 0.20 * coverage_quality
+        ),
+    }
+    learning_geometric = math.exp(
+        sum(
+            weights[key] * math.log(max(1e-6, value))
+            for key, value in components.items()
+        )
     )
     weakest = min(components.values())
-    score = 5.0 * geometric * (0.5 + 0.5 * weakest)
-    passed = not reasons and score >= float(cfg["min_research_score"])
+    score = 5.0 * learning_geometric * (0.5 + 0.5 * weakest)
+    passed = (
+        not reasons
+        and gate_score >= float(cfg["min_research_score"])
+    )
     return {
         "score": round(score, 4),
+        "learning_score": round(score, 4),
+        "gate_score": round(gate_score, 4),
+        "score_semantics": "continuous_failure_margin_v4.2",
         "passed": passed,
         "components": {key: round(value, 4) for key, value in components.items()},
+        "gate_components": {
+            key: round(value, 4)
+            for key, value in gate_components.items()
+        },
         # These are the conservative PUBLIC/META_TRAIN aggregates that
         # actually drove the discovery decision.  They are safe to feed back
         # to the miner and prevent a single optimistic layer from being shown
@@ -1012,11 +1136,156 @@ def _evaluate_layers(
     )
     metrics = {
         LAYER_ALIASES[layer]: _layer_metrics(
-            daily, deciles, layer, horizon, portfolio_mode, cfg
+            daily,
+            deciles,
+            layer,
+            horizon,
+            portfolio_mode,
+            direction,
+            cfg,
         )
         for layer in layers
     }
     return metrics, cfg
+
+
+def _validate_direction_policy(direction_policy: str) -> str:
+    if direction_policy not in {
+        DIRECTION_POLICY_BOTH,
+        DIRECTION_POLICY_FIXED,
+    }:
+        raise ValueError(
+            "direction_policy 必须是 both_train_select 或 fixed"
+        )
+    return direction_policy
+
+
+def _orientation_summary(direction: int, discovery: dict) -> dict:
+    """Bounded training-safe evidence retained for direction attribution."""
+    return {
+        "direction": direction,
+        "learning_score": discovery.get("learning_score", discovery.get("score", 0.0)),
+        "gate_score": discovery.get("gate_score", 0.0),
+        "passed": bool(discovery.get("passed")),
+        "components": dict(discovery.get("components") or {}),
+        "gate_components": dict(discovery.get("gate_components") or {}),
+        "effective_metrics": dict(discovery.get("effective_metrics") or {}),
+        "failure_reasons": list(discovery.get("failure_reasons") or []),
+    }
+
+
+def _evaluate_discovery_orientations(
+    expression: str,
+    universe_n: int,
+    horizon: int,
+    portfolio_mode: str,
+    preferred_direction: int,
+    panel_glob: str | None,
+    cost_bps: float | None,
+    market: str,
+    evaluation_overrides: dict | None,
+    direction_policy: str,
+) -> tuple[dict, dict, dict]:
+    """Select direction using training-safe layers only.
+
+    The effective multiple-testing budget is doubled when both signs are
+    searched.  The selected sign is returned before any validation layer is
+    accessed, so later audit code cannot use out-of-sample results to flip it.
+    """
+    if preferred_direction not in {-1, 1}:
+        raise ValueError("direction 必须为 1 或 -1")
+    policy = _validate_direction_policy(direction_policy)
+    base_cfg = evaluation_config(market, evaluation_overrides)
+    trials_multiplier = 2 if policy == DIRECTION_POLICY_BOTH else 1
+    effective_overrides = {
+        **(evaluation_overrides or {}),
+        "multiple_testing_trials": max(
+            1,
+            int(base_cfg["multiple_testing_trials"]) * trials_multiplier,
+        ),
+    }
+    directions = (
+        [1, -1]
+        if policy == DIRECTION_POLICY_BOTH
+        else [preferred_direction]
+    )
+    candidates: list[dict] = []
+    for candidate_direction in directions:
+        layers, cfg = _evaluate_layers(
+            expression,
+            universe_n,
+            horizon,
+            portfolio_mode,
+            candidate_direction,
+            panel_glob,
+            cost_bps,
+            market,
+            DISCOVERY_LAYERS,
+            effective_overrides,
+        )
+        discovery = _discovery_score(
+            layers["public"],
+            layers["gate"],
+            portfolio_mode,
+            cfg,
+        )
+        layers["public"]["score"] = discovery["score"]
+        layers["gate"]["score"] = discovery["score"]
+        candidates.append({
+            "direction": candidate_direction,
+            "layers": layers,
+            "cfg": cfg,
+            "discovery": discovery,
+        })
+
+    selected = max(
+        candidates,
+        key=lambda row: (
+            bool(row["discovery"].get("passed")),
+            _safe_float(
+                row["discovery"].get(
+                    "learning_score",
+                    row["discovery"].get("score"),
+                )
+            ),
+            _safe_float(row["discovery"].get("gate_score")),
+            row["direction"] == preferred_direction,
+        ),
+    )
+    selected_direction = int(selected["direction"])
+    selection = {
+        "policy": policy,
+        "selection_scope": "training_safe_discovery_only",
+        "selection_rule": (
+            "passed_then_learning_score_then_gate_score_"
+            "then_preferred_direction_tiebreak"
+        ),
+        "preferred_direction": preferred_direction,
+        "selected_direction": selected_direction,
+        "frozen_for_downstream": True,
+        "trials_multiplier": trials_multiplier,
+        "base_multiple_testing_trials": int(
+            base_cfg["multiple_testing_trials"]
+        ),
+        "effective_multiple_testing_trials": int(
+            selected["cfg"]["multiple_testing_trials"]
+        ),
+        "candidates": {
+            f"{row['direction']:+d}": _orientation_summary(
+                int(row["direction"]),
+                row["discovery"],
+            )
+            for row in candidates
+        },
+    }
+    discovery = {
+        **selected["discovery"],
+        "direction_policy": policy,
+        "preferred_direction": preferred_direction,
+        "selected_direction": selected_direction,
+        "direction_selection": selection,
+    }
+    return selected["layers"], selected["cfg"], discovery
 
 
 def evaluate(
@@ -1029,9 +1298,10 @@ def evaluate(
     cost_bps: float | None = None,
     market: str = "us",
     evaluation_overrides: dict | None = None,
+    direction_policy: str = DIRECTION_POLICY_BOTH,
 ) -> dict:
-    """Mining-safe V4 discovery evaluation; no holdout/vault access."""
-    layers, cfg = _evaluate_layers(
+    """Mining-safe discovery evaluation with training-only sign selection."""
+    layers, cfg, discovery = _evaluate_discovery_orientations(
         expression,
         universe_n,
         horizon,
@@ -1040,30 +1310,36 @@ def evaluate(
         panel_glob,
         cost_bps,
         market,
-        DISCOVERY_LAYERS,
         evaluation_overrides,
+        direction_policy,
     )
-    discovery = _discovery_score(layers["public"], layers["gate"], portfolio_mode, cfg)
-    layers["public"]["score"] = discovery["score"]
-    layers["gate"]["score"] = discovery["score"]
+    selected_direction = int(discovery["selected_direction"])
     return {
         "protocol_version": EVALUATION_PROTOCOL_VERSION,
         "scope": "discovery",
         "policy_label": "NON_PIT_RESEARCH",
         "market": market,
         "portfolio_mode": portfolio_mode,
-        "direction": direction,
+        "direction": selected_direction,
+        "preferred_direction": direction,
+        "direction_policy": direction_policy,
         "parameters": {
             "universe_n": universe_n,
             "horizon": horizon,
             "base_cost_bps": cfg["base_cost_bps"],
             "stress_cost_bps": cfg["stress_cost_bps"],
             "target_capital": cfg["target_capital"],
+            "multiple_testing_trials": cfg["multiple_testing_trials"],
+            "direction_trials_multiplier": (
+                discovery["direction_selection"]["trials_multiplier"]
+            ),
         },
         "public": layers["public"],
         "gate": layers["gate"],
         "discovery": discovery,
-        "ranking_policy": "发现分仅供 Miner；实盘排序必须显式审计且不读取 Vault 数值",
+        "ranking_policy": (
+            "连续学习分仅供 Miner；硬门槛独立；方向只在训练安全层选择并冻结"
+        ),
     }
 
 
@@ -1077,9 +1353,10 @@ def evaluate_full(
     cost_bps: float | None = None,
     market: str = "us",
     evaluation_overrides: dict | None = None,
+    direction_policy: str = DIRECTION_POLICY_BOTH,
 ) -> dict:
-    """Explicit four-layer audit.  Never call this from the mining loop."""
-    layers, cfg = _evaluate_layers(
+    """Explicit four-layer audit with direction frozen before validation."""
+    discovery_layers, cfg, discovery = _evaluate_discovery_orientations(
         expression,
         universe_n,
         horizon,
@@ -1088,12 +1365,26 @@ def evaluate_full(
         panel_glob,
         cost_bps,
         market,
-        FULL_LAYERS,
         evaluation_overrides,
+        direction_policy,
     )
-    discovery = _discovery_score(layers["public"], layers["gate"], portfolio_mode, cfg)
-    layers["public"]["score"] = discovery["score"]
-    layers["gate"]["score"] = discovery["score"]
+    selected_direction = int(discovery["selected_direction"])
+    validation_layers, _ = _evaluate_layers(
+        expression,
+        universe_n,
+        horizon,
+        portfolio_mode,
+        selected_direction,
+        panel_glob,
+        cost_bps,
+        market,
+        ["META_HOLDOUT", "FACTOR_VAULT"],
+        cfg,
+    )
+    layers = {
+        **discovery_layers,
+        **validation_layers,
+    }
     eligibility = _eligibility(layers, discovery, portfolio_mode, cfg)
     ranking = build_live_ranking(layers, eligibility, portfolio_mode, cfg)
     return {
@@ -1102,7 +1393,9 @@ def evaluate_full(
         "policy_label": "NON_PIT_RESEARCH",
         "market": market,
         "portfolio_mode": portfolio_mode,
-        "direction": direction,
+        "direction": selected_direction,
+        "preferred_direction": direction,
+        "direction_policy": direction_policy,
         "parameters": {
             "universe_n": universe_n,
             "horizon": horizon,
@@ -1114,6 +1407,9 @@ def evaluate_full(
             "multiple_testing_trials": cfg["multiple_testing_trials"],
             "multiple_testing_alpha": cfg["multiple_testing_alpha"],
             "return_lcb_confidence": cfg["return_lcb_confidence"],
+            "direction_trials_multiplier": (
+                discovery["direction_selection"]["trials_multiplier"]
+            ),
         },
         "layers": layers,
         "public": layers["public"],
@@ -1145,6 +1441,8 @@ def era_detail(
         panel_glob,
         None,
         market,
+        None,
+        DIRECTION_POLICY_FIXED,
     )
     eras = []
     layer_summary = {}

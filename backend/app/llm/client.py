@@ -117,6 +117,7 @@ async def mark_validation(
     *,
     accepted: bool,
     error: object = "",
+    trace_meta_updates: dict[str, Any] | None = None,
 ) -> None:
     """Finalize semantic parse/validation without affecting research flow."""
     audit_id = getattr(response, "audit_id", None)
@@ -125,7 +126,7 @@ async def mark_validation(
     try:
         from ..db import SessionLocal
         from ..models import LLMCallAudit
-        from ..observability import redact_text
+        from ..observability import redact_text, redact_value
 
         async with SessionLocal() as session:
             row = await session.get(LLMCallAudit, int(audit_id))
@@ -134,6 +135,11 @@ async def mark_validation(
             row.status = "accepted" if accepted else "rejected"
             if not accepted:
                 row.error = redact_text(error, 2000)
+            if trace_meta_updates:
+                row.trace_meta = {
+                    **(row.trace_meta or {}),
+                    **redact_value(trace_meta_updates),
+                }
             await session.commit()
     except Exception as exc:  # noqa: BLE001 - audit cannot break research
         logger.warning("LLM 语义审计更新失败: %s", str(exc)[:300])

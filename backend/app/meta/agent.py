@@ -205,7 +205,7 @@ _SYSTEM_V2 = """你是自动化因子挖掘系统的元优化器 (Meta-Optimizer
 8. **dsl_exploration_templates**: 会真实进入内层提示词的 DSL 结构样例
 
 安全边界 (你绝不能触碰):
-- 权威 V4 评估器与数据层只读；最终封存评价不可作为训练反馈
+- 权威 V4.2 评估器与数据层只读；最终封存评价不可作为训练反馈
 - 不得在模板中引用特定年份/era/数据层名称
 - 不得注入 Python 代码或文件系统操作
 - 所有改动必须引用历史报告中的证据；没有证据时应声明为探索性假设
@@ -213,8 +213,14 @@ _SYSTEM_V2 = """你是自动化因子挖掘系统的元优化器 (Meta-Optimizer
 你会看到:
 - 当前在位模板
 - 同一评价协议下的历史模板版本
-- 跨任务/多种子的通过率、分数方差、组件均值、失败原因与重复率
+- 跨任务/多种子的通过率、连续学习分、硬门槛分、方向分布、组件均值、失败原因与重复率
 - 上轮提案假设、结果反思和下一步建议
+
+分数与方向语义:
+- 每个新候选在训练安全层同时测试 +1/-1，双向搜索已计入试验预算，选中方向随后冻结
+- seed_score_mean/score_mean 是连续学习分，只用于失败归因和模板搜索
+- gate_score_mean/gate_score_best 与 pass_rate 是独立硬门槛证据
+- 学习分变高不等于通过准入，禁止据此宣称因子可实盘
 
 只回复 JSON:
 {{
@@ -234,6 +240,10 @@ _SYSTEM_V2 = """你是自动化因子挖掘系统的元优化器 (Meta-Optimizer
 def _compact_feedback_report(report: dict | None) -> dict:
     report = dict(report or {})
     compact = {
+        "score_semantics": report.get(
+            "score_semantics",
+            "continuous_failure_margin_v4.2",
+        ),
         "attempts": report.get("attempts", 0),
         "errors": report.get("errors", 0),
         "pass_rate": report.get("pass_rate", 0.0),
@@ -245,8 +255,11 @@ def _compact_feedback_report(report: dict | None) -> dict:
             "seed_score_std",
             report.get("score_std", 0.0),
         ),
+        "gate_score_mean": report.get("gate_score_mean", 0.0),
+        "gate_score_best": report.get("gate_score_best", 0.0),
         "duplicate_rate": report.get("duplicate_rate", 0.0),
         "source_counts": report.get("source_counts", {}),
+        "direction_counts": report.get("direction_counts", {}),
         "component_means": report.get("component_means", {}),
         "metric_means": {
             key: value
@@ -288,8 +301,11 @@ def _compact_feedback_report(report: dict | None) -> dict:
                 "pass_rate": row.get("pass_rate", 0.0),
                 "score_mean": row.get("score_mean", 0.0),
                 "score_best": row.get("score_best", 0.0),
+                "gate_score_mean": row.get("gate_score_mean", 0.0),
+                "gate_score_best": row.get("gate_score_best", 0.0),
                 "errors": row.get("errors", 0),
                 "duplicate_rate": row.get("duplicate_rate", 0.0),
+                "direction_counts": row.get("direction_counts", {}),
                 "failure_reason_counts": dict(
                     list(
                         (row.get("failure_reason_counts") or {}).items()
@@ -404,6 +420,7 @@ async def propose_template(
     market: str = "us",
     portfolio_mode: str = "long_short",
     direction: int = 1,
+    direction_policy: str = "both_train_select",
     trace_context: dict | None = None,
 ) -> tuple[dict, str, str, dict]:
     """返回 (new_template, note, source, proposal_reflection).
@@ -422,8 +439,10 @@ async def propose_template(
 
             user = (
                 f"=== 研究任务硬约束 ===\n市场: {market}\n持仓模式: {portfolio_mode}\n"
-                f"冻结信号方向: {direction:+d} "
-                f"({'高因子值偏多' if direction == 1 else '低因子值偏多'})\n"
+                f"方向评价策略: {direction_policy}；"
+                f"同分优先方向: {direction:+d}\n"
+                "每个候选必须在训练安全层同时评价正向与反向，"
+                "由系统选中并冻结方向；不得要求用隔离层翻号。\n"
                 f"{'只能做多，评价只奖励正向收益和多头稳定性。' if portfolio_mode == 'long_only' else '允许多空，评价可同时使用多头和空头收益。'}\n\n"
                 f"=== 当前在位模板 ===\n{current_summary}\n\n"
                 f"=== 同协议历史与评价反馈 ===\n{hist_text}\n\n"
@@ -557,6 +576,7 @@ def _deterministic_outcome_reflection(
         "lessons": [{
             "observation": (
                 f"seed_score_delta={deltas.get('seed_score_mean', 0)}, "
+                f"gate_score_delta={deltas.get('gate_score_mean', 0)}, "
                 f"pass_rate_delta={deltas.get('pass_rate', 0)}, "
                 f"duplicate_delta={deltas.get('duplicate_rate', 0)}"
             ),

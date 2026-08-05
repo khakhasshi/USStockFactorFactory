@@ -162,6 +162,8 @@ tr.clickable:hover { background: #1c2129; }
 .factor-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--text); }
 .factor-copy code { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .factor-meta { color: var(--muted); font-size: 10px; }
+.direction-input { width: 48px !important; padding: 4px !important; font-size: 10px !important; }
+.direction-input:disabled { opacity: .28; }
 .weight-input { width: 42px !important; padding: 4px 3px !important; text-align: center; font-size: 11px !important; }
 .weight-input:disabled { opacity: .28; }
 .factor-footer { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; padding: 10px 14px; background: rgba(13,17,23,.4); }

@@ -46,7 +46,34 @@ def _public_metrics(
         "cost_stress": [{"sharpe": 0.4}],
         "discovery": {
             "score": score,
+            "learning_score": score,
+            "gate_score": 0.3,
+            "score_semantics": "continuous_failure_margin_v4.2",
             "passed": passed,
+            "selected_direction": -1,
+            "preferred_direction": 1,
+            "direction_policy": "both_train_select",
+            "direction_selection": {
+                "policy": "both_train_select",
+                "selection_scope": "training_safe_discovery_only",
+                "preferred_direction": 1,
+                "selected_direction": -1,
+                "trials_multiplier": 2,
+                "candidates": {
+                    "+1": {
+                        "direction": 1,
+                        "learning_score": 0.4,
+                        "gate_score": 0.0,
+                        "passed": False,
+                    },
+                    "-1": {
+                        "direction": -1,
+                        "learning_score": score,
+                        "gate_score": 0.3,
+                        "passed": passed,
+                    },
+                },
+            },
             "components": {
                 "predictive": 0.70,
                 "portfolio_lcb": 0.40,
@@ -127,6 +154,13 @@ class FeedbackContractTests(unittest.TestCase):
         self.assertEqual(row["metrics"]["portfolio_sharpe"], 0.52)
         self.assertEqual(row["metrics"]["daily_turnover"], 0.19)
         self.assertEqual(row["metrics"]["selection_hurdle_t"], 3.72)
+        self.assertEqual(row["direction"], -1)
+        self.assertEqual(row["outcome"]["learning_score"], 1.4)
+        self.assertEqual(row["outcome"]["gate_score"], 0.3)
+        self.assertEqual(
+            set(row["direction_selection"]["candidates"]),
+            {"+1", "-1"},
+        )
         self.assertIn("HAC 显著性不足", row["failure_reasons"][0])
         self.assertTrue(row["improvement_targets"])
         self.assertEqual(len(row["feedback_fingerprint"]), 16)
@@ -153,6 +187,10 @@ class FeedbackContractTests(unittest.TestCase):
         self.assertIn("HAC_t=", context)
         self.assertIn("cost_cushion=", context)
         self.assertIn("components:", context)
+        self.assertIn("同时测试 +1/-1", context)
+        self.assertIn("direction=-1", context)
+        self.assertIn("learning_score=", context)
+        self.assertIn("hard_gate_score=", context)
         self.assertNotIn("LEGACY_SENTINEL", context)
         self.assertEqual(
             snapshot["protocol_version"],
@@ -290,8 +328,12 @@ class InnerOuterAgentTests(unittest.TestCase):
             miner_agent.llm.chat = original
 
         self.assertEqual(result[2], "llm")
-        self.assertEqual(result[3]["feedback_protocol"], "v4.0")
+        self.assertEqual(
+            result[3]["feedback_protocol"],
+            EVALUATION_PROTOCOL_VERSION,
+        )
         self.assertIn("只能做多", captured["system"])
+        self.assertIn("同时评价 +1", captured["system"])
         self.assertIn("实际持仓换手超过任务上限", captured["user"])
         self.assertIn("DSL 结构样例", captured["user"])
         self.assertEqual(captured["trace"]["role"], "inner")
@@ -459,6 +501,64 @@ class InnerOuterAgentTests(unittest.TestCase):
             miner_agent.llm.chat = original
         self.assertEqual(result[2], "random")
         self.assertIn("reflection", result[3]["fallback_reason"])
+
+    def test_missing_expected_effect_is_normalized_not_randomized(self):
+        original_chat = miner_agent.llm.chat
+        original_mark = miner_agent.llm.mark_validation
+        validation = {}
+
+        async def missing_noncritical_field(*args, **kwargs):
+            return (
+                '{"expression":"rank(ts_delta(close, 20))",'
+                '"hypothesis":"medium-term momentum",'
+                '"reflection":"retain a simple mechanism after noisy failures",'
+                '"targeted_failures":["cost stress is weak"]}'
+            )
+
+        async def capture_validation(*args, **kwargs):
+            validation.update(kwargs)
+
+        miner_agent.llm.chat = missing_noncritical_field
+        miner_agent.llm.mark_validation = capture_validation
+        try:
+            result = asyncio.run(miner_agent.propose(
+                DEFAULT_MINER_TEMPLATE,
+                "draft",
+                {
+                    "name": "T1",
+                    "market": "us",
+                    "mode": "long_short",
+                    "direction": 1,
+                    "universe_n": 500,
+                    "horizon": 5,
+                },
+                [{
+                    "id": 21,
+                    "status": "ok",
+                    "public_score": 0.5,
+                    "expression": "-rank(ts_delta(close, 5))",
+                    "public_metrics": _public_metrics(),
+                    "feedback_summary": _envelope(21),
+                }],
+                {"name": "mock"},
+                fields=["open", "high", "low", "close", "vol", "amount"],
+                rng=random.Random(7),
+            ))
+        finally:
+            miner_agent.llm.chat = original_chat
+            miner_agent.llm.mark_validation = original_mark
+
+        self.assertEqual(result[2], "llm")
+        self.assertIn("cost stress is weak", result[3]["expected_effect"])
+        self.assertEqual(
+            result[3]["semantic_normalizations"],
+            ["expected_effect_derived_from_targeted_failures"],
+        )
+        self.assertTrue(validation["accepted"])
+        self.assertEqual(
+            validation["trace_meta_updates"]["semantic_normalizations"],
+            ["expected_effect_derived_from_targeted_failures"],
+        )
 
     def test_outer_test_and_default_start_mode_are_explicit(self):
         self.assertEqual(EngineStartReq().mode, "v2")

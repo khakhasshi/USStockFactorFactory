@@ -1,6 +1,6 @@
 # USStockFactorFactory — 双层优化 LLM 因子挖掘工厂设计
 
-> 机构级设计蓝图 v0.5 · 2026-08-05（Evaluation Protocol V4 + 双层反馈契约）
+> 机构级设计蓝图 v0.6 · 2026-08-05（Evaluation Protocol V4.2 + 双层反馈契约）
 > 灵感来源：Weco AIDE²（bi-level autoresearch）× 机构因子投研全生命周期
 > 定位：独立系统；历史已停任务与旧协议产物只读保留，当前协议另起可比较血缘
 
@@ -165,7 +165,10 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 
 ## 4. 评估流水线（Layer 2）—— 系统的心脏
 
-> 当前运行协议：`v4.0 / NON_PIT_RESEARCH`。按当前研究要求，PIT 不进入评分，
+> 当前运行协议：`v4.2 / NON_PIT_RESEARCH`。V4.2 将连续失败梯度的学习分与
+> 不可放宽的硬门槛分拆开，并在训练安全层同时评价正反方向、按两次试验计数后
+> 冻结选中方向，避免差因子全部压成 0 或反向因子被不公平淘汰。
+> 按当前研究要求，PIT 不进入评分，
 > 但来源标签仍保留；任何 F5 只表示通过非 PIT 的执行可行性评价，不是生产批准。
 
 ### 4.1 四级数据隔离 + 不可变协议世代
@@ -256,6 +259,13 @@ meta_score = mean_seed(seed_score)
 继续学习。候选必须完整跑完预声明 seed 数、均值更高且单边检验 p 值低于阈值才接受。
 该分数被外层反复优化，**定性为自适应训练证据**；Miner 的真实泛化由
 META_HOLDOUT + 外部保留任务事后报告。
+
+**方向选择冻结**：每个新表达式只在 `INNER_PUBLIC + META_TRAIN` 分别按
+`direction=+1/-1` 生成完整组合评价，选择顺序预先固定为
+`passed → continuous learning score → hard gate score → 任务同分优先方向`。
+两种方向均计入试验预算。选中方向写入节点、反馈信封和因子元数据；后续
+HOLDOUT、Vault、选股与事件回测只读取这一冻结方向，除非用户显式创建一项
+“翻向重审”的新研究假设。
 
 ### 4.3 多重检验控制（机构级核心）
 

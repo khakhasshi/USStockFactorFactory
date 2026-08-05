@@ -1,6 +1,11 @@
 import unittest
 
-from backend.app.config import evaluation_config, resolve_engine_tasks
+from backend.app.config import (
+    EVALUATION_PROTOCOL_VERSION,
+    evaluation_config,
+    resolve_engine_tasks,
+)
+from backend.app.eval.harness import _discovery_score
 from backend.app.eval.ranking import build_live_ranking, ranking_diagnostics
 from backend.app.models import Factor
 
@@ -259,6 +264,95 @@ class EvaluationV4RankingTests(unittest.TestCase):
         )
         self.assertEqual(local[0]["cost_bps"], 37.0)
         self.assertEqual(local[0]["direction"], -1)
+        self.assertEqual(
+            local[0]["direction_policy"],
+            "both_train_select",
+        )
+
+    def test_failed_discovery_scores_keep_a_continuous_learning_gradient(self):
+        mild_public = _layer(
+            sharpe=-0.25,
+            ann_return=-0.02,
+            sharpe_lcb=-0.30,
+            ann_return_lcb=-0.02,
+            return_t=-0.40,
+            icir=-0.20,
+            stress_sharpe=-0.40,
+            cost_cushion=-0.50,
+        )
+        mild_gate = _layer(
+            sharpe=-0.35,
+            ann_return=-0.03,
+            sharpe_lcb=-0.45,
+            ann_return_lcb=-0.03,
+            return_t=-0.60,
+            icir=-0.30,
+            stress_sharpe=-0.60,
+            cost_cushion=-0.80,
+        )
+        severe_public = _layer(
+            sharpe=-2.0,
+            ann_return=-0.30,
+            sharpe_lcb=-2.5,
+            ann_return_lcb=-0.35,
+            return_t=-4.0,
+            icir=-1.8,
+            stress_sharpe=-2.5,
+            cost_cushion=-6.0,
+        )
+        severe_gate = _layer(
+            sharpe=-2.5,
+            ann_return=-0.40,
+            sharpe_lcb=-3.0,
+            ann_return_lcb=-0.45,
+            return_t=-5.0,
+            icir=-2.2,
+            stress_sharpe=-3.0,
+            cost_cushion=-8.0,
+        )
+        for layer in (
+            mild_public,
+            mild_gate,
+            severe_public,
+            severe_gate,
+        ):
+            layer["coverage"] = 0.95
+            layer["hac_p_value"] = 0.9
+
+        mild = _discovery_score(
+            mild_public,
+            mild_gate,
+            "long_short",
+            self.cfg,
+        )
+        severe = _discovery_score(
+            severe_public,
+            severe_gate,
+            "long_short",
+            self.cfg,
+        )
+
+        self.assertFalse(mild["passed"])
+        self.assertFalse(severe["passed"])
+        self.assertGreater(mild["score"], 0.0)
+        self.assertGreater(severe["score"], 0.0)
+        self.assertGreater(mild["score"], severe["score"])
+        self.assertEqual(
+            mild["score_semantics"],
+            "continuous_failure_margin_v4.2",
+        )
+        self.assertIn("gate_score", mild)
+        self.assertIn("gate_components", mild)
+
+    def test_protocol_override_cannot_downgrade_current_evaluator(self):
+        cfg = evaluation_config(
+            "us",
+            {"protocol_version": "v4.0"},
+        )
+        self.assertEqual(
+            cfg["protocol_version"],
+            EVALUATION_PROTOCOL_VERSION,
+        )
 
 
 if __name__ == "__main__":

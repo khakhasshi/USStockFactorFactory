@@ -19,8 +19,8 @@ from typing import Any, Iterable
 from .config import EVALUATION_PROTOCOL_VERSION
 from .observability import redact_text, redact_value
 
-FEEDBACK_SCHEMA_VERSION = "factorfactory.evaluation-feedback/v1"
-OUTER_REPORT_SCHEMA_VERSION = "factorfactory.outer-feedback/v1"
+FEEDBACK_SCHEMA_VERSION = "factorfactory.evaluation-feedback/v2"
+OUTER_REPORT_SCHEMA_VERSION = "factorfactory.outer-feedback/v2"
 
 DEFAULT_CONTEXT_POLICY = {
     "top_k": 4,
@@ -46,7 +46,7 @@ _FORBIDDEN_TRAINING_TEXT = (
 )
 
 _ACTION_RULES = (
-    ("ICIR 非正", "检查冻结方向与经济假设是否一致；不要仅靠符号翻转掩盖错误机制"),
+    ("ICIR 非正", "检查双向评价证据与经济假设是否一致；不要用机械符号翻转掩盖错误机制"),
     ("HAC 显著性不足", "减少自由度和窗口搜索，优先可复现的单一机制"),
     ("组合 Sharpe 非正", "改进费后收益来源，避免只有相关性而没有可交易收益"),
     ("HAC 置信度不足", "提高跨期稳定性并减少重叠标签造成的虚假显著性"),
@@ -172,6 +172,10 @@ def build_feedback_envelope(
     branch = _relevant_branch(public, portfolio_mode)
     confidence = dict(public.get("return_confidence") or {})
     exposure = dict(public.get("market_exposure") or {})
+    selected_direction = int(discovery.get("selected_direction", direction))
+    direction_selection = dict(
+        discovery.get("direction_selection") or {}
+    )
     protocol = (
         str(evaluation_protocol or public.get("protocol_version") or "")
         or "legacy_unoriented"
@@ -184,7 +188,14 @@ def build_feedback_envelope(
         "task_name": task_name,
         "market": market,
         "portfolio_mode": portfolio_mode,
-        "direction": int(direction),
+        "direction": selected_direction,
+        "preferred_direction": int(
+            discovery.get("preferred_direction", direction)
+        ),
+        "direction_policy": str(
+            discovery.get("direction_policy") or "fixed"
+        ),
+        "direction_selection": redact_value(direction_selection),
         "expression": str(expression)[:1200],
         "hypothesis": str(hypothesis or "")[:500],
         "source": source,
@@ -192,6 +203,15 @@ def build_feedback_envelope(
         "outcome": {
             "status": status,
             "score": _round(public_score, 4) or 0.0,
+            "learning_score": _round(
+                discovery.get("learning_score", public_score),
+                4,
+            )
+            or 0.0,
+            "gate_score": _round(discovery.get("gate_score"), 4) or 0.0,
+            "score_semantics": str(
+                discovery.get("score_semantics") or "legacy_clipped"
+            ),
             "passed": bool(discovery.get("passed")) if status == "ok" else False,
         },
         "metrics": {
@@ -453,9 +473,12 @@ def _format_example(item: dict, template: dict | None) -> str:
     metrics = item.get("metrics") or {}
     reasons = item.get("failure_reasons") or []
     proposal = item.get("proposal") or {}
+    direction_selection = item.get("direction_selection") or {}
     line = (
         f"node={item.get('node_id') or 'pending'} "
-        f"score={_finite_float(outcome.get('score'), 0.0):.3f} "
+        f"direction={int(item.get('direction') or 1):+d} "
+        f"learning_score={_finite_float(outcome.get('learning_score', outcome.get('score')), 0.0):.3f} "
+        f"hard_gate_score={_finite_float(outcome.get('gate_score'), 0.0):.3f} "
         f"passed={bool(outcome.get('passed'))} "
         f"priority={feedback_priority(item, template):.3f} "
         f"ICIR={_display_metric(metrics.get('icir'), signed=True)} "
@@ -463,6 +486,21 @@ def _format_example(item: dict, template: dict | None) -> str:
         f"ann_ret={_display_metric(metrics.get('portfolio_ann_return'), digits=1, signed=True, percent=True, suffix='%')}"
     )
     details = [line, f"  expr: {item.get('expression', '')}"]
+    orientation_candidates = direction_selection.get("candidates") or {}
+    if orientation_candidates:
+        details.append(
+            "  direction_test: "
+            + ", ".join(
+                (
+                    f"{label} learn="
+                    f"{_finite_float(row.get('learning_score'), 0.0):.3f} "
+                    f"gate={_finite_float(row.get('gate_score'), 0.0):.3f} "
+                    f"passed={bool(row.get('passed'))}"
+                )
+                for label, row in sorted(orientation_candidates.items())
+                if isinstance(row, dict)
+            )
+        )
     details.append(
         "  confidence: "
         f"HAC_t={_display_metric(metrics.get('return_hac_t'), signed=True)}"
@@ -527,6 +565,14 @@ def build_inner_feedback_context(
         f"反馈协议: {EVALUATION_PROTOCOL_VERSION} / {FEEDBACK_SCHEMA_VERSION}",
         "边界: 仅训练安全聚合反馈；最终封存层从不进入上下文。",
         (
+            "方向语义: 每个候选在训练安全层同时测试 +1/-1，"
+            "试验预算按双向计数；选中方向随后冻结，禁止根据隔离层翻号。"
+        ),
+        (
+            "分数语义: learning_score 是连续失败梯度，仅用于比较、归因和搜索；"
+            "hard_gate_score 与 passed 才表示硬准入，学习分绝不能覆盖失败门槛。"
+        ),
+        (
             "模板上下文优先权重（只影响示例选择，不改变权威评价）: "
             f"ICIR={weights['icir_weight']:.2f}, "
             f"稳定性={weights['consistency_weight']:.2f}, "
@@ -534,6 +580,9 @@ def build_inner_feedback_context(
         ),
         (
             f"总体: {summary['attempts']} 次，pass={summary['pass_rate']:.1%}，"
+            f"learning_mean={summary['score_mean']:.3f}，"
+            f"hard_gate_mean={summary['gate_score_mean']:.3f}，"
+            f"方向(+/-)={summary['direction_counts']}，"
             f"error={summary['errors']}，duplicate={summary['duplicate_rate']:.1%}"
         ),
     ]
@@ -566,7 +615,7 @@ def build_inner_feedback_context(
             )
         )
     headings = {
-        "authoritative_best": "权威评分较优样本",
+        "authoritative_best": "连续学习分较优样本（不代表准入）",
         "template_priority": "当前模板关注样本",
         "near_misses": "最接近通过的样本",
         "failures": "需要避免的失败样本",
@@ -606,7 +655,22 @@ def _summary_core(envelopes: list[dict]) -> dict:
         if (item.get("outcome") or {}).get("status") == "ok"
     ]
     scores = [
-        _finite_float((item.get("outcome") or {}).get("score"), 0.0) or 0.0
+        _finite_float(
+            (item.get("outcome") or {}).get(
+                "learning_score",
+                (item.get("outcome") or {}).get("score"),
+            ),
+            0.0,
+        )
+        or 0.0
+        for item in valid
+    ]
+    gate_scores = [
+        _finite_float(
+            (item.get("outcome") or {}).get("gate_score"),
+            0.0,
+        )
+        or 0.0
         for item in valid
     ]
     passed = [
@@ -623,6 +687,10 @@ def _summary_core(envelopes: list[dict]) -> dict:
         for target in (item.get("improvement_targets") or [])
     )
     sources = Counter(str(item.get("source") or "unknown") for item in envelopes)
+    directions = Counter(
+        f"{int(item.get('direction') or 1):+d}"
+        for item in valid
+    )
     components: dict[str, list[float]] = defaultdict(list)
     metrics: dict[str, list[float]] = defaultdict(list)
     for item in valid:
@@ -639,6 +707,7 @@ def _summary_core(envelopes: list[dict]) -> dict:
     ]
     unique_expressions = len(set(expressions))
     return {
+        "score_semantics": "continuous_failure_margin_v4.2",
         "attempts": attempts,
         "valid": len(valid),
         "errors": attempts - len(valid),
@@ -649,11 +718,22 @@ def _summary_core(envelopes: list[dict]) -> dict:
             round(statistics.pstdev(scores), 4) if len(scores) >= 2 else 0.0
         ),
         "score_best": round(max(scores), 4) if scores else 0.0,
+        "gate_score_mean": (
+            round(statistics.fmean(gate_scores), 4)
+            if gate_scores
+            else 0.0
+        ),
+        "gate_score_best": (
+            round(max(gate_scores), 4)
+            if gate_scores
+            else 0.0
+        ),
         "duplicate_rate": round(
             1.0 - unique_expressions / max(1, len(expressions)),
             6,
         ),
         "source_counts": dict(sources.most_common()),
+        "direction_counts": dict(directions.most_common()),
         "failure_reason_counts": dict(reasons.most_common(12)),
         "improvement_target_counts": dict(targets.most_common(8)),
         "component_means": {
@@ -757,6 +837,23 @@ def compare_feedback_reports(candidate: dict, incumbent: dict | None) -> dict:
                 (_finite_float(candidate.get("seed_score_mean"), 0.0) or 0.0)
                 - (
                     _finite_float(incumbent.get("seed_score_mean"), 0.0)
+                    or 0.0
+                ),
+                4,
+            ),
+            "gate_score_mean": round(
+                (
+                    _finite_float(
+                        candidate.get("gate_score_mean"),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                - (
+                    _finite_float(
+                        incumbent.get("gate_score_mean"),
+                        0.0,
+                    )
                     or 0.0
                 ),
                 4,

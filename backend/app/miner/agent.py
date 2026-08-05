@@ -92,6 +92,7 @@ def _build_system_prompt(
     portfolio_mode: str = "long_short",
     market: str = "us",
     direction: int = 1,
+    direction_policy: str = "both_train_select",
 ) -> str:
     """从模板组装 system prompt。约束块强制置顶 (外层不可稀释)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
@@ -99,28 +100,36 @@ def _build_system_prompt(
     sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
     fields = fields or _FIELDS
     strategy_part = sys_tpl.format(fields=", ".join(fields), ops=ops_doc, anti=anti)
-    direction_policy = (
-        "方向冻结为 +1：因子值越高，越偏向多头"
-        if direction == 1
-        else "方向冻结为 -1：因子值越低，越偏向多头；系统会反向排序"
+    direction_instruction = (
+        (
+            "每个候选都在训练安全层同时评价 +1（高值偏多）与 "
+            "-1（低值偏多）；系统计入双向试验惩罚后选优并冻结。"
+            f"完全同分时优先 {direction:+d}"
+        )
+        if direction_policy == "both_train_select"
+        else (
+            "方向冻结为 +1：因子值越高，越偏向多头"
+            if direction == 1
+            else "方向冻结为 -1：因子值越低，越偏向多头；系统会反向排序"
+        )
     )
     mode_policy = (
-        "只能做多，按冻结方向挑选股票，禁止依赖做空获利。"
+        "只能做多，按选中方向挑选股票，禁止依赖做空获利。"
         if portfolio_mode == "long_only"
-        else "允许多空，按冻结方向建立多头侧，反方向建立空头侧。"
+        else "允许多空，按选中方向建立多头侧，反方向建立空头侧。"
     )
 
     # 强制约束块 (置顶, 外层改写不能削弱)
     constraints = (
         f"【研究任务约束】市场: {market}；持仓模式: {portfolio_mode}。"
         f"{mode_policy}\n"
-        f"【信号方向】{direction_policy}；"
+        f"【信号方向】{direction_instruction}；"
         f"{'其余股票保持空仓，不建立空头。' if portfolio_mode == 'long_only' else '另一侧作为空头组合。'}\n"
         f"【硬约束 — 违反者无效】\n"
         f"可用字段 ({len(fields)}个): {', '.join(fields)}\n"
         f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
         f"窗口: 1..250 整数\n"
-        "权威目标: 改善 V4 保守 discovery score 的最弱组件；"
+        "权威目标: 改善 V4.2 连续学习分的最弱组件，同时不得削弱硬门槛；"
         "费后收益/下置信界、HAC 置信度、跨期稳定性、分位单调性、"
         "压力成本和可实施性不能由高 ICIR 抵消。\n"
         "输出格式: 只回复 JSON: "
@@ -128,6 +137,8 @@ def _build_system_prompt(
         "\"reflection\":\"从反馈提炼的经验与本次改变\","
         "\"targeted_failures\":[\"本次针对的失败原因\"],"
         "\"expected_effect\":\"预期改善的评价组件\"}\n"
+        "以上五个键全部必填，不得省略 expected_effect；"
+        "targeted_failures 必须是 JSON 数组。\n"
     )
     return constraints + "\n" + strategy_part
 
@@ -216,6 +227,9 @@ async def propose(
     portfolio_mode = task.get("mode", "long_short")
     market = task.get("market", "us")
     direction = int(task.get("direction", 1))
+    direction_policy = str(
+        task.get("direction_policy") or "both_train_select"
+    )
     fallback_reason = "provider_not_configured"
     text: str | None = None
 
@@ -228,6 +242,7 @@ async def propose(
                     portfolio_mode,
                     market,
                     direction,
+                    direction_policy,
                 )
                 if template
                 else _system_prompt_old(
@@ -284,7 +299,7 @@ async def propose(
                 draft_inst = template.get("draft_strategy", "提出与历史不同的新因子。") if template else "请提出一个与历史尝试思路不同的新因子。"
                 div_inst = template.get("diversity_instruction", "") if template else ""
                 user = (
-                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction={direction}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction_policy={direction_policy}, tie_break_direction={direction}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
                     f"评价反馈与历史经验:\n{context}\n\n"
                     f"上下文使用要求: {context_instruction}\n"
                     f"策略指令: {draft_inst}\n{div_inst}\n"
@@ -293,9 +308,9 @@ async def propose(
             else:  # improve
                 impr_inst = template.get("improve_strategy", "改进当前最优因子。") if template else "请改进当前最优因子 (调整结构/窗口/复合), 保持简洁。"
                 user = (
-                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction={direction}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction_policy={direction_policy}, tie_break_direction={direction}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
                     f"当前最优: {base['expression'] if base else '无'} "
-                    f"(score={base['public_score']:.3f} icir={base['public_metrics'].get('icir',0):+.2f})\n"
+                    f"(learning_score={base['public_score']:.3f} icir={base['public_metrics'].get('icir',0):+.2f})\n"
                     f"完整评价反馈与经验:\n{context}\n\n"
                     f"上下文使用要求: {context_instruction}\n"
                     f"改进策略: {impr_inst}\n"
@@ -339,18 +354,35 @@ async def propose(
                 for item in targeted[:6]
                 if str(item).strip()
             ]
-            if not hypothesis or not reflection or not expected_effect:
+            if not hypothesis or not reflection:
                 raise llm.LLMError(
-                    "LLM 输出缺少 hypothesis/reflection/expected_effect"
+                    "LLM 输出缺少 hypothesis/reflection"
                 )
             if top_nodes and not targeted:
                 raise llm.LLMError(
                     "已有评价反馈时 targeted_failures 不能为空"
                 )
+            semantic_normalizations = []
+            if not expected_effect:
+                # expected_effect is useful explanatory metadata, but it is not
+                # part of expression validity or the evaluator gate.  Some
+                # otherwise complete DeepSeek responses omit only this final
+                # key.  Preserve the substantive proposal and make the
+                # deterministic repair explicit instead of silently replacing
+                # it with a random expression.
+                basis = targeted or [reflection]
+                expected_effect = (
+                    "模型未单列 expected_effect；依据其失败目标规范化补全："
+                    + "；".join(basis)
+                )[:500]
+                semantic_normalizations.append(
+                    "expected_effect_derived_from_targeted_failures"
+                )
             proposal_meta = {
                 "reflection": reflection,
                 "targeted_failures": targeted,
                 "expected_effect": expected_effect,
+                "semantic_normalizations": semantic_normalizations,
                 "feedback_context_fingerprint": feedback_snapshot.get(
                     "context_fingerprint",
                     "",
@@ -360,7 +392,13 @@ async def propose(
                 ),
             }
             ensure_training_safe(proposal_meta)
-            await llm.mark_validation(text, accepted=True)
+            await llm.mark_validation(
+                text,
+                accepted=True,
+                trace_meta_updates={
+                    "semantic_normalizations": semantic_normalizations,
+                },
+            )
             return (
                 expr,
                 hypothesis,
@@ -448,7 +486,7 @@ def _context_block_old(top_nodes: list[dict], spec: dict) -> str:
     lines = []
     for n in top_nodes[:k]:
         lines.append(
-            f"- score={n['public_score']:.3f} icir={n['public_metrics'].get('icir')} "
+            f"- learning_score={n['public_score']:.3f} icir={n['public_metrics'].get('icir')} "
             f"daily_turnover={n['public_metrics'].get('daily_turnover', n['public_metrics'].get('turnover'))} "
             f"expr: {n['expression']}"
         )

@@ -2,7 +2,9 @@
 
 支持 A 股与美股并行任务的 7×24 双层嵌套优化 (bi-level) LLM 因子挖掘工厂。外层 Meta-Optimizer 进化白名单约束的
 `MinerTemplate`（提示词、搜索策略、反馈上下文、示例优先级与 DSL 结构），内层 Miner 在该模板下进化因子表达式；
-Evaluation Protocol V4 把搜索发现分、实盘排序分与最终校准分离。
+Evaluation Protocol V4.2 把连续学习分、硬准入分、实盘排序分与最终校准分离；
+每个新候选在训练安全层同时评价正反方向、按双向试验数惩罚后冻结方向，
+失败候选也保留可比较的严重程度，避免双层 LLM 面对一片 `0.000` 无法归因。
 设计蓝图见 [DESIGN.md](DESIGN.md)，事件回测的冻结口径见
 [docs/BACKTEST_PROTOCOL_V1.md](docs/BACKTEST_PROTOCOL_V1.md)。
 
@@ -49,7 +51,8 @@ createdb factor_factory      # 首次
   `supported/refuted/inconclusive`、证据、经验、避免模式、下一实验与停止条件，供下一步读取。
 - **生命周期**: F1 discovery → F2 research-pass → F3 OOS-pass → F4 paper-candidate →
   F5 live-candidate-non-pit。F5 仍是 `NON_PIT_RESEARCH`，不是生产批准。
-- **V4 实盘排序**: 0–100 分以 HOLDOUT 费后收益/Sharpe 下置信界、收益 HAC、多重检验门槛、
+- **V4.2 方向与实盘排序**: 新候选在训练安全层同时评价 +1/-1，按两次试验计数后冻结方向；
+  0–100 分以 HOLDOUT 费后收益/Sharpe 下置信界、收益 HAC、多重检验门槛、
   成本盈亏平衡、压力成本、跨 era 盈利率、泛化衰减和容量为核心；Vault 数值不进入公式，
   仅用于检验冻结排序与后续费后结果的 Spearman、Top 组盈利率和分组单调性。
 - **交互性能**: 页面使用 KeepAlive、GET 去重/短缓存和非重载任务切换；列表 API 只返回指标摘要，
