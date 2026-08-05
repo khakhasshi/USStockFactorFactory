@@ -10,7 +10,7 @@ createdb factor_factory      # 首次
 ./run.sh                     # 建 venv、装依赖、启动服务
 ```
 
-访问 http://localhost:9999 (可用 `FF_PORT=xxxx ./run.sh` 换端口)。
+访问 http://localhost:10010 (可用 `FF_PORT=xxxx ./run.sh` 换端口)。
 
 ## 页面
 
@@ -41,7 +41,7 @@ createdb factor_factory      # 首次
 
 | 变量 | 默认 |
 |---|---|
-| `FF_PORT` | 9999 |
+| `FF_PORT` | 10010 |
 | `FF_DATABASE_URL` | postgresql+asyncpg://jiangjingzhe@localhost:5432/factor_factory |
 | `FF_PANEL_GLOB` | MultiFactorUS yfinance 研究面板 parquet 路径 |
 

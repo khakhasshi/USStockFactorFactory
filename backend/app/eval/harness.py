@@ -21,7 +21,7 @@ EVAL_LAYERS = ["INNER_PUBLIC", "META_TRAIN"]
 COST_BPS = 15  # 默认单边交易成本 (bps)
 
 
-def _layer_metrics(daily: pl.DataFrame) -> dict:
+def _layer_metrics(daily: pl.DataFrame, portfolio_mode: str = "long_short") -> dict:
     """单层指标计算 (不含跨层惩罚)."""
     if daily.height < 30:
         return {"n_days": daily.height, "ic_mean": None, "icir": None, "score": None}
@@ -44,6 +44,14 @@ def _layer_metrics(daily: pl.DataFrame) -> dict:
     else:
         t_stat = None
 
+    long_sharpe = None
+    long_mean = None
+    if "long_ret" in daily.columns:
+        lr = daily["long_ret"].drop_nulls()
+        if len(lr) >= 30:
+            long_mean = float(lr.mean())
+            long_sharpe = long_mean / float(lr.std() or 1e-9) * math.sqrt(252)
+
     return {
         "n_days": daily.height,
         "ic_mean": round(ic_mean, 5),
@@ -52,6 +60,9 @@ def _layer_metrics(daily: pl.DataFrame) -> dict:
         "turnover": round(turnover, 4),
         "direction": overall_sign,
         "t_stat": round(t_stat, 3) if t_stat is not None else None,
+        "long_only_mean": round(long_mean, 6) if long_mean is not None else None,
+        "long_only_sharpe": round(long_sharpe, 4) if long_sharpe is not None else None,
+        "portfolio_mode": portfolio_mode,
         "score": None,  # 由 evaluate() 统一计算
         "era_series": [
             {"era": int(r["era"]), "ic": round(float(r["ic"]), 5)}
@@ -60,7 +71,7 @@ def _layer_metrics(daily: pl.DataFrame) -> dict:
     }
 
 
-def _compute_score(public: dict, gate: dict, turnover: float | None = None) -> float:
+def _compute_score(public: dict, gate: dict, turnover: float | None = None, portfolio_mode: str = "long_short") -> float:
     """跨层综合评分 (v2 公式).
 
     惩罚项:
@@ -69,12 +80,25 @@ def _compute_score(public: dict, gate: dict, turnover: float | None = None) -> f
       gate_flip_penalty: ×0.3 (如果 public/gate IC 符号相反)
       cost_killer:      0 (如果年化成本 > |ICIR|)
     """
-    icir = abs(public.get("icir") or 0)
+    raw_icir = public.get("icir") or 0
+    # A 股不可做空：负向 RankIC 不能靠做空获利，必须翻转表达式后重新验证，
+    # 因此 long-only 评分不再使用 abs(ICIR)。
+    icir = raw_icir if portfolio_mode == "long_only" else abs(raw_icir)
+    if portfolio_mode == "long_only":
+        def long_alpha(metrics: dict) -> float:
+            base = max(0.0, metrics.get("icir") or 0.0)
+            sharpe = max(0.0, metrics.get("long_only_sharpe") or 0.0)
+            return 0.65 * base + 0.35 * sharpe
+
+        # A 股不可做空，且必须在 PUBLIC 与 GATE 都能做多；取弱侧，
+        # 避免训练层漂亮、门禁层实际亏损仍被登记为高分。
+        icir = min(long_alpha(public), long_alpha(gate))
     if icir < 0.001:
         return 0.0
 
     # era一致性惩罚 (用public层)
-    cons = public.get("era_consistency") or 0
+    cons = min(public.get("era_consistency") or 0, gate.get("era_consistency") or 0) \
+        if portfolio_mode == "long_only" else public.get("era_consistency") or 0
     era_penalty = min(1.0, (cons / 0.75)**2)
 
     # 换手指数衰减 (取public和gate中的较大者, 更保守)
@@ -104,9 +128,19 @@ def _compute_score(public: dict, gate: dict, turnover: float | None = None) -> f
     return round(score, 4)
 
 
-def evaluate(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
+def evaluate(
+    expression: str,
+    universe_n: int = 500,
+    horizon: int = 5,
+    portfolio_mode: str = "long_short",
+    direction: int = 1,
+    panel_glob: str | None = None,
+    cost_bps: float = COST_BPS,
+) -> dict:
     """返回 {public: {...}, gate: {...}}; public和gate均含score (由跨层公式统一计算)."""
-    df = PanelStore.get().ensure_loaded()
+    if portfolio_mode not in {"long_short", "long_only"}:
+        raise ValueError("portfolio_mode 必须是 long_short 或 long_only")
+    df = PanelStore.get(panel_glob).ensure_loaded()
     pipe = parse(expression)
     fwd = f"fwd_{horizon}"
     if fwd not in df.columns:
@@ -128,12 +162,19 @@ def evaluate(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
             .abs()
             .alias("f_chg")
         )
+        .with_columns(
+            pl.when(pl.col("f_pct") >= 0.8 if direction >= 0 else pl.col("f_pct") <= 0.2)
+            .then(pl.col(fwd))
+            .otherwise(None)
+            .alias("long_ret")
+        )
     )
     daily = (
         work.group_by("trade_date", "layer", "era")
         .agg(
             pl.corr("f_rank", "r_rank").alias("ic"),
             pl.col("f_chg").mean().alias("turnover"),
+            pl.col("long_ret").mean().alias("long_ret"),
             pl.len().alias("n"),
         )
         .filter(pl.col("n") >= 50)
@@ -148,20 +189,20 @@ def evaluate(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
     # 分别计算单层指标
     pub_daily = daily.filter(pl.col("layer") == "INNER_PUBLIC")
     gate_daily = daily.filter(pl.col("layer") == "META_TRAIN")
-    public = _layer_metrics(pub_daily)
-    gate = _layer_metrics(gate_daily)
+    public = _layer_metrics(pub_daily, portfolio_mode)
+    gate = _layer_metrics(gate_daily, portfolio_mode)
 
     # 跨层综合评分
-    score = _compute_score(public, gate)
+    score = _compute_score(public, gate, portfolio_mode=portfolio_mode)
     public["score"] = score
     gate["score"] = score  # gate分也用同一个跨层公式 (统一尺度)
 
     return {"public": public, "gate": gate}
 
 
-def era_detail(expression: str, universe_n: int = 500, horizon: int = 5) -> dict:
+def era_detail(expression: str, universe_n: int = 500, horizon: int = 5, panel_glob: str | None = None) -> dict:
     """步进可视化数据: 全部四层的 era 级 IC 序列 (只读展示, 不参与优化信号)."""
-    df = PanelStore.get().ensure_loaded()
+    df = PanelStore.get(panel_glob).ensure_loaded()
     pipe = parse(expression)
     fwd = f"fwd_{horizon}"
     daily = (

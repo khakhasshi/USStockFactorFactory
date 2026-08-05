@@ -6,7 +6,7 @@
 import logging
 import random
 
-from ..config import DEFAULT_MINER_TEMPLATE, DSL_FIELDS
+from ..config import DEFAULT_MINER_TEMPLATE, DSL_FIELDS, get_dsl_fields
 from ..dsl.engine import OPERATORS_DOC, validate
 from ..llm import client as llm
 
@@ -19,11 +19,11 @@ _WINDOWS = [3, 5, 10, 20, 40, 60, 120]
 # 随机回退 (无 LLM 时)
 # ============================================================
 
-def random_expression(templates: list[str] | None = None) -> str:
+def random_expression(templates: list[str] | None = None, fields: list[str] | None = None) -> str:
     """使用模板生成随机表达式。"""
     f = random.choice
     w = lambda: f(_WINDOWS)  # noqa: E731
-    field = lambda: f(_FIELDS)  # noqa: E731
+    field = lambda: f(fields or _FIELDS)  # noqa: E731
 
     if templates and len(templates) >= 3:
         # 从模板列表随机选一个, 填参数
@@ -66,17 +66,20 @@ def mutate_expression(expr: str, templates: list[str] | None = None) -> str:
 # 模板驱动的提示词构造
 # ============================================================
 
-def _build_system_prompt(template: dict) -> str:
+def _build_system_prompt(template: dict, fields: list[str] | None = None, portfolio_mode: str = "long_short", market: str = "us") -> str:
     """从模板组装 system prompt。约束块强制置顶 (外层不可稀释)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = template.get("anti_overfit_instruction", "")
     sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
-    strategy_part = sys_tpl.format(fields=", ".join(_FIELDS), ops=ops_doc, anti=anti)
+    fields = fields or _FIELDS
+    strategy_part = sys_tpl.format(fields=", ".join(fields), ops=ops_doc, anti=anti)
 
     # 强制约束块 (置顶, 外层改写不能削弱)
     constraints = (
+        f"【研究任务约束】市场: {market}；持仓模式: {portfolio_mode}。"
+        f"{'只能做多，优先选择因子值最高的股票，禁止依赖做空获利。' if portfolio_mode == 'long_only' else '允许多空，因子正负方向均可作为组合两侧信号。'}\n"
         f"【硬约束 — 违反者无效】\n"
-        f"可用字段 ({len(_FIELDS)}个): {', '.join(_FIELDS)}\n"
+        f"可用字段 ({len(fields)}个): {', '.join(fields)}\n"
         f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
         f"窗口: 1..250 整数\n"
         f"输出格式: 只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"...\"}}\n"
@@ -128,6 +131,7 @@ async def propose(
     task: dict,
     top_nodes: list[dict],
     provider: dict | None,
+    fields: list[str] | None = None,
 ) -> tuple[str, str, str]:
     """返回 (expression, hypothesis, source).
 
@@ -137,17 +141,19 @@ async def propose(
     # 兼容 v1 spec 和 v2 template
     is_v2 = "draft_strategy" in template_or_spec
     template = template_or_spec if is_v2 else None
+    portfolio_mode = task.get("mode", "long_short")
+    market = task.get("market", "us")
 
     if provider:
         try:
-            system = _build_system_prompt(template) if template else _system_prompt_old(template_or_spec)
+            system = _build_system_prompt(template, fields, portfolio_mode, market) if template else _system_prompt_old(template_or_spec, fields, portfolio_mode, market)
             context = _build_context_block(top_nodes, template) if template else _context_block_old(top_nodes, template_or_spec)
 
             if op == "draft":
                 draft_inst = template.get("draft_strategy", "提出与历史不同的新因子。") if template else "请提出一个与历史尝试思路不同的新因子。"
                 div_inst = template.get("diversity_instruction", "") if template else ""
                 user = (
-                    f"任务: universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
                     f"历史尝试:\n{context}\n\n"
                     f"策略指令: {draft_inst}\n{div_inst}"
                 )
@@ -155,7 +161,7 @@ async def propose(
                 base = top_nodes[0] if top_nodes else None
                 impr_inst = template.get("improve_strategy", "改进当前最优因子。") if template else "请改进当前最优因子 (调整结构/窗口/复合), 保持简洁。"
                 user = (
-                    f"任务: universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
                     f"当前最优: {base['expression'] if base else '无'} "
                     f"(score={base['public_score']:.3f} icir={base['public_metrics'].get('icir',0):+.2f})\n"
                     f"其余尝试:\n{_build_context_block(top_nodes[1:], template) if template else _context_block_old(top_nodes[1:], template_or_spec)}\n\n"
@@ -178,14 +184,14 @@ async def propose(
     tpls = template.get("dsl_exploration_templates") if template else None
     if op == "improve" and top_nodes:
         return mutate_expression(top_nodes[0]["expression"], tpls), "随机变异自当前最优", "random"
-    return random_expression(tpls), "随机模板生成", "random"
+    return random_expression(tpls, fields), "随机模板生成", "random"
 
 
 # ============================================================
 # 向后兼容: v1 旧版函数 (A组仍在用)
 # ============================================================
 
-_OLD_SYSTEM = """你是量化因子研究员。基于美股日线数据设计横截面选股因子表达式。
+_OLD_SYSTEM = """你是量化因子研究员。基于当前市场日线数据设计横截面选股因子表达式。
 可用字段: {fields} (前复权价格与量额)
 可用算子:
 {ops}
@@ -196,10 +202,12 @@ _OLD_SYSTEM = """你是量化因子研究员。基于美股日线数据设计横
 _ANTI = "\n特别要求: 避免过拟合——偏好简单、有经济含义、跨行业普适的结构。"
 
 
-def _system_prompt_old(spec: dict) -> str:
+def _system_prompt_old(spec: dict, fields: list[str] | None = None, portfolio_mode: str = "long_short", market: str = "us") -> str:
     ops = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = _ANTI if spec.get("anti_overfit_instruction") else ""
-    return _OLD_SYSTEM.format(fields=", ".join(_FIELDS), ops=ops, anti=anti)
+    policy = f"\n研究任务: 市场={market}, 持仓模式={portfolio_mode}。"
+    policy += "只能做多，禁止依赖负向信号做空获利。" if portfolio_mode == "long_only" else "允许多空双侧组合。"
+    return _OLD_SYSTEM.format(fields=", ".join(fields or _FIELDS), ops=ops, anti=anti) + policy
 
 
 def _context_block_old(top_nodes: list[dict], spec: dict) -> str:

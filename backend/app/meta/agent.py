@@ -202,6 +202,8 @@ async def propose_template(
     incumbent_template: dict,
     history: list[dict],
     provider: dict | None,
+    market: str = "us",
+    portfolio_mode: str = "long_short",
 ) -> tuple[dict, str, str]:
     """返回 (new_template, note, source).
 
@@ -230,6 +232,8 @@ async def propose_template(
             }
 
             user = (
+                f"=== 研究任务硬约束 ===\n市场: {market}\n持仓模式: {portfolio_mode}\n"
+                f"{'只能做多，评价只奖励正向收益和多头稳定性。' if portfolio_mode == 'long_only' else '允许多空，评价可同时使用多头和空头收益。'}\n\n"
                 f"=== 当前在位模板 ===\n{current_summary}\n\n"
                 f"=== 历史版本 ===\n{hist_text}\n\n"
                 f"请分析当前模板的问题, 提出改进。"

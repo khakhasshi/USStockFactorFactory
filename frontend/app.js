@@ -44,6 +44,12 @@ const Dashboard = {
         <div class="sub">{{ st.counts?.accepted ?? 0 }} / {{ st.counts?.outer_steps ?? 0 }} 步被接受</div>
       </div>
     </div>
+    <div class="card" style="margin-bottom:14px">
+      <div class="panel-title-row"><div><h3>并行任务与数据身份</h3><span class="sub">同一端口内独立 worker；历史数据按任务 ID 隔离</span></div><span class="tag blue">{{ (st.workers || []).length }} workers</span></div>
+      <table><tr><th>任务</th><th>市场</th><th>模式</th><th>状态</th><th>外层步</th><th>内层评估</th></tr>
+        <tr v-for="w in (st.workers || [])" :key="w.experiment_id"><td>{{ w.experiment_id }}</td><td>{{ w.task_config?.market || '—' }}</td><td>{{ w.task_config?.portfolio_mode || '—' }}</td><td>{{ w.state }}</td><td>{{ w.outer_step }}</td><td>{{ w.inner_evals }}</td></tr>
+      </table>
+    </div>
     <div class="grid cols-2">
       <div class="card">
         <h3>外层 Meta-Score 步进 (候选 vs 在位)</h3>
@@ -286,6 +292,72 @@ const FactorLibrary = {
   },
 };
 
+/* ============ 因子研究工作台 ============ */
+const FactorLibraryWorkbench = {
+  template: `
+  <div class="factor-workbench">
+    <div class="card" style="margin-bottom:14px">
+      <div class="panel-title-row"><div><div class="eyebrow">FACTOR RESEARCH WORKBENCH</div><h1>因子库</h1><span class="sub">从“看一张表”升级为可检索、可复核、可比较的研究资产库。</span></div><span class="tag blue">{{ factors.length }} 条当前任务记录</span></div>
+      <div class="form-row" style="margin-top:14px">
+        <input style="flex:3" v-model="query" @keyup.enter="refresh" placeholder="搜索名称、表达式、经济学假设…" />
+        <select v-model="status"><option value="">全部生命周期</option><option value="public-leading">public-leading</option><option value="library-admitted">library-admitted</option><option value="paper">paper</option><option value="retired">retired</option></select>
+        <select v-model="sort"><option value="score">按综合分</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
+        <button class="btn" @click="refresh">刷新</button><button class="btn primary" @click="compare" :disabled="selected.length<2">比较 {{ selected.length }} 个</button>
+      </div>
+      <div class="sub" style="margin-top:10px">筛选建议：先按 long-only score / GATE Sharpe 过滤，再做相关性去冗余；单条表达式也可直接加入比较。</div>
+    </div>
+
+    <div class="grid cols-2" v-if="comparison">
+      <div class="card">
+        <div class="panel-title-row"><h2>批量评估</h2><span class="tag amber">{{ comparison.portfolio_mode }}</span></div>
+        <table><tr><th>表达式</th><th>PUB ICIR</th><th>GATE ICIR</th><th>多头 Sharpe</th><th>综合分</th></tr>
+          <tr v-for="r in comparison.results" :key="r.expression"><td class="mono-expr">{{ r.expression }}</td><td>{{ f(r.public?.icir) }}</td><td>{{ f(r.gate?.icir) }}</td><td>{{ f(r.gate?.long_only_sharpe) }}</td><td><b>{{ f(r.public?.score) }}</b></td></tr></table>
+      </div>
+      <div class="card"><h2>横截面冗余检查</h2><div class="sub">{{ comparison.correlation?.date }} · {{ comparison.correlation?.n }} 只股票</div>
+        <table><tr><th></th><th v-for="(_,i) in comparison.correlation.matrix" :key="i">F{{ i+1 }}</th></tr>
+          <tr v-for="(row,i) in comparison.correlation.matrix" :key="i"><th>F{{ i+1 }}</th><td v-for="(v,j) in row" :key="j" :class="Math.abs(v)>=0.8 && i!==j ? 'corr-high' : ''">{{ v.toFixed(2) }}</td></tr></table>
+        <div class="sub" style="margin-top:8px">相关系数绝对值 ≥ 0.80 标红，表示候选可能是同一风险暴露的重复表达。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="panel-title-row"><h2>研究资产</h2><span class="sub">勾选后批量比较；点击行查看完整分层结果和研究备注</span></div>
+      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>表达式</th><th>状态</th><th>评估协议</th><th>PUB ICIR</th><th>GATE ICIR</th><th>Long-only Sharpe</th><th>Score</th><th>标签</th></tr>
+        <tr v-for="fa in factors" :key="fa.id" class="clickable" @click="open(fa)">
+          <td @click.stop><input type="checkbox" :value="fa.id" v-model="selected" /></td><td><b>{{ fa.name }}</b></td><td class="mono-expr factor-expression">{{ fa.expression }}</td>
+          <td><span class="tag" :class="{green: fa.status==='library-admitted', blue: fa.status==='public-leading', amber: fa.status==='paper', red: fa.status==='retired'}">{{ fa.status }}</span></td><td><span class="tag" :class="fa.evaluation_protocol==='long_only_v1' ? 'green' : 'amber'">{{ fa.evaluation_protocol==='long_only_v1' ? '多头 V1' : '旧口径' }}</span></td>
+          <td>{{ f(fa.public?.icir) }}</td><td>{{ f(fa.gate?.icir) }}</td><td>{{ f(fa.gate?.long_only_sharpe) }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
+          <td>{{ (fa.research_meta?.tags || []).join(' · ') || '—' }}</td>
+        </tr></table>
+      <div v-if="!factors.length" class="selector-empty"><h2>当前筛选没有结果</h2><p>降低筛选条件，或等待任务产生新的因子。</p></div>
+    </div>
+
+    <div class="drawer" v-if="detail">
+      <button class="btn close" @click="detail=null">✕ 关闭</button><h2>{{ detail.factor.name }}</h2><div class="mono-expr">{{ detail.factor.expression }}</div><p class="sub">{{ detail.factor.hypothesis }}</p>
+      <div class="card"><h3>分层指标</h3><table><tr><th>层</th><th>ICIR</th><th>一致性</th><th>Long-only Sharpe</th><th>Score</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(m?.long_only_sharpe) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
+      <label>标签（逗号分隔）</label><input v-model="review.tags" placeholder="momentum, quality, low-turnover" /><label>研究备注</label><textarea v-model="review.note" rows="5" placeholder="记录经济机制、已知暴露、失败原因和后续动作"></textarea>
+      <div style="margin-top:10px"><button class="btn primary" @click="saveReview">保存研究备注</button><span class="sub" style="margin-left:8px">experiment={{ detail.factor.experiment_id }}</span></div>
+    </div>
+  </div>`,
+  setup() {
+    const factors = ref([]), selected = ref([]), detail = ref(null), comparison = ref(null);
+    const query = ref(""), status = ref(""), sort = ref("score");
+    const review = reactive({ tags: "", note: "" });
+    const f = v => v == null ? "—" : Number(v).toFixed(3);
+    async function refresh() {
+      const params = new URLSearchParams({ limit: "500", sort: sort.value });
+      if (query.value) params.set("q", query.value); if (status.value) params.set("status", status.value);
+      factors.value = (await api("/factors?" + params.toString())).factors;
+    }
+    function toggleAll(e) { selected.value = e.target.checked ? factors.value.map(fa=>fa.id) : []; }
+    async function open(fa) { detail.value = await api(`/factors/${fa.id}/detail`); review.tags = (detail.value.factor.research_meta?.tags || []).join(", "); review.note = detail.value.factor.research_meta?.note || ""; }
+    async function compare() { comparison.value = await api("/factors/compare", { method:"POST", body:{ factor_ids:selected.value } }); }
+    async function saveReview() { await api(`/factors/${detail.value.factor.id}/review`, { method:"PATCH", body:{ tags:review.tags.split(","), note:review.note } }); detail.value.factor.research_meta = { tags:review.tags.split(",").filter(Boolean), note:review.note }; refresh(); }
+    onMounted(refresh);
+    return { factors, selected, detail, comparison, query, status, sort, review, f, refresh, toggleAll, open, compare, saveReview };
+  },
+};
+
 /* ============ 回测 ============ */
 const BacktestView = {
   template: `
@@ -300,7 +372,7 @@ const BacktestView = {
         <div><label>结束</label><input v-model="form.end" /></div>
         <div><label>成本 bps</label><input v-model.number="form.cost_bps" type="number" /></div>
         <div><label>方向</label><select v-model.number="form.direction"><option :value="1">正向</option><option :value="-1">反向</option></select></div>
-        <div><label>模式</label><select v-model="form.mode"><option value="long_short">多空</option><option value="long_only">纯多头</option></select></div>
+        <div><label>任务持仓约束</label><span class="tag blue">{{ taskMode==='long_only' ? '纯多头' : '多空' }}</span><div class="sub">继承当前研究任务</div></div>
       </div>
       <div style="margin-top:12px"><button class="btn primary" @click="run" :disabled="running">{{ running ? '回测中…' : '运行回测' }}</button>
         <span v-if="err" style="color:var(--red); margin-left:12px">{{ err }}</span></div>
@@ -332,7 +404,8 @@ const BacktestView = {
     </div>
   </div>`,
   setup() {
-    const form = reactive({ expression: "-rank(ts_delta(close, 20))", universe_n: 500, start: "2015-01-01", end: "2024-12-31", cost_bps: 15, direction: 1, mode: "long_short" });
+    const form = reactive({ expression: "-rank(ts_delta(close, 20))", universe_n: 500, start: "2015-01-01", end: "2024-12-31", cost_bps: 15, direction: 1, mode: null });
+    const taskMode = ref("long_only");
     const result = ref(null), history = ref([]), err = ref(""), running = ref(false);
     const curveEl = ref(null);
     const labels = { days: "交易日数", ann_ret: "年化收益", ann_vol: "年化波动", sharpe: "Sharpe", max_dd: "最大回撤", avg_daily_turnover: "日均换手", final_nav: "期末净值" };
@@ -359,8 +432,8 @@ const BacktestView = {
       });
     }
     async function loadHistory() { history.value = (await api("/backtests")).backtests; }
-    onMounted(loadHistory);
-    return { form, result, history, err, running, run, curveEl, labels };
+    onMounted(async () => { const meta = await api("/meta"); taskMode.value = meta.portfolio_mode || "long_only"; form.mode = taskMode.value; loadHistory(); });
+    return { form, taskMode, result, history, err, running, run, curveEl, labels };
   },
 };
 
@@ -368,7 +441,22 @@ const BacktestView = {
 const SettingsView = {
   template: `
   <div>
-    <div class="warn-banner">提示: 默认端口 9999, 访问 http://localhost:9999 (可用环境变量 FF_PORT 覆盖)。</div>
+    <div class="card task-definition-card" style="margin-bottom:14px">
+      <div class="panel-title-row"><div><h2>定义研究任务</h2><span class="sub">任务配置会随实验保存；历史任务只允许归档，不会删除数据。</span></div><span class="tag blue">单端口 · 多任务并行</span></div>
+      <div class="form-row">
+        <div style="flex:2"><label>任务名称</label><input v-model="taskForm.name" placeholder="如：A股多头质量因子 V2" /></div>
+        <div style="flex:3"><label>研究问题 / 假设</label><input v-model="taskForm.description" placeholder="要验证的经济机制、变更点与成功标准" /></div>
+      </div>
+      <div class="form-row">
+        <div><label>市场</label><select v-model="taskForm.market"><option value="ashare">A股</option><option value="us">美股</option></select></div>
+        <div><label>持仓约束</label><select v-model="taskForm.portfolio_mode"><option value="long_only">纯多头</option><option value="long_short">多空</option></select></div>
+        <div><label>引擎版本</label><select v-model="taskForm.engine_mode"><option value="v2">V2 MinerTemplate</option><option value="v1">V1 兼容（历史）</option></select></div>
+        <div style="flex:3"><label>面板路径（可选）</label><input v-model="taskForm.panel_glob" placeholder="留空使用服务默认面板" /></div>
+        <div style="align-self:flex-end"><button class="btn primary" @click="createTask">创建任务</button></div>
+      </div>
+      <div v-if="taskMsg" :style="{color: taskOk ? 'var(--green)' : 'var(--red)'}">{{ taskMsg }}</div>
+    </div>
+    <div class="warn-banner">统一服务端口由启动环境决定；当前页面、A股与美股任务共用同一个 HTTP 端口，数据面板按任务配置隔离。</div>
     <div class="grid cols-2">
       <div class="card">
         <h3>大模型接入 (OpenAI / Anthropic 格式)</h3>
@@ -417,6 +505,8 @@ const SettingsView = {
     const llm = reactive({ providers: [], inner_provider: "", outer_provider: "" });
     const eng = reactive({ tasks: [] });
     const msg = ref(""), saved = ref("");
+    const taskForm = reactive({ name: "", description: "", market: "ashare", portfolio_mode: "long_only", engine_mode: "v2", panel_glob: "" });
+    const taskMsg = ref(""), taskOk = ref(false);
     async function load() {
       const s = await api("/settings");
       Object.assign(llm, s.llm_providers);
@@ -430,8 +520,20 @@ const SettingsView = {
       } catch (e) { saved.value = "err"; msg.value = "保存失败: " + e.message; }
       setTimeout(() => (msg.value = ""), 3000);
     }
+    async function createTask() {
+      taskMsg.value = "";
+      try {
+        await api("/experiments", { method: "POST", body: {
+          name: taskForm.name, description: taskForm.description,
+          research_config: { market: taskForm.market, portfolio_mode: taskForm.portfolio_mode,
+            engine_mode: taskForm.engine_mode, panel_glob: taskForm.panel_glob || undefined },
+        }});
+        taskOk.value = true; taskMsg.value = "研究任务已创建，可在“实验”页启动";
+        taskForm.name = ""; taskForm.description = "";
+      } catch (e) { taskOk.value = false; taskMsg.value = "创建失败: " + e.message; }
+    }
     onMounted(load);
-    return { llm, eng, save, msg, saved };
+    return { llm, eng, save, msg, saved, taskForm, taskMsg, taskOk, createTask };
   },
 };
 
@@ -440,29 +542,27 @@ const ExperimentsView = {
   template: `
   <div>
     <div class="card" style="margin-bottom:14px">
-      <h3>新建研究任务</h3>
+      <h3>研究任务与并行运行</h3>
       <div class="form-row">
         <div style="flex:1"><label>名称</label><input v-model="form.name" placeholder="如: 实验2-修复评估器" /></div>
         <div style="flex:2"><label>描述</label><input v-model="form.description" placeholder="研究假设 / 变更点" /></div>
-        <div style="align-self:flex-end"><button class="btn primary" @click="create">创建</button></div>
+        <div style="align-self:flex-end"><button class="btn primary" @click="create">创建（基础）</button></div>
       </div>
       <div v-if="err" style="color:var(--red); margin-top:8px">{{ err }}</div>
     </div>
     <div class="card">
       <h3>研究任务列表 ({{ exps.length }})</h3>
       <table>
-        <tr><th>#</th><th>名称</th><th>描述</th><th>状态</th><th>因子</th><th>节点</th><th>外层步</th><th>创建时间</th><th style="min-width:260px">操作</th></tr>
+        <tr><th>#</th><th>名称</th><th>市场 / 约束</th><th>任务状态</th><th>运行态</th><th>因子</th><th>节点</th><th>外层步</th><th style="min-width:280px">操作</th></tr>
         <tr v-for="e in exps" :key="e.id" :style="{background: e.active ? '#1c2733' : ''}">
           <td>{{ e.id }}</td>
           <td>
             <input v-if="editing===e.id" v-model="editForm.name" style="width:180px" />
             <template v-else><b>{{ e.name }}</b> <span v-if="e.active" class="tag green">活动</span></template>
           </td>
-          <td style="max-width:300px">
-            <input v-if="editing===e.id" v-model="editForm.description" style="width:100%" />
-            <span v-else class="sub">{{ e.description }}</span>
-          </td>
+          <td><span class="tag blue">{{ e.research_config?.market==='ashare' ? 'A股' : '美股' }}</span> <span class="sub">{{ e.research_config?.portfolio_mode==='long_only' ? '纯多头' : '多空' }}</span></td>
           <td><span class="tag" :class="{green: e.status==='open', amber: e.status==='archived'}">{{ e.status }}</span></td>
+          <td><span class="tag" :class="{green: runtime[e.id]?.state==='running', amber: runtime[e.id]?.state==='starting', red: runtime[e.id]?.state==='stopped'}">{{ runtime[e.id]?.state || 'stopped' }}</span></td>
           <td>{{ e.counts.factors }}</td><td>{{ e.counts.nodes }}</td><td>{{ e.counts.outer_steps }}</td>
           <td class="sub">{{ e.created_at?.slice(0,16) }}</td>
           <td>
@@ -471,7 +571,9 @@ const ExperimentsView = {
               <button class="btn" @click="editing=null">取消</button>
             </template>
             <template v-else>
-              <button class="btn" v-if="!e.active && e.status==='open'" @click="activate(e)">设为活动</button>
+              <button class="btn" v-if="!e.active && e.status==='open'" @click="activate(e)">查看任务</button>
+              <button class="btn primary" v-if="e.status==='open' && runtime[e.id]?.state!=='running'" @click="start(e)">启动 V2</button>
+              <button class="btn danger" v-else-if="runtime[e.id]?.state==='running'" @click="stop(e)">停止</button>
               <button class="btn" @click="startEdit(e)">编辑</button>
               <button class="btn" v-if="e.status==='open'" @click="setStatus(e,'archived')">归档</button>
               <button class="btn" v-else @click="setStatus(e,'open')">重新开放</button>
@@ -480,15 +582,19 @@ const ExperimentsView = {
           </td>
         </tr>
       </table>
-      <div class="sub" style="margin-top:8px">切换活动实验需先停止引擎; 删除会级联清除该实验全部因子/节点/步进记录, 不可恢复。</div>
+      <div class="sub" style="margin-top:8px">任务可以并行运行；历史数据不可物理删除，只能归档。点击“查看任务”只切换当前观察对象，不会停止其他 worker。</div>
     </div>
   </div>`,
   setup() {
-    const exps = ref([]);
+    const exps = ref([]), runtime = reactive({});
     const form = reactive({ name: "", description: "" });
     const editForm = reactive({ name: "", description: "" });
     const editing = ref(null), err = ref("");
-    async function refresh() { exps.value = (await api("/experiments")).experiments; }
+    async function refresh() {
+      exps.value = (await api("/experiments")).experiments;
+      const obs = await api("/observability");
+      (obs.workers || []).forEach(w => { runtime[w.experiment_id] = w; });
+    }
     async function create() {
       err.value = "";
       try { await api("/experiments", { method: "POST", body: { ...form } }); form.name = ""; form.description = ""; refresh(); }
@@ -510,6 +616,15 @@ const ExperimentsView = {
       try { await api(`/experiments/${e.id}/activate`, { method: "POST" }); location.reload(); }
       catch (ex) { err.value = ex.message; }
     }
+    async function start(e) {
+      err.value = "";
+      try { await api("/engine/start", { method: "POST", body: { mode: e.research_config?.engine_mode || "v2", experiment_id: e.id } }); refresh(); }
+      catch (ex) { err.value = ex.message; }
+    }
+    async function stop(e) {
+      try { await api("/engine/stop", { method: "POST", body: { experiment_id: e.id } }); refresh(); }
+      catch (ex) { err.value = ex.message; }
+    }
     async function del(e) {
       if (!confirm(`删除实验「${e.name}」及其全部 ${e.counts.factors} 个因子、${e.counts.nodes} 个节点? 不可恢复!`)) return;
       err.value = "";
@@ -517,13 +632,13 @@ const ExperimentsView = {
       catch (ex) { err.value = ex.message; }
     }
     onMounted(refresh);
-    return { exps, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, del };
+    return { exps, runtime, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, start, stop, del };
   },
 };
 
 /* ============ App ============ */
 const App = {
-  components: { Dashboard, ResearchTree, FactorLibrary, BacktestView, SettingsView, ExperimentsView },
+  components: { Dashboard, ResearchTree, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView },
   template: `
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
@@ -541,7 +656,7 @@ const App = {
   <div class="main">
     <Dashboard v-if="tab==='dash'" />
     <ResearchTree v-else-if="tab==='tree'" />
-    <FactorLibrary v-else-if="tab==='factors'" />
+    <FactorLibraryWorkbench v-else-if="tab==='factors'" />
 	    <ScreenerView v-else-if="tab==='screener'" />
     <BacktestView v-else-if="tab==='backtest'" />
     <ExperimentsView v-else-if="tab==='exps'" />
@@ -577,24 +692,139 @@ const App = {
   },
 };
 
-createApp(App).mount("#app");
-
-// ========== 选股器组件 ==========
 const ScreenerView = {
-  template: '<div class="screener"><div class="panel" style="margin-bottom:12px"><h3>多因子选股器</h3><div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap"><div><label>日期</label><input type="date" v-model="date" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px 8px"/></div><div><label>股票池</label><select v-model.number="univN" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px 8px"><option :value="100">Top 100</option><option :value="300">Top 300</option><option :value="500">Top 500</option><option :value="1000">Top 1000</option></select></div><div><label>显示</label><select v-model.number="topN" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px 8px"><option :value="20">Top 20</option><option :value="50">Top 50</option><option :value="100">Top 100</option></select></div><button @click="run" :disabled="loading" class="btn btn-primary">{{ loading ? "计算中..." : "执行选股" }}</button></div></div><div class="panel" style="margin-bottom:12px"><h4>因子选择 (勾选启用, 可调权重)</h4><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><div v-for="(f,i) in factors" :key="i" style="display:flex;align-items:center;gap:4px;background:var(--bg);padding:3px 8px;border-radius:4px;border:1px solid var(--border);font-size:12px"><input type="checkbox" v-model="f.enabled" :title="f.expression"/><span style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="f.expression">{{ f.name }}</span><input v-if="f.enabled" v-model.number="f.weight" type="number" step="0.5" min="0.5" max="5" style="width:36px;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:1px 3px;font-size:11px"/></div></div><div style="margin-top:6px;font-size:11px;color:var(--muted)">已选 {{ enabledCount }} 个因子 | 权重越大越重要</div></div><div v-if="result" class="panel"><h4>选股结果 ({{ result.date }})</h4><table style="width:100%;margin-top:8px"><thead><tr><th>排名</th><th>代码</th><th>名称</th><th>得分</th></tr></thead><tbody><tr v-for="s in result.stocks" :key="s.rank" :style="{background:s.rank<=10?\'rgba(63,185,80,0.08)\':\'transparent\'}"><td>{{ s.rank }}</td><td><code>{{ s.ts_code }}</code></td><td>{{ s.name }}</td><td>{{ s.score.toFixed(1) }}</td></tr></tbody></table></div><div v-if="error" class="panel" style="color:var(--red)">{{ error }}</div></div>',
+  template: `
+  <section class="selector-page">
+    <div class="selector-heading">
+      <div>
+        <div class="eyebrow">RESEARCH WORKBENCH / CROSS-SECTIONAL RANKING</div>
+        <h1>多因子选股器</h1>
+        <p>从已入库因子构建一次研究快照，按截面综合排名生成候选股票清单。</p>
+      </div>
+      <span class="tag amber">研究用途 · 非交易批准</span>
+    </div>
+
+      <div class="selector-toolbar card">
+      <div class="selector-field selector-dsl">
+        <label>直接 DSL 选股（可选）</label>
+        <input v-model="directExpr" placeholder="例如：-rank(ts_delta(close, 20))" />
+      </div>
+      <div class="selector-field selector-date">
+        <label>截面日期</label>
+        <input type="date" v-model="date" />
+      </div>
+      <div class="selector-field">
+        <label>股票池</label>
+        <select v-model.number="univN">
+          <option :value="100">Top 100 · 高流动性</option>
+          <option :value="300">Top 300 · 大盘池</option>
+          <option :value="500">Top 500 · 标准池</option>
+          <option :value="1000">Top 1000 · 扩展池</option>
+        </select>
+      </div>
+      <div class="selector-field selector-small">
+        <label>输出数量</label>
+        <select v-model.number="topN">
+          <option :value="20">20 只</option>
+          <option :value="50">50 只</option>
+          <option :value="100">100 只</option>
+        </select>
+      </div>
+      <div class="selector-actions">
+        <button class="btn" @click="loadFactors" :disabled="loading">刷新因子</button>
+        <button class="btn primary" @click="run" :disabled="loading || !canRun">
+          {{ loading ? "计算中..." : "执行选股" }}
+        </button>
+      </div>
+    </div>
+
+    <div class="selector-layout">
+      <aside class="selector-sidebar">
+        <div class="card factor-panel">
+          <div class="panel-title-row">
+            <div>
+              <h2>因子组合</h2>
+              <span class="sub">启用因子参与综合排名</span>
+            </div>
+            <span class="count-badge">{{ enabledCount }}/{{ factors.length }}</span>
+          </div>
+          <div class="factor-actions">
+            <button class="text-btn" @click="selectAll">全选</button>
+            <button class="text-btn" @click="clearAll">清空</button>
+          </div>
+          <div v-if="!factors.length" class="factor-empty">正在加载因子库…</div>
+          <div v-else class="factor-list">
+            <label v-for="f in factors" :key="f.expression" class="factor-row" :class="{active:f.enabled}">
+              <input type="checkbox" v-model="f.enabled" />
+              <span class="factor-mark"></span>
+              <span class="factor-copy">
+                <span class="factor-name">{{ f.name }}</span>
+                <code :title="f.expression">{{ f.expression }}</code>
+                <span class="factor-meta">公共分 {{ formatScore(f.public?.score) }}</span>
+              </span>
+              <input class="weight-input" v-model.number="f.weight" type="number" min="0.5" max="5" step="0.5" :disabled="!f.enabled" title="因子权重" />
+            </label>
+          </div>
+          <div class="factor-footer">
+            <span>组合权重</span><b>{{ totalWeight.toFixed(1) }}</b>
+          </div>
+        </div>
+      </aside>
+
+      <main class="selector-results">
+        <div v-if="error" class="selector-error">{{ error }}</div>
+        <div v-if="!result && !loading" class="card selector-empty">
+          <div class="empty-glyph">◎</div>
+          <h2>准备一组研究快照</h2>
+          <p>从左侧选择因子，设置日期与股票池，然后执行选股。结果仅代表该截面的模型排序。</p>
+          <div class="empty-steps"><span>01 选择因子</span><span>02 冻结参数</span><span>03 查看排名</span></div>
+        </div>
+        <div v-if="loading" class="card selector-empty">
+          <div class="loading-ring"></div><h2>正在计算截面排名</h2><p>正在按股票池过滤数据并合并 {{ enabledCount }} 个因子。</p>
+        </div>
+        <template v-if="result && !loading">
+          <div class="result-summary">
+            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · 综合排名</h2></div><span class="tag blue">已完成</span></div>
+          <div class="metric-strip">
+              <div class="metric-card"><span>股票池</span><b>Top {{ result.universe_n || univN }}</b><small>按 60 日成交额</small></div>
+              <div class="metric-card"><span>启用因子</span><b>{{ enabledCount }}</b><small>加权截面排名</small></div>
+              <div class="metric-card"><span>输出数量</span><b>{{ result.stocks.length }}</b><small>候选清单</small></div>
+              <div class="metric-card accent"><span>最高综合分</span><b>{{ topScore }}</b><small>{{ result.expression_mode ? '单条 DSL 排名' : '相对排序分数' }}</small></div>
+            </div>
+          </div>
+          <div class="card result-table-card">
+            <div class="panel-title-row"><div><h2>候选清单</h2><span class="sub">综合分越高代表因子排名组合越靠前</span></div><span class="tag">{{ result.date }}</span></div>
+            <table class="result-table"><thead><tr><th>排名</th><th>证券</th><th>名称</th><th>综合分</th><th>相对位置</th></tr></thead>
+              <tbody><tr v-for="s in result.stocks" :key="s.rank" :class="{'top-pick':s.rank<=10}"><td><span class="rank-number">{{ String(s.rank).padStart(2,"0") }}</span></td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
+            </table>
+          </div>
+          <div class="selector-disclaimer"><span>ⓘ</span> 这是基于当前研究面板的横截面排序。数据为 non-PIT 当前成分股回看历史，结果不等同于可交易信号。</div>
+        </template>
+      </main>
+    </div>
+  </section>`,
   setup() {
     const date = ref(new Date().toISOString().slice(0,10));
     const univN = ref(500); const topN = ref(50);
     const factors = ref([]);
+    const directExpr = ref("");
     const result = ref(null); const error = ref(""); const loading = ref(false);
-    const enabledCount = Vue.computed(() => factors.value.filter(f=>f.enabled).length);
+    const enabledCount = computed(() => factors.value.filter(f=>f.enabled).length);
+    const canRun = computed(() => Boolean(directExpr.value.trim()) || enabledCount.value > 0);
+    const totalWeight = computed(() => factors.value.filter(f=>f.enabled).reduce((sum, f) => sum + (Number(f.weight) || 0), 0));
+    const topScore = computed(() => result.value?.stocks?.length ? formatScore(result.value.stocks[0].score) : "—");
+    function formatScore(value) { return value == null ? "—" : Number(value).toFixed(2); }
+    function rankWidth(stock) {
+      if (!result.value?.stocks?.length) return "0%";
+      return `${((result.value.stocks.length - stock.rank + 1) / result.value.stocks.length) * 100}%`;
+    }
 
     async function loadFactors() {
       try {
         const d = await api("/factors");
         const fs = (d.factors||[]).filter(f=>f.expression);
         const seen=new Set(); const uniq=[];
-        for (const f of fs.sort((a,b)=>(b.public_metrics?.score||0)-(a.public_metrics?.score||0))) {
+        for (const f of fs.sort((a,b)=>(b.public?.score||0)-(a.public?.score||0))) {
           if (!seen.has(f.expression)) { seen.add(f.expression); uniq.push(f); }
           if (uniq.length>=50) break;
         }
@@ -607,21 +837,29 @@ const ScreenerView = {
       } catch(e) { error.value="加载因子失败: "+e.message; }
     }
 
+    function selectAll() { factors.value.forEach(f => { f.enabled = true; }); }
+    function clearAll() { factors.value.forEach(f => { f.enabled = false; }); }
+
     async function run() {
       const enabled = factors.value.filter(f=>f.enabled);
       if (!enabled.length) { error.value="请至少选择一个因子"; return; }
       loading.value=true; error.value=""; result.value=null;
       try {
-        const r = await api("/screener", { method:"POST", body:JSON.stringify({
+        const r = await api("/screener", { method:"POST", body:{
+          expression: directExpr.value.trim() || undefined,
           factors: enabled.map(f=>({expression:f.expression,weight:f.weight})),
           date: date.value, universe_n: univN.value, top_n: topN.value, direction:"top"
-        })});
+        }});
         result.value = r;
       } catch(e) { error.value = "选股失败: "+e.message; }
       finally { loading.value=false; }
     }
 
     onMounted(loadFactors);
-    return { date, univN, topN, factors, result, error, loading, enabledCount, run };
+    return { date, univN, topN, directExpr, factors, result, error, loading, enabledCount, canRun, totalWeight, topScore, formatScore, rankWidth, selectAll, clearAll, run, loadFactors };
   },
 };
+App.components.ScreenerView = ScreenerView;
+createApp(App).mount("#app");
+
+// ========== 选股器组件 ==========

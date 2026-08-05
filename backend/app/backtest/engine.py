@@ -7,6 +7,7 @@ import math
 
 import polars as pl
 
+from ..config import DEFAULT_PORTFOLIO_MODE
 from ..data.panel import PanelStore
 from ..dsl.engine import parse
 
@@ -18,9 +19,12 @@ def run_backtest(
     end: str = "2024-12-31",
     cost_bps: float = 15.0,
     direction: int = 1,
-    mode: str = "long_short",  # long_short / long_only
+    mode: str = DEFAULT_PORTFOLIO_MODE,  # long_short / long_only
+    panel_glob: str | None = None,
 ) -> dict:
-    df = PanelStore.get().ensure_loaded()
+    if mode not in {"long_short", "long_only"}:
+        raise ValueError("mode 必须是 long_short 或 long_only")
+    df = PanelStore.get(panel_glob).ensure_loaded()
     pipe = parse(expression)
 
     work = (

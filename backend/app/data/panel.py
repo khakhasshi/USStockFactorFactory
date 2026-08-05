@@ -3,6 +3,7 @@
 诚实标记: 本数据源为当前成分股回看历史 (non-PIT), production_eligible=False.
 """
 
+import os
 import threading
 from datetime import date
 
@@ -20,19 +21,21 @@ PANEL_META = {
 
 
 class PanelStore:
-    _instance = None
+    _instances: dict[str, "PanelStore"] = {}
     _lock = threading.Lock()
 
-    def __init__(self) -> None:
+    def __init__(self, panel_glob: str | None = None) -> None:
         self.df: pl.DataFrame | None = None
         self.load_error: str = ""
+        self.panel_glob = panel_glob or os.environ.get("FF_PANEL_GLOB")
 
     @classmethod
-    def get(cls) -> "PanelStore":
+    def get(cls, panel_glob: str | None = None) -> "PanelStore":
+        key = panel_glob or os.environ.get("FF_PANEL_GLOB", "__default__")
         with cls._lock:
-            if cls._instance is None:
-                cls._instance = cls()
-            return cls._instance
+            if key not in cls._instances:
+                cls._instances[key] = cls(panel_glob)
+            return cls._instances[key]
 
     def ensure_loaded(self) -> pl.DataFrame:
         if self.df is not None:
@@ -44,7 +47,8 @@ class PanelStore:
             return self.df
 
     def _load(self) -> pl.DataFrame:
-        lf = pl.scan_parquet(PANEL_GLOB, hive_partitioning=True)
+        panel_glob = self.panel_glob or PANEL_GLOB
+        lf = pl.scan_parquet(panel_glob, hive_partitioning=True)
         base_cols = [
             "trade_date", "ts_code", "name", "open", "high", "low", "close",
             "vol", "amount", "raw_open",
@@ -116,4 +120,5 @@ class PanelStore:
             "date_max": str(df["trade_date"].max()),
             "layers": {k: list(v) for k, v in LAYER_BOUNDS.items()},
             **PANEL_META,
+            "panel_glob": self.panel_glob or PANEL_GLOB,
         }

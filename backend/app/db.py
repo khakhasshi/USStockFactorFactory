@@ -28,6 +28,21 @@ async def init_db() -> None:
             "ALTER TABLE factors DROP CONSTRAINT IF EXISTS factors_expression_key"
         ))
         await conn.execute(text(
+            "ALTER TABLE experiments ADD COLUMN IF NOT EXISTS research_config JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE backtests ADD COLUMN IF NOT EXISTS experiment_id INTEGER NOT NULL DEFAULT 1"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE engine_events ADD COLUMN IF NOT EXISTS experiment_id INTEGER"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE engine_events ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS research_meta JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
             "INSERT INTO experiments (id, name, description, status) VALUES "
             "(1, '实验1-初始双层挖掘', '2026-08 首轮: 旧评分函数(exp换手衰减, 无退化检测), 328因子/31外层步; 已冻结存档', 'archived') "
             "ON CONFLICT (id) DO NOTHING"

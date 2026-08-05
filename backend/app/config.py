@@ -1,8 +1,10 @@
 import os
 
 _MARKET = os.environ.get("FF_MARKET", "us")  # "us" 或 "ashare"
+MARKET_LABEL = "A股" if _MARKET == "ashare" else "美股"
 
-PORT = int(os.environ.get("FF_PORT", "9999"))
+PORT = int(os.environ.get("FF_PORT", "10010"))
+DEFAULT_PORTFOLIO_MODE = "long_only" if _MARKET == "ashare" else "long_short"
 DATABASE_URL = os.environ.get(
     "FF_DATABASE_URL",
     "postgresql+asyncpg://jiangjingzhe@localhost:5432/factor_factory",
@@ -12,6 +14,20 @@ PANEL_GLOB = os.environ.get(
     "/Users/jiangjingzhe/Portfolios/MultiFactorUS/data_yfinance_research/"
     "processed/daily_panel/trade_year=*/data_0.parquet",
 )
+US_PANEL_GLOB = (
+    "/Users/jiangjingzhe/Portfolios/MultiFactorUS/data_yfinance_research/"
+    "processed/daily_panel/trade_year=*/data_0.parquet"
+)
+ASHARE_PANEL_GLOB = "/Users/jiangjingzhe/Portfolios/MultiFactorAshare/data/trade_year=*/data_0.parquet"
+
+
+def default_panel_glob(market: str | None = None) -> str:
+    """Use a market-specific default; never inherit the process boot market."""
+    if market == "ashare":
+        return ASHARE_PANEL_GLOB
+    if market == "us":
+        return US_PANEL_GLOB
+    return PANEL_GLOB
 
 # ---- 四级数据隔离边界 ----
 if _MARKET == "ashare":
@@ -38,6 +54,8 @@ if _MARKET == "ashare":
         # 股本
         "float_share",
     ]
+    ASHARE_DSL_FIELDS = DSL_FIELDS
+    US_DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
 else:
     LAYER_BOUNDS = {
         "INNER_PUBLIC": ("2010-06-01", "2019-12-31"),
@@ -46,6 +64,19 @@ else:
         "FACTOR_VAULT": ("2025-01-01", "2026-07-31"),
     }
     DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
+    US_DSL_FIELDS = DSL_FIELDS
+    ASHARE_DSL_FIELDS = [
+        "open", "high", "low", "close", "vol", "amount",
+        "pe_ttm", "pb", "ps_ttm", "dv_ttm", "total_mv", "circ_mv",
+        "turnover_rate", "volume_ratio", "net_mf_amount",
+        "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",
+        "float_share",
+    ]
+
+
+def get_dsl_fields(market: str | None = None) -> list[str]:
+    """Return fields for a task, independent of the process-wide default market."""
+    return list(ASHARE_DSL_FIELDS if market == "ashare" else US_DSL_FIELDS if market == "us" else DSL_FIELDS)
 
 # ---- 旧版 HarnessSpec (保留兼容, A组运行中) ----
 DEFAULT_HARNESS_SPEC = {
@@ -63,7 +94,7 @@ DEFAULT_HARNESS_SPEC = {
 DEFAULT_MINER_TEMPLATE = {
     # === 外层可改写 ===
     "system_prompt": (
-        "你是量化因子研究员。基于美股日线数据设计横截面选股因子表达式。\n"
+        "你是量化因子研究员。基于当前市场日线数据设计横截面选股因子表达式。\n"
         "可用字段: {fields} (前复权价格与量额)\n"
         "可用算子:\n{ops}\n"
         "规则: 只能用以上字段与算子; 窗口为 1..250 整数; 表达式一行;\n"
@@ -126,9 +157,9 @@ DEFAULT_ENGINE_CONFIG_V2 = {
     "incumbent_remeasure_every": 3,        # 每 3 步重测在位者
     "incumbent_remeasure_budget": 30,      # 重测时用 30 次评估 (节省算力)
     "tasks": [
-        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15},
-        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25},
-        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15},
+        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
     ],
 }
 
@@ -138,8 +169,8 @@ DEFAULT_ENGINE_CONFIG = {
     "outer_accept_epsilon": 0.02,
     "incumbent_remeasure_every": 5,
     "tasks": [
-        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15},
-        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25},
-        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15},
+        {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "mode": DEFAULT_PORTFOLIO_MODE},
+        {"name": "T3_liquid500_20d", "universe_n": 500, "horizon": 20, "cost_bps": 15, "mode": DEFAULT_PORTFOLIO_MODE},
     ],
 }

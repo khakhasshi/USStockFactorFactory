@@ -12,6 +12,7 @@ v2 改进:
 
 import asyncio
 import math
+import os
 import random
 import statistics as st
 import traceback
@@ -21,7 +22,7 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 
-from .config import DEFAULT_ENGINE_CONFIG, DEFAULT_ENGINE_CONFIG_V2, DEFAULT_HARNESS_SPEC, DEFAULT_MINER_TEMPLATE
+from .config import DEFAULT_ENGINE_CONFIG, DEFAULT_ENGINE_CONFIG_V2, DEFAULT_HARNESS_SPEC, DEFAULT_MINER_TEMPLATE, DEFAULT_PORTFOLIO_MODE, get_dsl_fields
 from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
 from .dsl.engine import normalize_hash
@@ -41,6 +42,7 @@ class Engine:
         self.status: dict = {"state": "stopped", "outer_step": 0, "inner_evals": 0, "experiment_id": None}
         self.logbuf: deque[dict] = deque(maxlen=300)
         self._mode: str = "v1"  # "v1" 或 "v2"
+        self.task_config: dict = {}
 
     @classmethod
     def get(cls) -> "Engine":
@@ -52,12 +54,24 @@ class Engine:
         entry = {"t": datetime.now().strftime("%m-%d %H:%M:%S"), "level": level, "msg": msg}
         self.logbuf.append(entry)
         async with SessionLocal() as s:
-            s.add(EngineEvent(level=level, message=msg))
+            s.add(EngineEvent(level=level, message=msg, experiment_id=self.exp_id))
             await s.commit()
 
-    async def start(self, mode: str = "v1") -> dict:
+    def _panel_glob(self) -> str | None:
+        return self.task_config.get("panel_glob") or os.environ.get("FF_PANEL_GLOB")
+
+    def _portfolio_mode(self) -> str:
+        return self.task_config.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
+
+    async def start(self, mode: str = "v1", experiment_id: int | None = None) -> dict:
         if self.running:
             return {"ok": False, "msg": "已在运行"}
+        # 在创建后台任务前锁定活动实验，避免 UI/API 在启动窗口切换实验后跑错任务。
+        self.exp_id = experiment_id or await get_active_experiment_id()
+        async with SessionLocal() as s:
+            exp = await s.get(Experiment, self.exp_id)
+            self.task_config = dict(exp.research_config or {}) if exp else {}
+        self.status["experiment_id"] = self.exp_id
         self.running = True
         self._mode = mode
         self.status["state"] = "starting"
@@ -67,7 +81,15 @@ class Engine:
     async def stop(self) -> dict:
         self.running = False
         self.status["state"] = "stopping"
-        return {"ok": True, "msg": "将在当前评估完成后停止"}
+        task = self.task
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.status["state"] = "stopped"
+        return {"ok": True, "msg": "引擎已停止，已保留已提交研究数据"}
 
     # ================================================================
     # V2 主循环 (B组: MinerTemplate + multi-seed + t-test)
@@ -75,7 +97,6 @@ class Engine:
 
     async def _run_v2(self) -> None:
         try:
-            self.exp_id = await get_active_experiment_id()
             async with SessionLocal() as s:
                 exp = await s.get(Experiment, self.exp_id)
                 if not exp:
@@ -84,8 +105,9 @@ class Engine:
                     raise RuntimeError(f"实验「{exp.name}」已归档")
             self.status["experiment_id"] = self.exp_id
             await self.log(f"[V2] 引擎启动: 实验[{exp.name}] 外层可改写 MinerTemplate")
-            await asyncio.to_thread(PanelStore.get().ensure_loaded)
-            await self.log(f"面板就绪: {PanelStore.get().summary()['rows']} 行")
+            panel = PanelStore.get(self._panel_glob())
+            await asyncio.to_thread(panel.ensure_loaded)
+            await self.log(f"面板就绪: {panel.summary()['rows']} 行 · {self.task_config.get('market', 'configured')}")
 
             incumbent = await self._ensure_incumbent_v2()
             self.status["state"] = "running"
@@ -107,7 +129,11 @@ class Engine:
 
         # 外层 LLM 提议新模板
         inc_template = incumbent.harness_spec if isinstance(incumbent.harness_spec, dict) else DEFAULT_MINER_TEMPLATE
-        cand_template, note, source = await propose_template(inc_template, history, provider)
+        cand_template, note, source = await propose_template(
+            inc_template, history, provider,
+            market=self.task_config.get("market", "us"),
+            portfolio_mode=self._portfolio_mode(),
+        )
 
         async with SessionLocal() as s:
             cand = MinerVersion(
@@ -233,7 +259,10 @@ class Engine:
                 improve_bias = 0.7  # 偏改进
 
             op = "improve" if (top_nodes and rng.random() < improve_bias) else "draft"
-            expr, hypo, source = await propose(template, op, task, top_nodes, provider)
+            expr, hypo, source = await propose(
+                template, op, task, top_nodes, provider,
+                fields=get_dsl_fields(self.task_config.get("market")),
+            )
 
             node = Node(
                 experiment_id=self.exp_id,
@@ -242,7 +271,11 @@ class Engine:
                 op=op, expression=expr, hypothesis=hypo, source=source, task_name=task["name"],
             )
             try:
-                metrics = await asyncio.to_thread(evaluate, expr, task["universe_n"], task["horizon"])
+                metrics = await asyncio.to_thread(
+                    evaluate, expr, task["universe_n"], task["horizon"],
+                    task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
+                    self._panel_glob(), task.get("cost_bps", 15),
+                )
                 node.status = "ok"
                 node.public_metrics = metrics["public"]
                 node.gate_metrics = metrics["gate"]
@@ -310,7 +343,35 @@ class Engine:
                 .where(MinerVersion.status == "incumbent", MinerVersion.experiment_id == self.exp_id)
                 .order_by(MinerVersion.id.desc())
             )
+            required_template_keys = {
+                "system_prompt", "draft_strategy", "improve_strategy",
+                "context_strategy", "diversity_instruction", "scoring_weights",
+                "dsl_exploration_templates",
+            }
+            if inc and isinstance(inc.harness_spec, dict) and required_template_keys.issubset(inc.harness_spec):
+                return inc
+
+            # An experiment may have been bootstrapped with the legacy V1
+            # HarnessSpec before being resumed as V2. Keep that record and
+            # create an explicit MinerTemplate baseline for the V2 lineage.
             if inc:
+                inc.status = "superseded"
+                max_version = await s.scalar(
+                    select(func.max(MinerVersion.version_no)).where(
+                        MinerVersion.experiment_id == self.exp_id
+                    )
+                )
+                next_version = (max_version if max_version is not None else -1) + 1
+                inc = MinerVersion(
+                    experiment_id=self.exp_id, version_no=next_version,
+                    parent_id=inc.id,
+                    harness_spec=deepcopy(DEFAULT_MINER_TEMPLATE),
+                    status="incumbent",
+                    proposal_note="V2 MinerTemplate 基线；保留旧 V1 基线及其历史数据",
+                )
+                s.add(inc)
+                await s.commit()
+                await s.refresh(inc)
                 return inc
             inc = MinerVersion(
                 experiment_id=self.exp_id, version_no=0,
@@ -337,7 +398,14 @@ class Engine:
     async def _config_v2(self) -> dict:
         async with SessionLocal() as s:
             row = await s.get(Setting, "engine_config")
-            return {**DEFAULT_ENGINE_CONFIG_V2, **(row.value if row else {})}
+            cfg = {**DEFAULT_ENGINE_CONFIG_V2, **(row.value if row else {})}
+            task_cfg = self.task_config.get("engine_config", {})
+            cfg.update(task_cfg)
+            cfg["tasks"] = [
+                {"market": self.task_config.get("market", "us"), **t, "mode": self._portfolio_mode()}
+                for t in cfg.get("tasks", [])
+            ]
+            return cfg
 
     # ================================================================
     # V1 主循环 (A组: 保持兼容, 原封不动)
@@ -345,7 +413,6 @@ class Engine:
 
     async def _run(self) -> None:
         try:
-            self.exp_id = await get_active_experiment_id()
             async with SessionLocal() as s:
                 exp = await s.get(Experiment, self.exp_id)
                 if not exp:
@@ -429,7 +496,10 @@ class Engine:
             task = tasks[i % len(tasks)]
             top_nodes = await self._top_nodes(miner.id, task["name"])
             op = "improve" if (top_nodes and random.random() < float(spec.get("improve_bias", 0.6))) else "draft"
-            expr, hypo, source = await propose(spec, op, task, top_nodes, provider)
+            expr, hypo, source = await propose(
+                spec, op, task, top_nodes, provider,
+                fields=get_dsl_fields(self.task_config.get("market")),
+            )
 
             node = Node(
                 experiment_id=self.exp_id,
@@ -438,7 +508,11 @@ class Engine:
                 op=op, expression=expr, hypothesis=hypo, source=source, task_name=task["name"],
             )
             try:
-                metrics = await asyncio.to_thread(evaluate, expr, task["universe_n"], task["horizon"])
+                metrics = await asyncio.to_thread(
+                    evaluate, expr, task["universe_n"], task["horizon"],
+                    task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
+                    self._panel_glob(), task.get("cost_bps", 15),
+                )
                 node.status = "ok"
                 node.public_metrics = metrics["public"]
                 node.gate_metrics = metrics["gate"]
@@ -569,7 +643,62 @@ class Engine:
     async def _config(self) -> dict:
         async with SessionLocal() as s:
             row = await s.get(Setting, "engine_config")
-            return {**DEFAULT_ENGINE_CONFIG, **(row.value if row else {})}
+            cfg = {**DEFAULT_ENGINE_CONFIG, **(row.value if row else {})}
+            cfg.update(self.task_config.get("engine_config", {}))
+            cfg["tasks"] = [{"market": self.task_config.get("market", "us"), **t, "mode": self._portfolio_mode()} for t in cfg.get("tasks", [])]
+            return cfg
+
+
+class EngineManager:
+    """单进程多研究任务调度器；每个任务拥有独立 worker 和日志缓冲。"""
+
+    _instance = None
+
+    def __init__(self) -> None:
+        self.workers: dict[int, Engine] = {}
+
+    @classmethod
+    def get(cls) -> "EngineManager":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @property
+    def running(self) -> bool:
+        return any(worker.running for worker in self.workers.values())
+
+    def worker(self, experiment_id: int) -> Engine | None:
+        return self.workers.get(experiment_id)
+
+    def status_for(self, experiment_id: int) -> dict:
+        worker = self.workers.get(experiment_id)
+        if worker:
+            return worker.status | {"mode": worker._mode, "logs": list(worker.logbuf), "task_config": worker.task_config}
+        return {"state": "stopped", "outer_step": 0, "inner_evals": 0,
+                "experiment_id": experiment_id, "mode": None, "logs": []}
+
+    def all_status(self) -> list[dict]:
+        return [self.status_for(eid) for eid in sorted(self.workers)]
+
+    async def start(self, mode: str = "v2", experiment_id: int | None = None) -> dict:
+        eid = experiment_id or await get_active_experiment_id()
+        worker = self.workers.get(eid)
+        if worker and worker.running:
+            return {"ok": False, "msg": f"研究任务 {eid} 已在运行"}
+        worker = Engine()
+        self.workers[eid] = worker
+        return await worker.start(mode, experiment_id=eid)
+
+    async def stop(self, experiment_id: int | None = None) -> dict:
+        if experiment_id is not None:
+            worker = self.workers.get(experiment_id)
+            return await worker.stop() if worker else {"ok": True, "msg": "任务未运行"}
+        stopped = 0
+        for worker in list(self.workers.values()):
+            if worker.running:
+                await worker.stop()
+                stopped += 1
+        return {"ok": True, "msg": f"已停止 {stopped} 个研究任务，已保留已提交研究数据"}
 
 
 def _normal_cdf(x: float) -> float:

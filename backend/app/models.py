@@ -20,6 +20,8 @@ class Experiment(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True)
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="open")  # open/archived
+    # 研究任务的完整、可复现配置；历史任务只读保留，不依赖当前环境变量重建。
+    research_config: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -87,6 +89,7 @@ class Factor(Base):
     public_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     gate_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     fingerprint: Mapped[dict] = mapped_column(JSON, default=dict)
+    research_meta: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -107,6 +110,7 @@ class Backtest(Base):
     __tablename__ = "backtests"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     params: Mapped[dict] = mapped_column(JSON, default=dict)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     result: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="done")
     error: Mapped[str] = mapped_column(Text, default="")
@@ -118,4 +122,6 @@ class EngineEvent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     level: Mapped[str] = mapped_column(String(8), default="info")
     message: Mapped[str] = mapped_column(Text)
+    experiment_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
