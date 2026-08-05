@@ -93,12 +93,12 @@ def _compute_score(public: dict, gate: dict, turnover: float | None = None) -> f
     else:
         gate_flip_penalty = 1.0
 
-    # 成本实扣: 年化换手 > 3倍 (日换手≈120%) → 不可交易
-    # exp(-3*to) 已提供平滑惩罚, 此处仅做硬截断
+    # 成本硬截断: 年化换手 > 50倍 (日换手≈20%) → 不可交易 (成本必然超过alpha)
+    # exp(-3*to) 已提供平滑惩罚, 此处仅做极端情况硬截断
     annual_turnover = to * 252  # 年化换手倍数
-    if annual_turnover > 3.0:   # 日均换手 >120% → 成本必然不可行
+    if annual_turnover > 50.0:  # 日均换手 >20% → 成本必然不可行
         return 0.0
-    cost_killer = 1.0  # 保留占位, 未来可加入真实成本模型
+    cost_killer = 1.0
 
     score = icir * era_penalty * turnover_penalty * gate_flip_penalty * cost_killer
     return round(score, 4)
