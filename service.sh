@@ -28,6 +28,15 @@ job_pid() {
   job_snapshot | awk '/^[[:space:]]*pid = / { print $3; exit }'
 }
 
+wait_for_job_removal() {
+  local attempts=0
+  while job_snapshot >/dev/null && (( attempts < 80 )); do
+    sleep 0.25
+    attempts=$((attempts + 1))
+  done
+  ! job_snapshot >/dev/null
+}
+
 start_service() {
   mkdir -p "$log_dir"
   local process_id="$(job_pid || true)"
@@ -38,6 +47,10 @@ start_service() {
   fi
   if job_snapshot >/dev/null; then
     launchctl remove "$service_label"
+    if ! wait_for_job_removal; then
+      print -u2 "旧 launchd job 在 20 秒内未完成注销；未提交新实例。"
+      return 1
+    fi
   fi
   if [[ -n "$occupied_by" ]]; then
     print -u2 "端口 $service_port 已被 PID $occupied_by 占用；为避免双实例，未启动。"
@@ -94,6 +107,10 @@ stop_service() {
   done
   if [[ "$(listener_pid || true)" == "$process_id" ]]; then
     print -u2 "PID $process_id 在 20 秒内未退出；未执行强制终止。"
+    return 1
+  fi
+  if ! wait_for_job_removal; then
+    print -u2 "PID 已退出，但 launchd job 在 20 秒内未完成注销。"
     return 1
   fi
   print "FactorFactory 已停止：PID $process_id"
