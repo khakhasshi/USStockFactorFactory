@@ -21,11 +21,22 @@ if _MARKET == "ashare":
         "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
         "FACTOR_VAULT": ("2025-01-01", "2026-08-04"),
     }
-    # A股 DSL 字段: 价量 + 估值 + 市值
+    # A股 DSL 字段: 价量 + 估值 + 市值 + 流动性 + 资金流向
     DSL_FIELDS = [
+        # 价量
         "open", "high", "low", "close", "vol", "amount",
-        "pe", "pe_ttm", "pb", "total_mv", "circ_mv",
+        # 估值
+        "pe_ttm", "pb", "ps_ttm", "dv_ttm",
+        # 市值
+        "total_mv", "circ_mv",
+        # 流动性
         "turnover_rate", "volume_ratio",
+        # 资金流向
+        "net_mf_amount",
+        "buy_lg_amount", "sell_lg_amount",
+        "buy_elg_amount", "sell_elg_amount",
+        # 股本
+        "float_share",
     ]
 else:
     LAYER_BOUNDS = {

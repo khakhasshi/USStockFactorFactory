@@ -49,13 +49,22 @@ class PanelStore:
             "trade_date", "ts_code", "open", "high", "low", "close",
             "vol", "amount", "raw_open",
         ]
-        # 质量过滤列: A股数据可能缺少某些列, 按存在性自适应
+        # 额外字段: A股估值/市值/流动性/资金流向 (按存在性自适应)
+        extra_fields = [
+            "pe_ttm", "pb", "ps_ttm", "dv_ttm",
+            "total_mv", "circ_mv",
+            "turnover_rate", "volume_ratio",
+            "net_mf_amount", "buy_lg_amount", "sell_lg_amount",
+            "buy_elg_amount", "sell_elg_amount",
+            "float_share",
+        ]
+        # 质量过滤列: 按存在性自适应
         available = set(lf.collect_schema().names())
         quality_cols = []
         for c in ["is_tradable_observation", "is_valid_ohlc", "is_security_identity_consistent"]:
             if c in available:
                 quality_cols.append(c)
-        cols = base_cols + quality_cols
+        cols = base_cols + [f for f in extra_fields if f in available] + quality_cols
 
         lf = lf.select(cols)
         # 逐列过滤 (不存在的列跳过)
