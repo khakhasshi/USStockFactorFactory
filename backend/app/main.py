@@ -4,7 +4,7 @@ from pathlib import Path
 import asyncio
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.staticfiles import StaticFiles
 
 from .api.routes import router
@@ -23,6 +23,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="USStockFactorFactory", lifespan=lifespan)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    # Some browsers request this path even when the page uses an inline icon.
+    return Response(status_code=204)
+
+
 app.include_router(router)
 app.mount("/", StaticFiles(directory=str(FRONTEND), html=True), name="frontend")
 

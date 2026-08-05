@@ -1,6 +1,6 @@
 # USStockFactorFactory — 双层优化 LLM 因子挖掘工厂设计
 
-> 机构级设计蓝图 v0.2 · 2026-08-03（并入外部评审 5 项 P0 / 4 项 P1 修订）
+> 机构级设计蓝图 v0.3 · 2026-08-05（Evaluation Protocol V3）
 > 灵感来源：Weco AIDE²（bi-level autoresearch）× 机构因子投研全生命周期
 > 定位：**全新独立系统（greenfield）**，不依赖、不迁移任何既有因子平台
 
@@ -160,6 +160,9 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 
 ## 4. 评估流水线（Layer 2）—— 系统的心脏
 
+> 当前运行协议：`v3.0 / NON_PIT_RESEARCH`。按当前研究要求，PIT 不进入评分，
+> 但来源标签仍保留；任何 F5 只表示通过非 PIT 的执行可行性评价，不是生产批准。
+
 ### 4.1 四级数据隔离 + 不可变协议世代
 
 核心原则：**凡被某个循环反复查询的分数，其数据层对该循环就不再是样本外**，必须诚实标记。
@@ -181,6 +184,36 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 - **证券迁移稳健性测试**（自 v0.1 的"横截面 OOS"降级而来）：按行业/市值/证券身份做**确定性**分组切分，检验因子在未见证券组上的迁移能力。两组股票共享同一市场冲击与幸存者偏差，**不计作独立 OOS**，仅作稳健性证据。
 
 ### 4.2 指标体系
+
+**V3 的核心变化**：搜索阶段和准入阶段使用不同结果。挖掘循环只能读取
+`INNER_PUBLIC + META_TRAIN` 的 discovery score；`META_HOLDOUT + FACTOR_VAULT`
+只允许由研究员显式发起一次完整审计，审计结果持久化但永不回流 Miner。
+
+V3 不再用因子排名变化近似组合换手，而是在与预测周期一致的非重叠调仓点生成
+实际目标权重并计算双边交易额 `Σ|w_t-w_{t-1}|`；离开股票池的持仓也按归零计入。
+报告同时给出每次调仓、单边与日均等效换手。A股纯多头同时报告绝对净收益与相对等权基准的主动收益；
+美股多空拆分 long leg、short leg、双边换手、交易成本和借券成本代理。
+
+每层统一保存：
+
+- 方向调整后的 RankIC、ICIR、IC 命中率、Newey-West t/p；
+- 费前、费后、主动收益的年化、Sharpe、Sortino、最大回撤、Calmar、尾部损失；
+- 分位数组合单调性、top-bottom spread、era/年度稳定性；
+- 实际持仓换手、成本压力矩阵、目标资本占 ADV 的参与率代理、组合市场 Beta/相关性；
+- 覆盖率、有效样本量和明确的失败原因。
+
+准入采用硬门与最弱环节约束，而非让高 ICIR 抵消负费后收益：
+
+```
+F1 discovery_only
+F2 research_pass
+F3 oos_pass
+F4 paper_candidate
+F5 live_candidate_non_pit
+```
+
+任一层发生方向反转、HAC 显著性不足、费后收益非正、成本压力失效、
+回撤/换手超限、多空市场 Beta 超限、单调性或 era 稳定性不足，均停止晋级并保存原因。
 
 **Public score（Miner 可见的优化信号）** — INNER_PUBLIC 层：
 

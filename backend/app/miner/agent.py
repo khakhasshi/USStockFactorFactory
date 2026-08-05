@@ -32,7 +32,7 @@ def random_expression(templates: list[str] | None = None, fields: list[str] | No
         expr = expr.replace("{field1}", field()).replace("{field2}", field())
         expr = expr.replace("{field}", field())
         expr = expr.replace("{-}", "-" if random.random() < 0.5 else "")
-        if validate(expr) is None:
+        if validate(expr, fields or _FIELDS) is None:
             return expr
 
     # 内置回退模板
@@ -49,7 +49,11 @@ def random_expression(templates: list[str] | None = None, fields: list[str] | No
     return f(builtin)()
 
 
-def mutate_expression(expr: str, templates: list[str] | None = None) -> str:
+def mutate_expression(
+    expr: str,
+    templates: list[str] | None = None,
+    fields: list[str] | None = None,
+) -> str:
     """轻量随机变异: 换窗口/翻方向/加 rank。"""
     out = expr
     for old, new in [(str(a), str(b)) for a in _WINDOWS for b in _WINDOWS if a != b]:
@@ -59,25 +63,43 @@ def mutate_expression(expr: str, templates: list[str] | None = None) -> str:
             break
     if out == expr:
         out = f"-({expr})" if not expr.startswith("-") else expr[1:].strip("()") or expr
-    return out if validate(out) is None else expr
+    return out if validate(out, fields or _FIELDS) is None else expr
 
 
 # ============================================================
 # 模板驱动的提示词构造
 # ============================================================
 
-def _build_system_prompt(template: dict, fields: list[str] | None = None, portfolio_mode: str = "long_short", market: str = "us") -> str:
+def _build_system_prompt(
+    template: dict,
+    fields: list[str] | None = None,
+    portfolio_mode: str = "long_short",
+    market: str = "us",
+    direction: int = 1,
+) -> str:
     """从模板组装 system prompt。约束块强制置顶 (外层不可稀释)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = template.get("anti_overfit_instruction", "")
     sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
     fields = fields or _FIELDS
     strategy_part = sys_tpl.format(fields=", ".join(fields), ops=ops_doc, anti=anti)
+    direction_policy = (
+        "方向冻结为 +1：因子值越高，越偏向多头"
+        if direction == 1
+        else "方向冻结为 -1：因子值越低，越偏向多头；系统会反向排序"
+    )
+    mode_policy = (
+        "只能做多，按冻结方向挑选股票，禁止依赖做空获利。"
+        if portfolio_mode == "long_only"
+        else "允许多空，按冻结方向建立多头侧，反方向建立空头侧。"
+    )
 
     # 强制约束块 (置顶, 外层改写不能削弱)
     constraints = (
         f"【研究任务约束】市场: {market}；持仓模式: {portfolio_mode}。"
-        f"{'只能做多，优先选择因子值最高的股票，禁止依赖做空获利。' if portfolio_mode == 'long_only' else '允许多空，因子正负方向均可作为组合两侧信号。'}\n"
+        f"{mode_policy}\n"
+        f"【信号方向】{direction_policy}；"
+        f"{'其余股票保持空仓，不建立空头。' if portfolio_mode == 'long_only' else '另一侧作为空头组合。'}\n"
         f"【硬约束 — 违反者无效】\n"
         f"可用字段 ({len(fields)}个): {', '.join(fields)}\n"
         f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
@@ -99,7 +121,8 @@ def _build_context_block(top_nodes: list[dict], template: dict) -> str:
     for i, n in enumerate(top_nodes[:top_k]):
         lines.append(
             f"- #{i+1} score={n['public_score']:.3f} icir={n['public_metrics'].get('icir',0):+.2f} "
-            f"turnover={n['public_metrics'].get('turnover',0):.1%} expr: {n['expression']}"
+            f"daily_turnover={n['public_metrics'].get('daily_turnover', n['public_metrics'].get('turnover',0)):.1%} "
+            f"expr: {n['expression']}"
         )
 
     # 失败模式摘要 (如果模板要求)
@@ -143,17 +166,34 @@ async def propose(
     template = template_or_spec if is_v2 else None
     portfolio_mode = task.get("mode", "long_short")
     market = task.get("market", "us")
+    direction = int(task.get("direction", 1))
 
     if provider:
         try:
-            system = _build_system_prompt(template, fields, portfolio_mode, market) if template else _system_prompt_old(template_or_spec, fields, portfolio_mode, market)
+            system = (
+                _build_system_prompt(
+                    template,
+                    fields,
+                    portfolio_mode,
+                    market,
+                    direction,
+                )
+                if template
+                else _system_prompt_old(
+                    template_or_spec,
+                    fields,
+                    portfolio_mode,
+                    market,
+                    direction,
+                )
+            )
             context = _build_context_block(top_nodes, template) if template else _context_block_old(top_nodes, template_or_spec)
 
             if op == "draft":
                 draft_inst = template.get("draft_strategy", "提出与历史不同的新因子。") if template else "请提出一个与历史尝试思路不同的新因子。"
                 div_inst = template.get("diversity_instruction", "") if template else ""
                 user = (
-                    f"任务: market={market}, portfolio_mode={portfolio_mode}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction={direction}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
                     f"历史尝试:\n{context}\n\n"
                     f"策略指令: {draft_inst}\n{div_inst}"
                 )
@@ -161,7 +201,7 @@ async def propose(
                 base = top_nodes[0] if top_nodes else None
                 impr_inst = template.get("improve_strategy", "改进当前最优因子。") if template else "请改进当前最优因子 (调整结构/窗口/复合), 保持简洁。"
                 user = (
-                    f"任务: market={market}, portfolio_mode={portfolio_mode}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction={direction}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
                     f"当前最优: {base['expression'] if base else '无'} "
                     f"(score={base['public_score']:.3f} icir={base['public_metrics'].get('icir',0):+.2f})\n"
                     f"其余尝试:\n{_build_context_block(top_nodes[1:], template) if template else _context_block_old(top_nodes[1:], template_or_spec)}\n\n"
@@ -172,7 +212,7 @@ async def propose(
             text = await llm.chat(provider, system, user, temp_val)
             data = llm.extract_json(text)
             expr = str(data.get("expression", "")).strip()
-            err = validate(expr)
+            err = validate(expr, fields or _FIELDS)
             if err:
                 raise llm.LLMError(f"表达式非法: {err} | {expr}")
             return expr, str(data.get("hypothesis", ""))[:500], "llm"
@@ -183,7 +223,7 @@ async def propose(
     # 回退随机
     tpls = template.get("dsl_exploration_templates") if template else None
     if op == "improve" and top_nodes:
-        return mutate_expression(top_nodes[0]["expression"], tpls), "随机变异自当前最优", "random"
+        return mutate_expression(top_nodes[0]["expression"], tpls, fields), "随机变异自当前最优", "random"
     return random_expression(tpls, fields), "随机模板生成", "random"
 
 
@@ -202,10 +242,19 @@ _OLD_SYSTEM = """你是量化因子研究员。基于当前市场日线数据设
 _ANTI = "\n特别要求: 避免过拟合——偏好简单、有经济含义、跨行业普适的结构。"
 
 
-def _system_prompt_old(spec: dict, fields: list[str] | None = None, portfolio_mode: str = "long_short", market: str = "us") -> str:
+def _system_prompt_old(
+    spec: dict,
+    fields: list[str] | None = None,
+    portfolio_mode: str = "long_short",
+    market: str = "us",
+    direction: int = 1,
+) -> str:
     ops = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = _ANTI if spec.get("anti_overfit_instruction") else ""
-    policy = f"\n研究任务: 市场={market}, 持仓模式={portfolio_mode}。"
+    policy = (
+        f"\n研究任务: 市场={market}, 持仓模式={portfolio_mode}, "
+        f"信号方向={'高值偏多' if direction == 1 else '低值偏多'}({direction:+d})。"
+    )
     policy += "只能做多，禁止依赖负向信号做空获利。" if portfolio_mode == "long_only" else "允许多空双侧组合。"
     return _OLD_SYSTEM.format(fields=", ".join(fields or _FIELDS), ops=ops, anti=anti) + policy
 
@@ -218,6 +267,7 @@ def _context_block_old(top_nodes: list[dict], spec: dict) -> str:
     for n in top_nodes[:k]:
         lines.append(
             f"- score={n['public_score']:.3f} icir={n['public_metrics'].get('icir')} "
-            f"turnover={n['public_metrics'].get('turnover')} expr: {n['expression']}"
+            f"daily_turnover={n['public_metrics'].get('daily_turnover', n['public_metrics'].get('turnover'))} "
+            f"expr: {n['expression']}"
         )
     return "\n".join(lines)

@@ -1,18 +1,72 @@
 /* USStockFactorFactory 前端 — Vue3 全局构建 + ECharts */
-const { createApp, ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } = Vue;
+const {
+  createApp, ref, reactive, computed, onMounted, onUnmounted,
+  onActivated, onDeactivated, watch, nextTick,
+} = Vue;
+
+const appState = reactive({
+  experimentId: null,
+  experimentVersion: 0,
+  switching: false,
+  switchMessage: "",
+});
+const responseCache = new Map();
+const inflightGets = new Map();
+let apiCacheGeneration = 0;
 
 async function api(path, opts = {}) {
-  const res = await fetch("/api" + path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  if (!res.ok) {
-    let msg = res.statusText;
-    try { msg = (await res.json()).detail || msg; } catch (e) {}
-    throw new Error(msg);
+  const method = (opts.method || "GET").toUpperCase();
+  const requestGeneration = apiCacheGeneration;
+  const cacheKey = method === "GET" ? `${requestGeneration}:${path}` : null;
+  const ttl = opts.cacheTtl ?? 0;
+  const { cacheTtl: _cacheTtl, ...fetchOptions } = opts;
+  if (cacheKey && ttl > 0) {
+    const hit = responseCache.get(cacheKey);
+    if (hit && Date.now() - hit.time < ttl) return hit.value;
+    if (inflightGets.has(cacheKey)) return inflightGets.get(cacheKey);
   }
-  return res.json();
+  const request = (async () => {
+    const res = await fetch("/api" + path, {
+      headers: { "Content-Type": "application/json" },
+      ...fetchOptions,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).detail || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    const value = await res.json();
+    if (method !== "GET") invalidateApiCache();
+    if (cacheKey && ttl > 0 && requestGeneration === apiCacheGeneration) {
+      responseCache.set(cacheKey, { time: Date.now(), value });
+    }
+    return value;
+  })();
+  if (cacheKey && ttl > 0) inflightGets.set(cacheKey, request);
+  try { return await request; }
+  finally { if (cacheKey) inflightGets.delete(cacheKey); }
+}
+
+function invalidateApiCache() {
+  apiCacheGeneration += 1;
+  responseCache.clear();
+  inflightGets.clear();
+}
+
+async function activateExperiment(experimentId) {
+  appState.switching = true;
+  appState.switchMessage = "正在切换研究任务…";
+  try {
+    const result = await api(`/experiments/${experimentId}/activate`, { method: "POST" });
+    appState.experimentId = Number(result.active_id || experimentId);
+    appState.experimentVersion += 1;
+    appState.switchMessage = `已切换到 ${result.experiment?.name || "研究任务"}`;
+    return result;
+  } finally {
+    appState.switching = false;
+    setTimeout(() => { appState.switchMessage = ""; }, 1200);
+  }
 }
 
 function mountChart(el, option) {
@@ -46,8 +100,8 @@ const Dashboard = {
     </div>
     <div class="card" style="margin-bottom:14px">
       <div class="panel-title-row"><div><h3>并行任务与数据身份</h3><span class="sub">同一端口内独立 worker；历史数据按任务 ID 隔离</span></div><span class="tag blue">{{ (st.workers || []).length }} workers</span></div>
-      <table><tr><th>任务</th><th>市场</th><th>模式</th><th>状态</th><th>外层步</th><th>内层评估</th></tr>
-        <tr v-for="w in (st.workers || [])" :key="w.experiment_id"><td>{{ w.experiment_id }}</td><td>{{ w.task_config?.market || '—' }}</td><td>{{ w.task_config?.portfolio_mode || '—' }}</td><td>{{ w.state }}</td><td>{{ w.outer_step }}</td><td>{{ w.inner_evals }}</td></tr>
+      <table><tr><th>任务</th><th>市场</th><th>模式</th><th>方向</th><th>状态</th><th>外层步</th><th>内层评估</th></tr>
+        <tr v-for="w in (st.workers || [])" :key="w.experiment_id"><td>{{ w.experiment_id }}</td><td>{{ w.task_config?.market || '—' }}</td><td>{{ w.task_config?.portfolio_mode || '—' }}</td><td>{{ Number(w.task_config?.direction || 1)===1 ? '高值偏多' : '低值偏多' }}</td><td>{{ w.state }}</td><td>{{ w.outer_step }}</td><td>{{ w.inner_evals }}</td></tr>
       </table>
     </div>
     <div class="grid cols-2">
@@ -72,19 +126,25 @@ const Dashboard = {
   setup() {
     const st = ref({ state: "…", logs: [] });
     const progressEl = ref(null), logEl = ref(null);
-    let timer = null;
+    let timer = null, refreshing = false;
     const fmt = (v) => (v == null ? "—" : Number(v).toFixed(4));
     const acceptRate = computed(() => {
       const c = st.value.counts;
       return c && c.outer_steps ? ((100 * c.accepted) / c.outer_steps).toFixed(0) + "%" : "—";
     });
     async function refresh() {
+      if (refreshing) return;
+      refreshing = true;
       try {
-        st.value = await api("/engine/status");
-        const prog = await api("/engine/progress");
+        const [status, prog] = await Promise.all([
+          api("/engine/status", { cacheTtl: 900 }),
+          api("/engine/progress", { cacheTtl: 900 }),
+        ]);
+        st.value = status;
         drawProgress(prog.steps);
         nextTick(() => { if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight; });
       } catch (e) { /* server booting */ }
+      finally { refreshing = false; }
     }
     function drawProgress(steps) {
       if (!progressEl.value) return;
@@ -104,8 +164,16 @@ const Dashboard = {
     }
     async function start() { await api("/engine/start", { method: "POST" }); refresh(); }
     async function stop() { await api("/engine/stop", { method: "POST" }); refresh(); }
-    onMounted(() => { refresh(); timer = setInterval(refresh, 3000); });
-    onUnmounted(() => clearInterval(timer));
+    function startPolling() {
+      refresh();
+      clearInterval(timer);
+      timer = setInterval(refresh, 3000);
+    }
+    function stopPolling() { clearInterval(timer); timer = null; }
+    watch(() => appState.experimentVersion, refresh);
+    onActivated(startPolling);
+    onDeactivated(stopPolling);
+    onUnmounted(stopPolling);
     return { st, progressEl, logEl, start, stop, fmt, acceptRate };
   },
 };
@@ -140,12 +208,16 @@ const ResearchTree = {
     const data = ref({ versions: [], nodes: [] });
     const selected = ref(null), picked = ref(null);
     const treeEl = ref(null);
-    let timer = null;
+    let timer = null, refreshing = false;
     const versionNo = (id) => data.value.versions.find((v) => v.id === id)?.version_no;
     async function refresh() {
+      if (refreshing) return;
+      refreshing = true;
       const q = selected.value ? "?miner_version_id=" + selected.value : "";
-      data.value = await api("/tree" + q);
-      draw();
+      try {
+        data.value = await api("/tree" + q, { cacheTtl: 1200 });
+        draw();
+      } finally { refreshing = false; }
     }
     function buildForest(nodes) {
       const byId = {}, roots = [];
@@ -181,8 +253,18 @@ const ResearchTree = {
       chart.on("click", (p) => { if (p.data.raw) picked.value = p.data.raw; });
     }
     function selectVersion(id) { selected.value = selected.value === id ? null : id; refresh(); }
-    onMounted(() => { refresh(); timer = setInterval(refresh, 6000); });
-    onUnmounted(() => clearInterval(timer));
+    function startPolling() {
+      refresh();
+      clearInterval(timer);
+      timer = setInterval(refresh, 6000);
+    }
+    function stopPolling() { clearInterval(timer); timer = null; }
+    watch(() => appState.experimentVersion, () => {
+      selected.value = null; picked.value = null; refresh();
+    });
+    onActivated(startPolling);
+    onDeactivated(stopPolling);
+    onUnmounted(stopPolling);
     return { data, selected, picked, treeEl, selectVersion, versionNo };
   },
 };
@@ -297,21 +379,21 @@ const FactorLibraryWorkbench = {
   template: `
   <div class="factor-workbench">
     <div class="card" style="margin-bottom:14px">
-      <div class="panel-title-row"><div><div class="eyebrow">FACTOR RESEARCH WORKBENCH</div><h1>因子库</h1><span class="sub">从“看一张表”升级为可检索、可复核、可比较的研究资产库。</span></div><span class="tag blue">{{ factors.length }} 条当前任务记录</span></div>
+      <div class="panel-title-row"><div><div class="eyebrow">EVALUATION PROTOCOL V3</div><h1>因子研究资产库</h1><span class="sub">搜索分与实战准入分离；HOLDOUT / VAULT 仅在显式审计时读取。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
       <div class="form-row" style="margin-top:14px">
         <input style="flex:3" v-model="query" @keyup.enter="refresh" placeholder="搜索名称、表达式、经济学假设…" />
-        <select v-model="status"><option value="">全部生命周期</option><option value="public-leading">public-leading</option><option value="library-admitted">library-admitted</option><option value="paper">paper</option><option value="retired">retired</option></select>
-        <select v-model="sort"><option value="score">按综合分</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
+        <select v-model="status"><option value="">全部生命周期</option><option value="discovery_only">F1 · discovery_only</option><option value="research_pass">F2 · research_pass</option><option value="oos_pass">F3 · oos_pass</option><option value="paper_candidate">F4 · paper_candidate</option><option value="live_candidate_non_pit">F5 · live_candidate_non_pit</option><option value="legacy_unreviewed">旧协议未审计</option><option value="invalid_provenance">来源无效</option><option value="configuration_changed_requires_reaudit">配置变更待复审</option></select>
+        <select v-model="sort"><option value="score">按研究分</option><option value="grade">按实战等级</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
         <button class="btn" @click="refresh">刷新</button><button class="btn primary" @click="compare" :disabled="selected.length<2">比较 {{ selected.length }} 个</button>
       </div>
-      <div class="sub" style="margin-top:10px">筛选建议：先按 long-only score / GATE Sharpe 过滤，再做相关性去冗余；单条表达式也可直接加入比较。</div>
+      <div class="sub" style="margin-top:10px">V3 使用真实目标权重换手、费后组合收益、成本压力、分层单调性和跨时期稳定性；旧协议数据不会自动升级。</div>
     </div>
 
     <div class="grid cols-2" v-if="comparison">
       <div class="card">
-        <div class="panel-title-row"><h2>批量评估</h2><span class="tag amber">{{ comparison.portfolio_mode }}</span></div>
-        <table><tr><th>表达式</th><th>PUB ICIR</th><th>GATE ICIR</th><th>多头 Sharpe</th><th>综合分</th></tr>
-          <tr v-for="r in comparison.results" :key="r.expression"><td class="mono-expr">{{ r.expression }}</td><td>{{ f(r.public?.icir) }}</td><td>{{ f(r.gate?.icir) }}</td><td>{{ f(r.gate?.long_only_sharpe) }}</td><td><b>{{ f(r.public?.score) }}</b></td></tr></table>
+        <div class="panel-title-row"><h2>V3 训练层复评</h2><span class="tag amber">{{ comparison.portfolio_mode }}</span></div>
+        <table><tr><th>表达式</th><th>PUB ICIR</th><th>GATE ICIR</th><th>GATE 费后 Sharpe</th><th>研究分</th></tr>
+          <tr v-for="r in comparison.results" :key="r.expression"><td class="mono-expr">{{ r.expression }}</td><td>{{ f(r.public?.icir) }}</td><td>{{ f(r.gate?.icir) }}</td><td>{{ f(layerSharpe(r.gate)) }}</td><td><b>{{ f(r.discovery?.score) }}</b></td></tr></table>
       </div>
       <div class="card"><h2>横截面冗余检查</h2><div class="sub">{{ comparison.correlation?.date }} · {{ comparison.correlation?.n }} 只股票</div>
         <table><tr><th></th><th v-for="(_,i) in comparison.correlation.matrix" :key="i">F{{ i+1 }}</th></tr>
@@ -321,20 +403,38 @@ const FactorLibraryWorkbench = {
     </div>
 
     <div class="card">
-      <div class="panel-title-row"><h2>研究资产</h2><span class="sub">勾选后批量比较；点击行查看完整分层结果和研究备注</span></div>
-      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>表达式</th><th>状态</th><th>评估协议</th><th>PUB ICIR</th><th>GATE ICIR</th><th>Long-only Sharpe</th><th>Score</th><th>标签</th></tr>
+      <div class="panel-title-row"><h2>研究资产</h2><span class="sub">点击行立即读取已存结果；完整审计由用户显式触发</span></div>
+      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>表达式</th><th>协议</th><th>生命周期</th><th>等级</th><th>PUB ICIR</th><th>GATE Sharpe</th><th>研究分</th><th>来源</th></tr>
         <tr v-for="fa in factors" :key="fa.id" class="clickable" @click="open(fa)">
           <td @click.stop><input type="checkbox" :value="fa.id" v-model="selected" /></td><td><b>{{ fa.name }}</b></td><td class="mono-expr factor-expression">{{ fa.expression }}</td>
-          <td><span class="tag" :class="{green: fa.status==='library-admitted', blue: fa.status==='public-leading', amber: fa.status==='paper', red: fa.status==='retired'}">{{ fa.status }}</span></td><td><span class="tag" :class="fa.evaluation_protocol==='long_only_v1' ? 'green' : 'amber'">{{ fa.evaluation_protocol==='long_only_v1' ? '多头 V1' : '旧口径' }}</span></td>
-          <td>{{ f(fa.public?.icir) }}</td><td>{{ f(fa.gate?.icir) }}</td><td>{{ f(fa.gate?.long_only_sharpe) }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
-          <td>{{ (fa.research_meta?.tags || []).join(' · ') || '—' }}</td>
+          <td><span class="tag" :class="fa.evaluation_protocol==='v3.0' ? 'green' : 'amber'">{{ fa.evaluation_protocol }}</span></td>
+          <td><span class="tag" :class="{green:fa.lifecycle_stage?.includes('live'), blue:fa.lifecycle_stage==='research_pass', amber:fa.lifecycle_stage?.includes('paper'), red:fa.lifecycle_stage==='legacy_unreviewed'}">{{ fa.lifecycle_stage }}</span></td>
+          <td><b :class="gradeClass(fa.eligibility?.grade)">{{ fa.eligibility?.grade || '—' }}</b></td>
+          <td>{{ f(fa.public?.icir) }}</td><td>{{ f(layerSharpe(fa.gate)) }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
+          <td><span class="tag" :class="fa.provenance_status?.includes('invalid') ? 'red' : ''">{{ fa.provenance_status }}</span></td>
         </tr></table>
       <div v-if="!factors.length" class="selector-empty"><h2>当前筛选没有结果</h2><p>降低筛选条件，或等待任务产生新的因子。</p></div>
     </div>
 
     <div class="drawer" v-if="detail">
-      <button class="btn close" @click="detail=null">✕ 关闭</button><h2>{{ detail.factor.name }}</h2><div class="mono-expr">{{ detail.factor.expression }}</div><p class="sub">{{ detail.factor.hypothesis }}</p>
-      <div class="card"><h3>分层指标</h3><table><tr><th>层</th><th>ICIR</th><th>一致性</th><th>Long-only Sharpe</th><th>Score</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(m?.long_only_sharpe) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
+      <button class="btn close" @click="detail=null">✕ 关闭</button>
+      <div class="panel-title-row"><div><h2>{{ detail.factor.name }}</h2><div class="sub">{{ detail.factor.lifecycle_stage }} · {{ detail.factor.provenance_status }}</div></div><div><span class="tag" :class="detail.factor.evaluation_protocol==='v3.0'?'green':'amber'">{{ detail.factor.evaluation_protocol }}</span> <span class="tag amber">NON_PIT</span></div></div>
+      <div class="mono-expr">{{ detail.factor.expression }}</div><p class="sub">{{ detail.factor.hypothesis }}</p>
+      <div v-if="detail.factor.validation?.source_provenance_warning" class="warn-banner">{{ detail.factor.validation.source_provenance_warning }}</div>
+      <div class="card audit-controls">
+        <div class="panel-title-row"><div><h3>完整 V3 审计</h3><span class="sub">显式读取 HOLDOUT 与 VAULT，并把结果持久化；不会反馈给 Miner。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
+        <div class="form-row"><div><label>股票池</label><input type="number" v-model.number="auditForm.universe_n" /></div><div><label>持有期</label><select v-model.number="auditForm.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="10">10日</option><option :value="20">20日</option></select></div><div><label>基础成本 bps</label><input type="number" v-model.number="auditForm.cost_bps" /></div><div><label>目标资金规模</label><input type="number" v-model.number="auditForm.target_capital" /></div></div>
+        <div v-if="auditErr" style="color:var(--red)">{{ auditErr }}</div>
+      </div>
+      <div class="card" v-if="detail.factor.validation?.layers">
+        <div class="panel-title-row"><h3>四层实战指标</h3><div><span class="grade-pill" :class="gradeClass(detail.factor.eligibility?.grade)">{{ detail.factor.eligibility?.grade }}</span> <span class="tag">{{ detail.factor.eligibility?.stage }}</span></div></div>
+        <table><tr><th>层</th><th>ICIR</th><th>费后 Sharpe</th><th>年化</th><th>最大回撤</th><th>日均等效换手</th><th>单调性</th><th>压力最差</th></tr>
+          <tr v-for="(m,k) in detail.factor.validation.layers" :key="k"><td>{{ k.toUpperCase() }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(layerReturn(m)) }}</td><td>{{ pct(m?.net?.max_drawdown) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.monotonicity) }}</td><td>{{ f(worstStress(m)) }}</td></tr>
+        </table>
+        <div v-if="detail.factor.eligibility?.failure_reasons?.length" class="failure-list"><b>未通过原因</b><ul><li v-for="reason in detail.factor.eligibility.failure_reasons" :key="reason">{{ reason }}</li></ul></div>
+      </div>
+      <div v-else class="card selector-empty"><h3>尚未完成 V3 全层审计</h3><p>旧评分仅作为历史记录。运行审计后才会生成 F1–F5 等级。</p></div>
+      <div class="card"><h3>训练反馈层</h3><table><tr><th>层</th><th>ICIR</th><th>一致性</th><th>费后 Sharpe</th><th>日均等效换手</th><th>研究分</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
       <label>标签（逗号分隔）</label><input v-model="review.tags" placeholder="momentum, quality, low-turnover" /><label>研究备注</label><textarea v-model="review.note" rows="5" placeholder="记录经济机制、已知暴露、失败原因和后续动作"></textarea>
       <div style="margin-top:10px"><button class="btn primary" @click="saveReview">保存研究备注</button><span class="sub" style="margin-left:8px">experiment={{ detail.factor.experiment_id }}</span></div>
     </div>
@@ -343,18 +443,49 @@ const FactorLibraryWorkbench = {
     const factors = ref([]), selected = ref([]), detail = ref(null), comparison = ref(null);
     const query = ref(""), status = ref(""), sort = ref("score");
     const review = reactive({ tags: "", note: "" });
+    const auditForm = reactive({ universe_n: 500, horizon: 5, cost_bps: 20, target_capital: 10000000 });
+    const auditing = ref(false), auditErr = ref("");
     const f = v => v == null ? "—" : Number(v).toFixed(3);
+    const pct = v => v == null ? "—" : (Number(v) * 100).toFixed(1) + "%";
+    const layerSharpe = m => m?.active?.sharpe ?? m?.net?.sharpe ?? m?.long_only_sharpe;
+    const layerReturn = m => m?.active?.ann_return ?? m?.net?.ann_return;
+    const worstStress = m => m?.cost_stress?.length ? Math.min(...m.cost_stress.map(x=>Number(x.sharpe))) : null;
+    const gradeClass = grade => grade === "F5" ? "grade-f5" : grade === "F4" ? "grade-f4" : grade === "F3" ? "grade-f3" : "grade-low";
     async function refresh() {
       const params = new URLSearchParams({ limit: "500", sort: sort.value });
-      if (query.value) params.set("q", query.value); if (status.value) params.set("status", status.value);
-      factors.value = (await api("/factors?" + params.toString())).factors;
+      if (query.value) params.set("q", query.value); if (status.value) params.set("lifecycle", status.value);
+      factors.value = (await api("/factors?" + params.toString(), { cacheTtl: 1000 })).factors;
     }
     function toggleAll(e) { selected.value = e.target.checked ? factors.value.map(fa=>fa.id) : []; }
-    async function open(fa) { detail.value = await api(`/factors/${fa.id}/detail`); review.tags = (detail.value.factor.research_meta?.tags || []).join(", "); review.note = detail.value.factor.research_meta?.note || ""; }
+    async function open(fa) {
+      detail.value = await api(`/factors/${fa.id}/detail`, { cacheTtl: 2000 });
+      review.tags = (detail.value.factor.research_meta?.tags || []).join(", ");
+      review.note = detail.value.factor.research_meta?.note || "";
+      const defaults = detail.value.audit_defaults || {};
+      auditForm.universe_n = detail.value.factor.research_meta?.last_audit_universe_n || defaults.universe_n || 500;
+      auditForm.horizon = detail.value.factor.research_meta?.last_audit_horizon || defaults.horizon || 5;
+      auditForm.cost_bps = defaults.cost_bps ?? 15;
+      auditForm.target_capital = defaults.target_capital ?? 1000000;
+    }
     async function compare() { comparison.value = await api("/factors/compare", { method:"POST", body:{ factor_ids:selected.value } }); }
-    async function saveReview() { await api(`/factors/${detail.value.factor.id}/review`, { method:"PATCH", body:{ tags:review.tags.split(","), note:review.note } }); detail.value.factor.research_meta = { tags:review.tags.split(",").filter(Boolean), note:review.note }; refresh(); }
+    async function runAudit() {
+      auditing.value = true; auditErr.value = "";
+      try {
+        detail.value = await api(`/factors/${detail.value.factor.id}/audit`, { method:"POST", body:{ ...auditForm } });
+        invalidateApiCache(); await refresh();
+      } catch (e) { auditErr.value = e.message; }
+      finally { auditing.value = false; }
+    }
+    async function saveReview() {
+      await api(`/factors/${detail.value.factor.id}/review`, { method:"PATCH", body:{ tags:review.tags.split(","), note:review.note } });
+      detail.value.factor.research_meta = { ...detail.value.factor.research_meta, tags:review.tags.split(",").filter(Boolean), note:review.note };
+      invalidateApiCache(); refresh();
+    }
+    watch(() => appState.experimentVersion, () => {
+      selected.value = []; detail.value = null; comparison.value = null; refresh();
+    });
     onMounted(refresh);
-    return { factors, selected, detail, comparison, query, status, sort, review, f, refresh, toggleAll, open, compare, saveReview };
+    return { factors, selected, detail, comparison, query, status, sort, review, auditForm, auditing, auditErr, f, pct, layerSharpe, layerReturn, worstStress, gradeClass, refresh, toggleAll, open, compare, runAudit, saveReview };
   },
 };
 
@@ -408,7 +539,7 @@ const BacktestView = {
     const taskMode = ref("long_only");
     const result = ref(null), history = ref([]), err = ref(""), running = ref(false);
     const curveEl = ref(null);
-    const labels = { days: "交易日数", ann_ret: "年化收益", ann_vol: "年化波动", sharpe: "Sharpe", max_dd: "最大回撤", avg_daily_turnover: "日均换手", final_nav: "期末净值" };
+    const labels = { days: "交易日数", ann_ret: "年化收益", ann_vol: "年化波动", sharpe: "Sharpe", max_dd: "最大回撤", avg_daily_turnover: "日均双边交易额/净值", avg_one_way_turnover: "日均单边换手", final_nav: "期末净值" };
     async function run() {
       running.value = true; err.value = "";
       try {
@@ -431,8 +562,17 @@ const BacktestView = {
         series: [{ type: "line", data: c.equity, showSymbol: false, lineStyle: { color: "#3fb950", width: 1.5 }, areaStyle: { color: "rgba(63,185,80,0.08)" } }],
       });
     }
-    async function loadHistory() { history.value = (await api("/backtests")).backtests; }
-    onMounted(async () => { const meta = await api("/meta"); taskMode.value = meta.portfolio_mode || "long_only"; form.mode = taskMode.value; loadHistory(); });
+    async function loadHistory() { history.value = (await api("/backtests", { cacheTtl: 1000 })).backtests; }
+    async function loadContext() {
+      result.value = null;
+      const meta = await api("/meta", { cacheTtl: 1500 });
+      taskMode.value = meta.portfolio_mode || "long_only";
+      form.mode = taskMode.value;
+      form.cost_bps = meta.evaluation_config?.base_cost_bps ?? form.cost_bps;
+      await loadHistory();
+    }
+    watch(() => appState.experimentVersion, loadContext);
+    onMounted(loadContext);
     return { form, taskMode, result, history, err, running, run, curveEl, labels };
   },
 };
@@ -448,11 +588,22 @@ const SettingsView = {
         <div style="flex:3"><label>研究问题 / 假设</label><input v-model="taskForm.description" placeholder="要验证的经济机制、变更点与成功标准" /></div>
       </div>
       <div class="form-row">
-        <div><label>市场</label><select v-model="taskForm.market"><option value="ashare">A股</option><option value="us">美股</option></select></div>
-        <div><label>持仓约束</label><select v-model="taskForm.portfolio_mode"><option value="long_only">纯多头</option><option value="long_short">多空</option></select></div>
-        <div><label>引擎版本</label><select v-model="taskForm.engine_mode"><option value="v2">V2 MinerTemplate</option><option value="v1">V1 兼容（历史）</option></select></div>
+        <div><label>市场</label><select v-model="taskForm.market" @change="syncMarketDefaults"><option value="ashare">A股</option><option value="us">美股</option></select></div>
+        <div><label>持仓约束</label><select v-model="taskForm.portfolio_mode"><option value="long_only">纯多头</option><option value="long_short" :disabled="taskForm.market==='ashare'">多空</option></select></div>
+        <div><label>信号方向</label><select v-model.number="taskForm.direction"><option :value="1">高分做多{{ taskForm.portfolio_mode==='long_short' ? ' / 低分做空' : '' }}</option><option :value="-1">低分做多{{ taskForm.portfolio_mode==='long_short' ? ' / 高分做空' : '（仍为纯多头）' }}</option></select></div>
+        <div><label>引擎版本</label><select v-model="taskForm.engine_mode"><option value="v2">V2 MinerTemplate（当前）</option></select></div>
         <div style="flex:3"><label>面板路径（可选）</label><input v-model="taskForm.panel_glob" placeholder="留空使用服务默认面板" /></div>
-        <div style="align-self:flex-end"><button class="btn primary" @click="createTask">创建任务</button></div>
+      </div>
+      <div class="evaluation-config-grid">
+        <div><label>建仓比例</label><input v-model.number="taskForm.top_fraction" type="number" min="0.05" max="0.5" step="0.05" /></div>
+        <div><label>基础成本 bps</label><input v-model.number="taskForm.base_cost_bps" type="number" min="0" /></div>
+        <div><label>压力成本 bps</label><input v-model="taskForm.stress_cost_bps" placeholder="10,20,35,50" /></div>
+        <div><label>年借券成本 bps</label><input v-model.number="taskForm.borrow_cost_bps_annual" type="number" :disabled="taskForm.portfolio_mode==='long_only'" /></div>
+        <div><label>目标资金规模</label><input v-model.number="taskForm.target_capital" type="number" min="1" /></div>
+        <div><label>OOS 最低 Sharpe</label><input v-model.number="taskForm.min_oos_sharpe" type="number" step="0.1" /></div>
+        <div><label>最大回撤</label><input v-model.number="taskForm.max_drawdown" type="number" step="0.05" /></div>
+        <div><label>最大日换手</label><input v-model.number="taskForm.max_daily_turnover" type="number" step="0.05" /></div>
+        <div style="align-self:end"><button class="btn primary" @click="createTask">按 V3 创建任务</button></div>
       </div>
       <div v-if="taskMsg" :style="{color: taskOk ? 'var(--green)' : 'var(--red)'}">{{ taskMsg }}</div>
     </div>
@@ -493,7 +644,8 @@ const SettingsView = {
           <tr><th>名称</th><th>股票池</th><th>持有期</th><th>成本bps</th></tr>
           <tr v-for="t in eng.tasks" :key="t.name"><td>{{ t.name }}</td><td>{{ t.universe_n }}</td><td>{{ t.horizon }}日</td><td>{{ t.cost_bps }}</td></tr>
         </table>
-        <div class="sub" style="margin-top:8px">评估仅使用 INNER_PUBLIC(2010~2019) + META_TRAIN(2020~2022); META_HOLDOUT 与 FACTOR_VAULT 层永不进入循环提示词。</div>
+        <div class="sub" style="margin-top:8px">挖掘评分仅使用 INNER_PUBLIC + META_TRAIN；HOLDOUT 与 VAULT 只允许通过因子库里的显式 V3 审计读取，绝不进入循环提示词。</div>
+        <div class="protocol-card"><b>Evaluation Protocol {{ evalProtocol.version || 'v3.0' }}</b><span>真实目标权重换手 · 费后收益 · 多头/空头拆分 · 成本压力 · OOS 生命周期</span><small>{{ evalProtocol.policy_label }}</small></div>
       </div>
     </div>
     <div style="margin-top:14px; display:flex; gap:10px; align-items:center">
@@ -504,13 +656,21 @@ const SettingsView = {
   setup() {
     const llm = reactive({ providers: [], inner_provider: "", outer_provider: "" });
     const eng = reactive({ tasks: [] });
+    const evalProtocol = reactive({});
     const msg = ref(""), saved = ref("");
-    const taskForm = reactive({ name: "", description: "", market: "ashare", portfolio_mode: "long_only", engine_mode: "v2", panel_glob: "" });
+    const taskForm = reactive({
+      name: "", description: "", market: "ashare", portfolio_mode: "long_only",
+      direction: 1, engine_mode: "v2", panel_glob: "", top_fraction: 0.20,
+      base_cost_bps: 20, stress_cost_bps: "10,20,35,50",
+      borrow_cost_bps_annual: 0, target_capital: 10000000,
+      min_oos_sharpe: 0.5, max_drawdown: 0.35, max_daily_turnover: 0.35,
+    });
     const taskMsg = ref(""), taskOk = ref(false);
     async function load() {
       const s = await api("/settings");
       Object.assign(llm, s.llm_providers);
       Object.assign(eng, s.engine_config);
+      Object.assign(evalProtocol, s.evaluation_protocol || {});
     }
     async function save() {
       try {
@@ -523,17 +683,37 @@ const SettingsView = {
     async function createTask() {
       taskMsg.value = "";
       try {
+        const stress = String(taskForm.stress_cost_bps).split(",").map(Number).filter(Number.isFinite);
         await api("/experiments", { method: "POST", body: {
           name: taskForm.name, description: taskForm.description,
           research_config: { market: taskForm.market, portfolio_mode: taskForm.portfolio_mode,
-            engine_mode: taskForm.engine_mode, panel_glob: taskForm.panel_glob || undefined },
+            direction: taskForm.direction, engine_mode: taskForm.engine_mode,
+            panel_glob: taskForm.panel_glob || undefined, evaluation_protocol: "v3.0",
+            evaluation_config: {
+              top_fraction: taskForm.top_fraction, tail_fraction: taskForm.top_fraction,
+              base_cost_bps: taskForm.base_cost_bps, stress_cost_bps: stress,
+              borrow_cost_bps_annual: taskForm.borrow_cost_bps_annual,
+              target_capital: taskForm.target_capital, min_oos_sharpe: taskForm.min_oos_sharpe,
+              max_drawdown: taskForm.max_drawdown, max_daily_turnover: taskForm.max_daily_turnover,
+            }},
         }});
         taskOk.value = true; taskMsg.value = "研究任务已创建，可在“实验”页启动";
         taskForm.name = ""; taskForm.description = "";
       } catch (e) { taskOk.value = false; taskMsg.value = "创建失败: " + e.message; }
     }
+    function syncMarketDefaults() {
+      if (taskForm.market === "ashare") {
+        taskForm.portfolio_mode = "long_only"; taskForm.base_cost_bps = 20;
+        taskForm.stress_cost_bps = "10,20,35,50"; taskForm.borrow_cost_bps_annual = 0;
+        taskForm.target_capital = 10000000; taskForm.max_daily_turnover = 0.35;
+      } else {
+        taskForm.portfolio_mode = "long_short"; taskForm.base_cost_bps = 15;
+        taskForm.stress_cost_bps = "5,15,25,40"; taskForm.borrow_cost_bps_annual = 300;
+        taskForm.target_capital = 1000000; taskForm.max_daily_turnover = 0.50;
+      }
+    }
     onMounted(load);
-    return { llm, eng, save, msg, saved, taskForm, taskMsg, taskOk, createTask };
+    return { llm, eng, evalProtocol, save, msg, saved, taskForm, taskMsg, taskOk, createTask, syncMarketDefaults };
   },
 };
 
@@ -553,14 +733,15 @@ const ExperimentsView = {
     <div class="card">
       <h3>研究任务列表 ({{ exps.length }})</h3>
       <table>
-        <tr><th>#</th><th>名称</th><th>市场 / 约束</th><th>任务状态</th><th>运行态</th><th>因子</th><th>节点</th><th>外层步</th><th style="min-width:280px">操作</th></tr>
+        <tr><th>#</th><th>名称</th><th>市场 / 约束</th><th>协议</th><th>任务状态</th><th>运行态</th><th>因子</th><th>节点</th><th>外层步</th><th style="min-width:250px">操作</th></tr>
         <tr v-for="e in exps" :key="e.id" :style="{background: e.active ? '#1c2733' : ''}">
           <td>{{ e.id }}</td>
           <td>
             <input v-if="editing===e.id" v-model="editForm.name" style="width:180px" />
             <template v-else><b>{{ e.name }}</b> <span v-if="e.active" class="tag green">活动</span></template>
           </td>
-          <td><span class="tag blue">{{ e.research_config?.market==='ashare' ? 'A股' : '美股' }}</span> <span class="sub">{{ e.research_config?.portfolio_mode==='long_only' ? '纯多头' : '多空' }}</span></td>
+          <td><span class="tag blue">{{ e.research_config?.market==='ashare' ? 'A股' : '美股' }}</span> <span class="sub">{{ e.research_config?.portfolio_mode==='long_only' ? '纯多头' : '多空' }} · {{ Number(e.research_config?.direction || 1)===1 ? '高值偏多' : '低值偏多' }}</span></td>
+          <td><span class="tag" :class="e.research_config?.evaluation_protocol==='v3.0'?'green':'amber'">{{ e.research_config?.evaluation_protocol || 'legacy' }}</span><div v-if="e.research_config?.provenance_warning" class="provenance-dot" :title="e.research_config.provenance_warning">来源警告</div></td>
           <td><span class="tag" :class="{green: e.status==='open', amber: e.status==='archived'}">{{ e.status }}</span></td>
           <td><span class="tag" :class="{green: runtime[e.id]?.state==='running', amber: runtime[e.id]?.state==='starting', red: runtime[e.id]?.state==='stopped'}">{{ runtime[e.id]?.state || 'stopped' }}</span></td>
           <td>{{ e.counts.factors }}</td><td>{{ e.counts.nodes }}</td><td>{{ e.counts.outer_steps }}</td>
@@ -577,7 +758,6 @@ const ExperimentsView = {
               <button class="btn" @click="startEdit(e)">编辑</button>
               <button class="btn" v-if="e.status==='open'" @click="setStatus(e,'archived')">归档</button>
               <button class="btn" v-else @click="setStatus(e,'open')">重新开放</button>
-              <button class="btn danger" v-if="!e.active" @click="del(e)">删除</button>
             </template>
           </td>
         </tr>
@@ -591,8 +771,12 @@ const ExperimentsView = {
     const editForm = reactive({ name: "", description: "" });
     const editing = ref(null), err = ref("");
     async function refresh() {
-      exps.value = (await api("/experiments")).experiments;
-      const obs = await api("/observability");
+      const [experiments, obs] = await Promise.all([
+        api("/experiments", { cacheTtl: 800 }),
+        api("/observability", { cacheTtl: 800 }),
+      ]);
+      exps.value = experiments.experiments;
+      Object.keys(runtime).forEach(key => delete runtime[key]);
       (obs.workers || []).forEach(w => { runtime[w.experiment_id] = w; });
     }
     async function create() {
@@ -613,7 +797,7 @@ const ExperimentsView = {
     }
     async function activate(e) {
       err.value = "";
-      try { await api(`/experiments/${e.id}/activate`, { method: "POST" }); location.reload(); }
+      try { await activateExperiment(e.id); await refresh(); }
       catch (ex) { err.value = ex.message; }
     }
     async function start(e) {
@@ -625,14 +809,9 @@ const ExperimentsView = {
       try { await api("/engine/stop", { method: "POST", body: { experiment_id: e.id } }); refresh(); }
       catch (ex) { err.value = ex.message; }
     }
-    async function del(e) {
-      if (!confirm(`删除实验「${e.name}」及其全部 ${e.counts.factors} 个因子、${e.counts.nodes} 个节点? 不可恢复!`)) return;
-      err.value = "";
-      try { await api(`/experiments/${e.id}`, { method: "DELETE" }); refresh(); }
-      catch (ex) { err.value = ex.message; }
-    }
+    watch(() => appState.experimentVersion, refresh);
     onMounted(refresh);
-    return { exps, runtime, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, start, stop, del };
+    return { exps, runtime, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, start, stop };
   },
 };
 
@@ -643,10 +822,11 @@ const App = {
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
     <div class="tabs">
-      <button v-for="t in tabs" :key="t.id" :class="{active: tab===t.id}" @click="tab=t.id">{{ t.label }}</button>
+      <button v-for="t in tabs" :key="t.id" :class="{active: tab===t.id}" @click="selectTab(t.id)">{{ t.label }}</button>
     </div>
     <div class="spacer"></div>
-    <select v-model="selExp" @change="switchExp" style="margin-right:10px; max-width:220px" title="切换活动研究任务">
+    <span v-if="appState.switchMessage" class="switch-message">{{ appState.switchMessage }}</span>
+    <select v-model="selExp" @change="switchExp" :disabled="appState.switching" style="margin-right:10px; max-width:220px" title="切换活动研究任务">
       <option v-for="e in exps" :key="e.id" :value="e.id" :disabled="e.status==='archived' && !e.active">
         {{ e.name }}{{ e.status==='archived' ? ' (归档)' : '' }}
       </option>
@@ -654,16 +834,12 @@ const App = {
     <span class="state-badge" :class="engState==='running' ? 'state-running' : 'state-stopped'">● {{ engState }}</span>
   </div>
   <div class="main">
-    <Dashboard v-if="tab==='dash'" />
-    <ResearchTree v-else-if="tab==='tree'" />
-    <FactorLibraryWorkbench v-else-if="tab==='factors'" />
-	    <ScreenerView v-else-if="tab==='screener'" />
-    <BacktestView v-else-if="tab==='backtest'" />
-    <ExperimentsView v-else-if="tab==='exps'" />
-    <SettingsView v-else />
+    <div v-if="appState.switching" class="task-switch-overlay"><div class="loading-ring"></div><span>正在切换任务上下文</span></div>
+    <KeepAlive :max="7"><component :is="activeComponent" :key="tab" /></KeepAlive>
   </div>`,
   setup() {
-    const tab = ref("dash");
+    const savedTab = localStorage.getItem("factorfactory.tab");
+    const tab = ref(savedTab || "dash");
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
       { id: "factors", label: "因子库" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
@@ -671,24 +847,41 @@ const App = {
     ];
     const engState = ref("…");
     const exps = ref([]), selExp = ref(null);
-    let timer = null;
+    let timer = null, polling = false;
+    const activeComponent = computed(() => ({
+      dash: Dashboard, tree: ResearchTree, factors: FactorLibraryWorkbench,
+      screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
+      settings: SettingsView,
+    })[tab.value] || Dashboard);
     async function poll() {
-      try { engState.value = (await api("/engine/status")).state; } catch (e) {}
+      if (polling) return;
+      polling = true;
+      try { engState.value = (await api("/engine/status", { cacheTtl: 900 })).state; }
+      catch (e) {}
+      finally { polling = false; }
     }
     async function loadExps() {
       try {
-        const d = await api("/experiments");
+        const d = await api("/experiments", { cacheTtl: 1200 });
         exps.value = d.experiments;
         selExp.value = d.active_id;
+        appState.experimentId = Number(d.active_id);
       } catch (e) {}
     }
     async function switchExp() {
-      try { await api(`/experiments/${selExp.value}/activate`, { method: "POST" }); location.reload(); }
+      try {
+        await activateExperiment(selExp.value);
+        await Promise.all([loadExps(), poll()]);
+      }
       catch (e) { alert("切换失败: " + e.message); loadExps(); }
+    }
+    function selectTab(id) {
+      tab.value = id;
+      localStorage.setItem("factorfactory.tab", id);
     }
     onMounted(() => { poll(); loadExps(); timer = setInterval(poll, 5000); });
     onUnmounted(() => clearInterval(timer));
-    return { tab, tabs, engState, exps, selExp, switchExp };
+    return { tab, tabs, engState, exps, selExp, switchExp, selectTab, activeComponent, appState };
   },
 };
 
@@ -760,7 +953,7 @@ const ScreenerView = {
               <span class="factor-copy">
                 <span class="factor-name">{{ f.name }}</span>
                 <code :title="f.expression">{{ f.expression }}</code>
-                <span class="factor-meta">公共分 {{ formatScore(f.public?.score) }}</span>
+                <span class="factor-meta">{{ f.grade || '未审计' }} · {{ f.lifecycle }} · 研究分 {{ formatScore(f.score) }}</span>
               </span>
               <input class="weight-input" v-model.number="f.weight" type="number" min="0.5" max="5" step="0.5" :disabled="!f.enabled" title="因子权重" />
             </label>
@@ -780,14 +973,14 @@ const ScreenerView = {
           <div class="empty-steps"><span>01 选择因子</span><span>02 冻结参数</span><span>03 查看排名</span></div>
         </div>
         <div v-if="loading" class="card selector-empty">
-          <div class="loading-ring"></div><h2>正在计算截面排名</h2><p>正在按股票池过滤数据并合并 {{ enabledCount }} 个因子。</p>
+          <div class="loading-ring"></div><h2>正在计算截面排名</h2><p>正在按股票池过滤数据并合并 {{ directExpr.trim() ? 1 : enabledCount }} 个因子。</p>
         </div>
         <template v-if="result && !loading">
           <div class="result-summary">
-            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · 综合排名</h2></div><span class="tag blue">已完成</span></div>
+            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · 综合排名</h2><small v-if="result.date_adjusted" class="sub">请求日 {{ result.requested_date }} 非交易日或超出面板，已回退到最近交易日</small></div><span class="tag blue">已完成</span></div>
           <div class="metric-strip">
               <div class="metric-card"><span>股票池</span><b>Top {{ result.universe_n || univN }}</b><small>按 60 日成交额</small></div>
-              <div class="metric-card"><span>启用因子</span><b>{{ enabledCount }}</b><small>加权截面排名</small></div>
+              <div class="metric-card"><span>启用因子</span><b>{{ result.factor_count }}</b><small>加权截面排名</small></div>
               <div class="metric-card"><span>输出数量</span><b>{{ result.stocks.length }}</b><small>候选清单</small></div>
               <div class="metric-card accent"><span>最高综合分</span><b>{{ topScore }}</b><small>{{ result.expression_mode ? '单条 DSL 排名' : '相对排序分数' }}</small></div>
             </div>
@@ -821,18 +1014,24 @@ const ScreenerView = {
 
     async function loadFactors() {
       try {
-        const d = await api("/factors");
+        const d = await api("/factors?sort=grade", { cacheTtl: 1000 });
         const fs = (d.factors||[]).filter(f=>f.expression);
         const seen=new Set(); const uniq=[];
         for (const f of fs.sort((a,b)=>(b.public?.score||0)-(a.public?.score||0))) {
           if (!seen.has(f.expression)) { seen.add(f.expression); uniq.push(f); }
           if (uniq.length>=50) break;
         }
-        factors.value = uniq.map((f,i)=>({
+        const audited = uniq.filter(f => ["F3","F4","F5"].includes(f.eligibility?.grade));
+        const defaultExpressions = new Set(audited.slice(0,10).map(f => f.expression));
+        factors.value = uniq.map((f)=>({
           expression: f.expression,
           name: f.name || f.expression.slice(0,30),
-          enabled: i<10,
+          enabled: defaultExpressions.has(f.expression),
           weight: 1.0,
+          grade: f.eligibility?.grade,
+          lifecycle: f.lifecycle_stage,
+          score: f.public?.score,
+          direction: Number(f.research_meta?.direction || 1),
         }));
       } catch(e) { error.value="加载因子失败: "+e.message; }
     }
@@ -842,12 +1041,12 @@ const ScreenerView = {
 
     async function run() {
       const enabled = factors.value.filter(f=>f.enabled);
-      if (!enabled.length) { error.value="请至少选择一个因子"; return; }
+      if (!enabled.length && !directExpr.value.trim()) { error.value="请至少选择一个因子或输入 DSL 表达式"; return; }
       loading.value=true; error.value=""; result.value=null;
       try {
         const r = await api("/screener", { method:"POST", body:{
           expression: directExpr.value.trim() || undefined,
-          factors: enabled.map(f=>({expression:f.expression,weight:f.weight})),
+          factors: enabled.map(f=>({expression:f.expression,weight:f.weight,direction:f.direction})),
           date: date.value, universe_n: univN.value, top_n: topN.value, direction:"top"
         }});
         result.value = r;
@@ -855,6 +1054,7 @@ const ScreenerView = {
       finally { loading.value=false; }
     }
 
+    watch(() => appState.experimentVersion, () => { result.value=null; directExpr.value=""; loadFactors(); });
     onMounted(loadFactors);
     return { date, univN, topN, directExpr, factors, result, error, loading, enabledCount, canRun, totalWeight, topScore, formatScore, rankWidth, selectAll, clearAll, run, loadFactors };
   },

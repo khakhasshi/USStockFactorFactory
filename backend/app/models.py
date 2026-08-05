@@ -88,8 +88,14 @@ class Factor(Base):
     task_name: Mapped[str] = mapped_column(String(64), default="")
     public_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     gate_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    evaluation_protocol: Mapped[str] = mapped_column(String(32), default="legacy_unoriented", index=True)
+    lifecycle_stage: Mapped[str] = mapped_column(String(32), default="legacy_unreviewed", index=True)
+    provenance_status: Mapped[str] = mapped_column(String(32), default="unverified", index=True)
+    validation_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    eligibility: Mapped[dict] = mapped_column(JSON, default=dict)
     fingerprint: Mapped[dict] = mapped_column(JSON, default=dict)
     research_meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

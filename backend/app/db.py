@@ -43,6 +43,47 @@ async def init_db() -> None:
             "ALTER TABLE factors ADD COLUMN IF NOT EXISTS research_meta JSONB NOT NULL DEFAULT '{}'::jsonb"
         ))
         await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS evaluation_protocol VARCHAR(32) "
+            "NOT NULL DEFAULT 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS lifecycle_stage VARCHAR(32) "
+            "NOT NULL DEFAULT 'legacy_unreviewed'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS provenance_status VARCHAR(32) "
+            "NOT NULL DEFAULT 'unverified'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS validation_metrics JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS eligibility JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE factors ADD COLUMN IF NOT EXISTS evaluated_at TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_factors_evaluation_protocol ON factors (evaluation_protocol)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_factors_lifecycle_stage ON factors (lifecycle_stage)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_factors_provenance_status ON factors (provenance_status)"
+        ))
+        # Preserve contaminated historical expressions while preventing them
+        # from appearing as validated research assets.
+        await conn.execute(text(
+            "UPDATE factors AS f "
+            "SET provenance_status = 'invalid_historical_panel', "
+            "    lifecycle_stage = 'invalid_provenance' "
+            "FROM experiments AS e "
+            "WHERE f.experiment_id = e.id "
+            "  AND e.research_config ? 'provenance_warning' "
+            "  AND f.evaluation_protocol = 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
             "INSERT INTO experiments (id, name, description, status) VALUES "
             "(1, '实验1-初始双层挖掘', '2026-08 首轮: 旧评分函数(exp换手衰减, 无退化检测), 328因子/31外层步; 已冻结存档', 'archived') "
             "ON CONFLICT (id) DO NOTHING"

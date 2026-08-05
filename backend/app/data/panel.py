@@ -9,7 +9,7 @@ from datetime import date
 
 import polars as pl
 
-from ..config import LAYER_BOUNDS, PANEL_GLOB
+from ..config import PANEL_GLOB, get_layer_bounds
 
 HORIZONS = [1, 5, 10, 20]
 
@@ -22,25 +22,32 @@ PANEL_META = {
 
 class PanelStore:
     _instances: dict[str, "PanelStore"] = {}
-    _lock = threading.Lock()
+    _registry_lock = threading.Lock()
 
-    def __init__(self, panel_glob: str | None = None) -> None:
+    def __init__(self, panel_glob: str | None = None, market: str | None = None) -> None:
         self.df: pl.DataFrame | None = None
         self.load_error: str = ""
         self.panel_glob = panel_glob or os.environ.get("FF_PANEL_GLOB")
+        self.market = market or os.environ.get("FF_MARKET", "us")
+        self.layer_bounds = get_layer_bounds(self.market)
+        self._load_lock = threading.Lock()
 
     @classmethod
-    def get(cls, panel_glob: str | None = None) -> "PanelStore":
-        key = panel_glob or os.environ.get("FF_PANEL_GLOB", "__default__")
-        with cls._lock:
+    def get(cls, panel_glob: str | None = None, market: str | None = None) -> "PanelStore":
+        resolved_market = market or os.environ.get("FF_MARKET", "us")
+        resolved_glob = panel_glob or os.environ.get("FF_PANEL_GLOB", "__default__")
+        key = f"{resolved_market}::{resolved_glob}"
+        with cls._registry_lock:
             if key not in cls._instances:
-                cls._instances[key] = cls(panel_glob)
+                cls._instances[key] = cls(panel_glob, resolved_market)
             return cls._instances[key]
 
     def ensure_loaded(self) -> pl.DataFrame:
         if self.df is not None:
             return self.df
-        with self._lock:
+        # Different market panels may load concurrently; only duplicate loads
+        # of this exact panel instance are serialized.
+        with self._load_lock:
             if self.df is not None:
                 return self.df
             self.df = self._load()
@@ -98,7 +105,7 @@ class PanelStore:
             .alias("era")
         )
         layer_expr = pl.lit("NONE")
-        for name, (lo, hi) in LAYER_BOUNDS.items():
+        for name, (lo, hi) in self.layer_bounds.items():
             layer_expr = (
                 pl.when(pl.col("trade_date").is_between(date.fromisoformat(lo), date.fromisoformat(hi)))
                 .then(pl.lit(name))
@@ -107,7 +114,29 @@ class PanelStore:
         lf = lf.with_columns(layer_expr.alias("layer"))
         return lf.collect()
 
-    def summary(self) -> dict:
+    def summary(self, ensure_loaded: bool = True) -> dict:
+        if not ensure_loaded and self.df is None:
+            panel_glob = self.panel_glob or PANEL_GLOB
+            try:
+                columns = pl.scan_parquet(panel_glob, hive_partitioning=True).collect_schema().names()
+            except Exception as e:  # noqa: BLE001
+                return {
+                    "loaded": False,
+                    "error": str(e),
+                    "market": self.market,
+                    "layers": {k: list(v) for k, v in self.layer_bounds.items()},
+                    **PANEL_META,
+                    "panel_glob": panel_glob,
+                }
+            return {
+                "loaded": False,
+                "state": "cold",
+                "market": self.market,
+                "layers": {k: list(v) for k, v in self.layer_bounds.items()},
+                "available_columns": columns,
+                **PANEL_META,
+                "panel_glob": panel_glob,
+            }
         try:
             df = self.ensure_loaded()
         except Exception as e:  # noqa: BLE001
@@ -118,7 +147,8 @@ class PanelStore:
             "securities": df["ts_code"].n_unique(),
             "date_min": str(df["trade_date"].min()),
             "date_max": str(df["trade_date"].max()),
-            "layers": {k: list(v) for k, v in LAYER_BOUNDS.items()},
+            "market": self.market,
+            "layers": {k: list(v) for k, v in self.layer_bounds.items()},
             **PANEL_META,
             "panel_glob": self.panel_glob or PANEL_GLOB,
         }

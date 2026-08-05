@@ -77,8 +77,9 @@ class FactorPipeline:
 
 
 class _Builder:
-    def __init__(self) -> None:
+    def __init__(self, fields: list[str] | None = None) -> None:
         self.stages: list[tuple[str, pl.Expr]] = []
+        self.fields = fields or DSL_FIELDS
 
     def _mat(self, expr: pl.Expr) -> pl.Expr:
         name = f"__t{len(self.stages)}"
@@ -91,8 +92,8 @@ class _Builder:
                 return pl.lit(float(node.value))
             raise ValueError(f"非法常量: {node.value!r}")
         if isinstance(node, ast.Name):
-            if node.id not in DSL_FIELDS:
-                raise ValueError(f"未知字段: {node.id} (白名单: {DSL_FIELDS})")
+            if node.id not in self.fields:
+                raise ValueError(f"未知字段: {node.id} (白名单: {self.fields})")
             return pl.col(node.id)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
             return -self.build(node.operand)
@@ -187,13 +188,13 @@ def _degenerate_check(root: ast.expr) -> None:
                 raise ValueError("退化表达式: ts_corr(x, x, w) 恒为 1")
 
 
-def parse(expression: str) -> FactorPipeline:
+def parse(expression: str, fields: list[str] | None = None) -> FactorPipeline:
     """解析 DSL 表达式为 FactorPipeline; 非法即抛 ValueError."""
     if len(expression) > 500:
         raise ValueError("表达式过长")
     tree = ast.parse(expression, mode="eval")
     _degenerate_check(tree.body)
-    b = _Builder()
+    b = _Builder(fields)
     final = b.build(tree.body)
     return FactorPipeline(b.stages, final)
 
@@ -203,9 +204,9 @@ def normalize_hash(expression: str) -> str:
     return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:16]
 
 
-def validate(expression: str) -> str | None:
+def validate(expression: str, fields: list[str] | None = None) -> str | None:
     try:
-        parse(expression)
+        parse(expression, fields)
         return None
     except (ValueError, SyntaxError) as e:
         return str(e)

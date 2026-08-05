@@ -165,3 +165,38 @@ tr.clickable:hover { background: #1c2129; }
 .corr-high { color: var(--red); background: rgba(248,81,73,.12); font-weight: 700; }
 .factor-workbench h1 { margin: 4px 0; }
 .factor-workbench textarea { width: 100%; resize: vertical; }
+
+/* ============ V3 research protocol & fast task switching ============ */
+.switch-message { color: var(--accent); font-size: 11px; margin-right: 10px; white-space: nowrap; }
+.task-switch-overlay {
+  position: fixed; inset: 54px 0 0; z-index: 45; display: flex; align-items: center;
+  justify-content: center; flex-direction: column; gap: 10px;
+  color: var(--text); background: rgba(13,17,23,.72); backdrop-filter: blur(2px);
+}
+.task-switch-overlay .loading-ring { margin: 0; }
+.evaluation-config-grid {
+  display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px 12px; margin-top: 10px;
+}
+.protocol-card {
+  margin-top: 16px; border: 1px solid #1f4b7a; border-radius: 7px;
+  background: linear-gradient(135deg, rgba(31,111,235,.10), rgba(22,27,34,.7));
+  padding: 12px; display: flex; flex-direction: column; gap: 5px;
+}
+.protocol-card b { color: var(--accent); }
+.protocol-card span, .protocol-card small { color: var(--muted); font-size: 11px; }
+.audit-controls { margin: 14px 0; }
+.failure-list {
+  margin-top: 12px; border-left: 3px solid var(--amber); padding: 9px 12px;
+  background: rgba(210,153,34,.07); font-size: 12px;
+}
+.failure-list ul { margin: 7px 0 0 18px; color: var(--muted); }
+.failure-list li { margin: 4px 0; }
+.grade-pill { display: inline-block; border: 1px solid var(--border); padding: 2px 9px; border-radius: 11px; font-weight: 700; }
+.grade-f5 { color: var(--green); }
+.grade-f4 { color: #79c0ff; }
+.grade-f3 { color: var(--amber); }
+.grade-low { color: var(--muted); }
+.provenance-dot { display: inline-block; margin-top: 4px; color: var(--red); font-size: 10px; cursor: help; }
+@media (max-width: 1100px) { .evaluation-config-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 700px) { .evaluation-config-grid { grid-template-columns: repeat(2, 1fr); } }

@@ -22,7 +22,15 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 
-from .config import DEFAULT_ENGINE_CONFIG, DEFAULT_ENGINE_CONFIG_V2, DEFAULT_HARNESS_SPEC, DEFAULT_MINER_TEMPLATE, DEFAULT_PORTFOLIO_MODE, get_dsl_fields
+from .config import (
+    DEFAULT_ENGINE_CONFIG,
+    DEFAULT_ENGINE_CONFIG_V2,
+    DEFAULT_HARNESS_SPEC,
+    DEFAULT_MINER_TEMPLATE,
+    DEFAULT_PORTFOLIO_MODE,
+    EVALUATION_PROTOCOL_VERSION,
+    get_dsl_fields,
+)
 from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
 from .dsl.engine import normalize_hash
@@ -62,6 +70,12 @@ class Engine:
 
     def _portfolio_mode(self) -> str:
         return self.task_config.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
+
+    def _signal_direction(self) -> int:
+        direction = int(self.task_config.get("direction", 1))
+        if direction not in {-1, 1}:
+            raise ValueError("研究任务 direction 必须为 1 或 -1")
+        return direction
 
     async def start(self, mode: str = "v1", experiment_id: int | None = None) -> dict:
         if self.running:
@@ -105,7 +119,7 @@ class Engine:
                     raise RuntimeError(f"实验「{exp.name}」已归档")
             self.status["experiment_id"] = self.exp_id
             await self.log(f"[V2] 引擎启动: 实验[{exp.name}] 外层可改写 MinerTemplate")
-            panel = PanelStore.get(self._panel_glob())
+            panel = PanelStore.get(self._panel_glob(), self.task_config.get("market", "us"))
             await asyncio.to_thread(panel.ensure_loaded)
             await self.log(f"面板就绪: {panel.summary()['rows']} 行 · {self.task_config.get('market', 'configured')}")
 
@@ -133,6 +147,7 @@ class Engine:
             inc_template, history, provider,
             market=self.task_config.get("market", "us"),
             portfolio_mode=self._portfolio_mode(),
+            direction=self._signal_direction(),
         )
 
         async with SessionLocal() as s:
@@ -275,9 +290,15 @@ class Engine:
                     evaluate, expr, task["universe_n"], task["horizon"],
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
                     self._panel_glob(), task.get("cost_bps", 15),
+                    self.task_config.get("market", "us"),
+                    self.task_config.get("evaluation_config"),
                 )
                 node.status = "ok"
-                node.public_metrics = metrics["public"]
+                node.public_metrics = {
+                    **metrics["public"],
+                    "discovery": metrics["discovery"],
+                    "protocol_version": metrics["protocol_version"],
+                }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["public"].get("score") or 0.0
                 gate_score = metrics["gate"].get("score") or 0.0
@@ -292,7 +313,11 @@ class Engine:
                     experiment_id=self.exp_id,
                     expression_hash=normalize_hash(expr) if node.status == "ok" else "invalid",
                     layer="INNER_PUBLIC+META_TRAIN", task_name=task["name"],
-                    statistic={"public_score": node.public_score, "seed": seed},
+                    statistic={
+                        "public_score": node.public_score,
+                        "seed": seed,
+                        "protocol_version": EVALUATION_PROTOCOL_VERSION,
+                    },
                 ))
                 await s.commit()
                 await s.refresh(node)
@@ -311,7 +336,8 @@ class Engine:
 
     async def _maybe_register_factor_v2(self, node: Node, min_icir: float) -> None:
         pm = node.public_metrics
-        if abs(pm.get("icir") or 0) < min_icir:
+        discovery = pm.get("discovery") or {}
+        if not discovery.get("passed") or (pm.get("icir") or 0) < min_icir:
             return
         async with SessionLocal() as s:
             exists = await s.scalar(select(Factor).where(
@@ -325,6 +351,15 @@ class Engine:
                 name=f"F{n + 1:05d}", expression=node.expression, hypothesis=node.hypothesis,
                 status="public-leading", node_id=node.id, task_name=node.task_name,
                 public_metrics=node.public_metrics, gate_metrics=node.gate_metrics,
+                evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                lifecycle_stage="research_pass",
+                provenance_status="valid_task_config",
+                research_meta={
+                    "policy_label": "NON_PIT_RESEARCH",
+                    "market": self.task_config.get("market", "us"),
+                    "portfolio_mode": self._portfolio_mode(),
+                    "direction": self._signal_direction(),
+                },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
                     "source": node.source, "expr_hash": normalize_hash(node.expression),
@@ -402,7 +437,12 @@ class Engine:
             task_cfg = self.task_config.get("engine_config", {})
             cfg.update(task_cfg)
             cfg["tasks"] = [
-                {"market": self.task_config.get("market", "us"), **t, "mode": self._portfolio_mode()}
+                {
+                    "market": self.task_config.get("market", "us"),
+                    **t,
+                    "mode": self._portfolio_mode(),
+                    "direction": self._signal_direction(),
+                }
                 for t in cfg.get("tasks", [])
             ]
             return cfg
@@ -421,8 +461,11 @@ class Engine:
                     raise RuntimeError(f"实验「{exp.name}」已归档, 请先切换到开放实验")
             self.status["experiment_id"] = self.exp_id
             await self.log(f"引擎启动: 实验[{exp.name}] 加载数据面板...")
-            await asyncio.to_thread(PanelStore.get().ensure_loaded)
-            await self.log(f"面板就绪: {PanelStore.get().summary()['rows']} 行")
+            panel = PanelStore.get(self._panel_glob(), self.task_config.get("market", "us"))
+            await asyncio.to_thread(panel.ensure_loaded)
+            await self.log(
+                f"面板就绪: {panel.summary()['rows']} 行 · {self.task_config.get('market', 'configured')}"
+            )
             incumbent = await self._ensure_incumbent()
             self.status["state"] = "running"
             cfg = await self._config()
@@ -512,9 +555,15 @@ class Engine:
                     evaluate, expr, task["universe_n"], task["horizon"],
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
                     self._panel_glob(), task.get("cost_bps", 15),
+                    self.task_config.get("market", "us"),
+                    self.task_config.get("evaluation_config"),
                 )
                 node.status = "ok"
-                node.public_metrics = metrics["public"]
+                node.public_metrics = {
+                    **metrics["public"],
+                    "discovery": metrics["discovery"],
+                    "protocol_version": metrics["protocol_version"],
+                }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["public"].get("score") or 0.0
                 gate_score = metrics["gate"].get("score") or 0.0
@@ -528,7 +577,10 @@ class Engine:
                     experiment_id=self.exp_id,
                     expression_hash=normalize_hash(expr) if node.status == "ok" else "invalid",
                     layer="INNER_PUBLIC+META_TRAIN", task_name=task["name"],
-                    statistic={"public_score": node.public_score},
+                    statistic={
+                        "public_score": node.public_score,
+                        "protocol_version": EVALUATION_PROTOCOL_VERSION,
+                    },
                 ))
                 await s.commit()
                 await s.refresh(node)
@@ -546,7 +598,8 @@ class Engine:
 
     async def _maybe_register_factor(self, node: Node, spec: dict) -> None:
         pm = node.public_metrics
-        if abs(pm.get("icir") or 0) < float(spec.get("min_public_icir", 0.25)):
+        discovery = pm.get("discovery") or {}
+        if not discovery.get("passed") or (pm.get("icir") or 0) < float(spec.get("min_public_icir", 0.25)):
             return
         async with SessionLocal() as s:
             exists = await s.scalar(select(Factor).where(
@@ -560,6 +613,15 @@ class Engine:
                 name=f"F{n + 1:05d}", expression=node.expression, hypothesis=node.hypothesis,
                 status="public-leading", node_id=node.id, task_name=node.task_name,
                 public_metrics=node.public_metrics, gate_metrics=node.gate_metrics,
+                evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                lifecycle_stage="research_pass",
+                provenance_status="valid_task_config",
+                research_meta={
+                    "policy_label": "NON_PIT_RESEARCH",
+                    "market": self.task_config.get("market", "us"),
+                    "portfolio_mode": self._portfolio_mode(),
+                    "direction": self._signal_direction(),
+                },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
                     "source": node.source, "expr_hash": normalize_hash(node.expression),
@@ -645,7 +707,15 @@ class Engine:
             row = await s.get(Setting, "engine_config")
             cfg = {**DEFAULT_ENGINE_CONFIG, **(row.value if row else {})}
             cfg.update(self.task_config.get("engine_config", {}))
-            cfg["tasks"] = [{"market": self.task_config.get("market", "us"), **t, "mode": self._portfolio_mode()} for t in cfg.get("tasks", [])]
+            cfg["tasks"] = [
+                {
+                    "market": self.task_config.get("market", "us"),
+                    **t,
+                    "mode": self._portfolio_mode(),
+                    "direction": self._signal_direction(),
+                }
+                for t in cfg.get("tasks", [])
+            ]
             return cfg
 
 
@@ -670,15 +740,32 @@ class EngineManager:
     def worker(self, experiment_id: int) -> Engine | None:
         return self.workers.get(experiment_id)
 
-    def status_for(self, experiment_id: int) -> dict:
+    def status_for(self, experiment_id: int, include_logs: bool = True) -> dict:
         worker = self.workers.get(experiment_id)
         if worker:
-            return worker.status | {"mode": worker._mode, "logs": list(worker.logbuf), "task_config": worker.task_config}
-        return {"state": "stopped", "outer_step": 0, "inner_evals": 0,
-                "experiment_id": experiment_id, "mode": None, "logs": []}
+            result = worker.status | {
+                "mode": worker._mode,
+                "task_config": worker.task_config,
+            }
+            if include_logs:
+                result["logs"] = list(worker.logbuf)
+            return result
+        result = {
+            "state": "stopped",
+            "outer_step": 0,
+            "inner_evals": 0,
+            "experiment_id": experiment_id,
+            "mode": None,
+        }
+        if include_logs:
+            result["logs"] = []
+        return result
 
-    def all_status(self) -> list[dict]:
-        return [self.status_for(eid) for eid in sorted(self.workers)]
+    def all_status(self, include_logs: bool = False) -> list[dict]:
+        return [
+            self.status_for(eid, include_logs=include_logs)
+            for eid in sorted(self.workers)
+        ]
 
     async def start(self, mode: str = "v2", experiment_id: int | None = None) -> dict:
         eid = experiment_id or await get_active_experiment_id()

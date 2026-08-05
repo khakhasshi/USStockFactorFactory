@@ -30,13 +30,29 @@ def default_panel_glob(market: str | None = None) -> str:
     return PANEL_GLOB
 
 # ---- 四级数据隔离边界 ----
-if _MARKET == "ashare":
-    LAYER_BOUNDS = {
+MARKET_LAYER_BOUNDS = {
+    "ashare": {
         "INNER_PUBLIC": ("2010-01-01", "2019-12-31"),
         "META_TRAIN": ("2020-01-01", "2022-12-31"),
         "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
         "FACTOR_VAULT": ("2025-01-01", "2026-08-04"),
-    }
+    },
+    "us": {
+        "INNER_PUBLIC": ("2010-06-01", "2019-12-31"),
+        "META_TRAIN": ("2020-01-01", "2022-12-31"),
+        "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
+        "FACTOR_VAULT": ("2025-01-01", "2026-08-04"),
+    },
+}
+LAYER_BOUNDS = MARKET_LAYER_BOUNDS[_MARKET]
+
+
+def get_layer_bounds(market: str | None = None) -> dict[str, tuple[str, str]]:
+    """Return immutable chronological splits for one task market."""
+    return dict(MARKET_LAYER_BOUNDS.get(market or _MARKET, MARKET_LAYER_BOUNDS["us"]))
+
+
+if _MARKET == "ashare":
     # A股 DSL 字段: 价量 + 估值 + 市值 + 流动性 + 资金流向
     DSL_FIELDS = [
         # 价量
@@ -57,12 +73,6 @@ if _MARKET == "ashare":
     ASHARE_DSL_FIELDS = DSL_FIELDS
     US_DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
 else:
-    LAYER_BOUNDS = {
-        "INNER_PUBLIC": ("2010-06-01", "2019-12-31"),
-        "META_TRAIN": ("2020-01-01", "2022-12-31"),
-        "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
-        "FACTOR_VAULT": ("2025-01-01", "2026-07-31"),
-    }
     DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
     US_DSL_FIELDS = DSL_FIELDS
     ASHARE_DSL_FIELDS = [
@@ -77,6 +87,124 @@ else:
 def get_dsl_fields(market: str | None = None) -> list[str]:
     """Return fields for a task, independent of the process-wide default market."""
     return list(ASHARE_DSL_FIELDS if market == "ashare" else US_DSL_FIELDS if market == "us" else DSL_FIELDS)
+
+
+# ---- Evaluation Protocol V3 ----
+# These are research/execution-readiness defaults.  PIT is deliberately not part
+# of this score; the API keeps the panel's NON_PIT label visible separately.
+EVALUATION_PROTOCOL_VERSION = "v3.0"
+DEFAULT_EVALUATION_CONFIG = {
+    "protocol_version": EVALUATION_PROTOCOL_VERSION,
+    "top_fraction": 0.20,
+    "tail_fraction": 0.20,
+    "min_coverage": 0.70,
+    "min_layer_days": 120,
+    "min_research_score": 1.00,
+    "min_oos_sharpe": 0.50,
+    "min_stress_sharpe": 0.00,
+    "max_hac_p_value": 0.10,
+    "min_era_consistency": 0.60,
+    "min_monotonicity": 0.35,
+    "max_drawdown": 0.35,
+    "max_market_beta_long_short": 0.35,
+    "max_daily_turnover": {"ashare": 0.35, "us": 0.50},
+    "base_cost_bps": {"ashare": 20.0, "us": 15.0},
+    "stress_cost_bps": {"ashare": [10.0, 20.0, 35.0, 50.0], "us": [5.0, 15.0, 25.0, 40.0]},
+    "borrow_cost_bps_annual": {"ashare": 0.0, "us": 300.0},
+    "stress_borrow_cost_bps_annual": {"ashare": 0.0, "us": 600.0},
+    "target_capital": {"ashare": 10_000_000.0, "us": 1_000_000.0},
+    "max_adv_participation": 0.05,
+}
+
+
+def evaluation_config(market: str, overrides: dict | None = None) -> dict:
+    """Resolve market-specific V3 settings while preserving a serialisable snapshot."""
+    if market not in {"ashare", "us"}:
+        raise ValueError("market 必须是 ashare 或 us")
+    src = DEFAULT_EVALUATION_CONFIG
+    cfg = {
+        "protocol_version": src["protocol_version"],
+        "top_fraction": src["top_fraction"],
+        "tail_fraction": src["tail_fraction"],
+        "min_coverage": src["min_coverage"],
+        "min_layer_days": src["min_layer_days"],
+        "min_research_score": src["min_research_score"],
+        "min_oos_sharpe": src["min_oos_sharpe"],
+        "min_stress_sharpe": src["min_stress_sharpe"],
+        "max_hac_p_value": src["max_hac_p_value"],
+        "min_era_consistency": src["min_era_consistency"],
+        "min_monotonicity": src["min_monotonicity"],
+        "max_drawdown": src["max_drawdown"],
+        "max_market_beta_long_short": src["max_market_beta_long_short"],
+        "max_daily_turnover": src["max_daily_turnover"][market],
+        "base_cost_bps": src["base_cost_bps"][market],
+        "stress_cost_bps": list(src["stress_cost_bps"][market]),
+        "borrow_cost_bps_annual": src["borrow_cost_bps_annual"][market],
+        "stress_borrow_cost_bps_annual": src["stress_borrow_cost_bps_annual"][market],
+        "target_capital": src["target_capital"][market],
+        "max_adv_participation": src["max_adv_participation"],
+    }
+    cfg.update(overrides or {})
+    for key in (
+        "top_fraction",
+        "tail_fraction",
+        "min_coverage",
+        "min_research_score",
+        "min_oos_sharpe",
+        "min_stress_sharpe",
+        "max_hac_p_value",
+        "min_era_consistency",
+        "min_monotonicity",
+        "max_drawdown",
+        "max_market_beta_long_short",
+        "max_daily_turnover",
+        "base_cost_bps",
+        "borrow_cost_bps_annual",
+        "stress_borrow_cost_bps_annual",
+        "target_capital",
+        "max_adv_participation",
+    ):
+        try:
+            cfg[key] = float(cfg[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"evaluation_config.{key} 必须是数值") from exc
+    try:
+        cfg["min_layer_days"] = int(cfg["min_layer_days"])
+        cfg["stress_cost_bps"] = [float(value) for value in cfg["stress_cost_bps"]]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("evaluation_config 的样本天数或压力成本格式错误") from exc
+    if not 0 < cfg["top_fraction"] <= 0.5 or not 0 < cfg["tail_fraction"] <= 0.5:
+        raise ValueError("top_fraction/tail_fraction 必须在 (0, 0.5] 内")
+    if not 0 < cfg["min_coverage"] <= 1:
+        raise ValueError("min_coverage 必须在 (0, 1] 内")
+    if not 0 <= cfg["max_hac_p_value"] <= 1:
+        raise ValueError("max_hac_p_value 必须在 [0, 1] 内")
+    if not 0 <= cfg["min_era_consistency"] <= 1:
+        raise ValueError("min_era_consistency 必须在 [0, 1] 内")
+    if not -1 <= cfg["min_monotonicity"] <= 1:
+        raise ValueError("min_monotonicity 必须在 [-1, 1] 内")
+    if not 0 < cfg["max_drawdown"] <= 1:
+        raise ValueError("max_drawdown 必须在 (0, 1] 内")
+    if cfg["max_daily_turnover"] <= 0:
+        raise ValueError("max_daily_turnover 必须为正数")
+    if cfg["target_capital"] <= 0:
+        raise ValueError("target_capital 必须为正数")
+    if not 0 < cfg["max_adv_participation"] <= 1:
+        raise ValueError("max_adv_participation 必须在 (0, 1] 内")
+    if cfg["min_layer_days"] < 30:
+        raise ValueError("min_layer_days 不能少于 30")
+    if not cfg["stress_cost_bps"] or any(value < 0 for value in cfg["stress_cost_bps"]):
+        raise ValueError("stress_cost_bps 必须是非负数列表")
+    for key in (
+        "base_cost_bps",
+        "borrow_cost_bps_annual",
+        "stress_borrow_cost_bps_annual",
+        "max_market_beta_long_short",
+    ):
+        if cfg[key] < 0:
+            raise ValueError(f"{key} 不能为负数")
+    cfg["protocol_version"] = EVALUATION_PROTOCOL_VERSION
+    return cfg
 
 # ---- 旧版 HarnessSpec (保留兼容, A组运行中) ----
 DEFAULT_HARNESS_SPEC = {
