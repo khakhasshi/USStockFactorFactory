@@ -1,11 +1,13 @@
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import polars as pl
 
@@ -233,6 +235,9 @@ class ObservabilityTests(unittest.TestCase):
                     "heartbeat_stale": True,
                     "heartbeat_age_seconds": 600,
                     "phase": "factor_evaluation",
+                    "evaluation_deadline_exceeded": True,
+                    "evaluation_elapsed_seconds": 601,
+                    "evaluation_soft_deadline_seconds": 180,
                     "task_done": False,
                     "task_exception": None,
                 },
@@ -261,6 +266,7 @@ class ObservabilityTests(unittest.TestCase):
             "event_loop_lag",
             "panel_contract_error",
             "worker_heartbeat_stale",
+            "worker_evaluation_slow",
             "worker_failed",
         }.issubset(codes))
         self.assertEqual(overall_health(findings), "unhealthy")
@@ -380,6 +386,62 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(slo["status"], "pass")
         self.assertEqual(slo["failed"], 0)
         self.assertEqual(len(slo["objectives"]), 7)
+
+
+class EngineHeartbeatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blocking_evaluation_emits_heartbeats_and_runtime(self):
+        engine = Engine()
+
+        def slow_result():
+            time.sleep(0.065)
+            return {"ok": True}
+
+        with patch.dict(os.environ, {
+            "FF_EVALUATION_HEARTBEAT_SECONDS": "0.01",
+            "FF_EVALUATION_SOFT_DEADLINE_SECONDS": "0.02",
+        }):
+            result = await engine._run_blocking_with_heartbeat(slow_result)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertFalse(engine.status["evaluation_active"])
+        self.assertGreaterEqual(
+            engine.status["evaluation_heartbeat_count"],
+            2,
+        )
+        self.assertTrue(engine.status["evaluation_deadline_exceeded"])
+        self.assertGreaterEqual(
+            engine.status["last_evaluation_duration_seconds"],
+            0.05,
+        )
+
+    async def test_cancellation_waits_for_blocking_evaluation_to_drain(self):
+        engine = Engine()
+        completed: list[bool] = []
+
+        def slow_result():
+            time.sleep(0.06)
+            completed.append(True)
+
+        with patch.dict(os.environ, {
+            "FF_EVALUATION_HEARTBEAT_SECONDS": "0.01",
+            "FF_EVALUATION_SOFT_DEADLINE_SECONDS": "0.02",
+        }):
+            task = asyncio.create_task(
+                engine._run_blocking_with_heartbeat(slow_result)
+            )
+            await asyncio.sleep(0.015)
+            cancelled_at = time.monotonic()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(completed, [True])
+        self.assertGreaterEqual(time.monotonic() - cancelled_at, 0.03)
+        self.assertFalse(engine.status["evaluation_active"])
+        self.assertEqual(
+            engine.status["current_operation"],
+            "factor_evaluation_draining",
+        )
 
 
 if __name__ == "__main__":

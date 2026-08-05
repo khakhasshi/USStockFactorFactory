@@ -21,6 +21,7 @@ this protocol, not production approval.
 from __future__ import annotations
 
 import math
+import time
 from statistics import NormalDist
 
 import polars as pl
@@ -286,32 +287,28 @@ def _market_exposure(
     }
 
 
-def _prepare_daily(
+def _prepare_factor_base(
     expression: str,
     universe_n: int,
     horizon: int,
-    portfolio_mode: str,
-    direction: int,
     panel_glob: str | None,
     market: str,
     layers: list[str],
-    cfg: dict,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    if portfolio_mode not in {"long_only", "long_short"}:
-        raise ValueError("portfolio_mode 必须是 long_only 或 long_short")
-    if direction not in {-1, 1}:
-        raise ValueError("direction 必须在训练阶段冻结为 1 或 -1")
+) -> tuple[pl.LazyFrame, str]:
+    """Build the direction-neutral part of one factor evaluation.
+
+    This lazy sub-plan is shared by all tested orientations.  The explicit
+    cache is consumed by one collect_all call, ensuring the DSL expression,
+    cross-sectional factor rank, and forward-return rank are materialised only
+    once even when both +1 and -1 are evaluated.
+    """
     panel = PanelStore.get(panel_glob, market)
     df = panel.ensure_loaded()
     fwd = f"fwd_{horizon}"
     if fwd not in df.columns:
         raise ValueError(f"不支持的 horizon: {horizon}")
     pipe = parse(expression, get_dsl_fields(market))
-    top_fraction = float(cfg["top_fraction"])
-    tail_fraction = float(cfg["tail_fraction"])
-    target_capital = float(cfg["target_capital"])
-
-    work = (
+    base = (
         pipe.apply(df.lazy().filter(pl.col("layer").is_in(layers)))
         .filter((pl.col("univ_rank") <= universe_n) & pl.col(fwd).is_finite())
         .with_columns(pl.len().over("trade_date").alias("_eligible_n"))
@@ -323,18 +320,50 @@ def _prepare_daily(
         .with_columns(
             (pl.col("_factor_rank") / pl.col("_factor_rank").count().over("trade_date")).alias("_factor_pct")
         )
-        .with_columns(
-            (
-                pl.col("_factor_pct")
-                if direction > 0
-                else 1.0 - pl.col("_factor_pct")
-            ).alias("_signal_pct")
-        )
         # fwd_h observations overlap on adjacent dates.  Portfolio statistics
         # therefore use one deterministic, non-overlapping rebalance cohort.
         # This also makes weight turnover an h-day rebalance turnover.
         .with_columns(
             pl.col("trade_date").rank(method="dense").over("layer").alias("_date_seq")
+        )
+        .select(
+            "trade_date",
+            "layer",
+            "era",
+            "ts_code",
+            fwd,
+            "amount",
+            "_eligible_n",
+            "_return_rank",
+            "_factor_pct",
+            "_date_seq",
+        )
+        .cache()
+    )
+    return base, fwd
+
+
+def _prepare_direction_work(
+    base: pl.LazyFrame,
+    horizon: int,
+    portfolio_mode: str,
+    direction: int,
+    cfg: dict,
+) -> pl.LazyFrame:
+    if portfolio_mode not in {"long_only", "long_short"}:
+        raise ValueError("portfolio_mode 必须是 long_only 或 long_short")
+    if direction not in {-1, 1}:
+        raise ValueError("direction 必须在训练阶段冻结为 1 或 -1")
+    top_fraction = float(cfg["top_fraction"])
+    tail_fraction = float(cfg["tail_fraction"])
+    target_capital = float(cfg["target_capital"])
+    return (
+        base.with_columns(
+            (
+                pl.col("_factor_pct")
+                if direction > 0
+                else 1.0 - pl.col("_factor_pct")
+            ).alias("_signal_pct")
         )
         .filter(((pl.col("_date_seq") - 1) % horizon) == 0)
         .with_columns(
@@ -398,7 +427,16 @@ def _prepare_daily(
                 / pl.when(pl.col("amount") > 0).then(pl.col("amount")).otherwise(None)
             ).alias("_adv_participation")
         )
+        .cache()
     )
+
+
+def _direction_aggregates(
+    work: pl.LazyFrame,
+    fwd: str,
+    portfolio_mode: str,
+    target_capital: float,
+) -> tuple[pl.LazyFrame, pl.LazyFrame]:
     target_gross = 1.0 if portfolio_mode == "long_only" else 2.0
     daily_lazy = (
         work.group_by("trade_date", "layer", "era")
@@ -474,10 +512,114 @@ def _prepare_daily(
         .agg(pl.col(fwd).mean().alias("mean_return"), pl.len().alias("observations"))
         .sort("layer", "_decile")
     )
-    daily, deciles = pl.collect_all([daily_lazy, decile_lazy])
-    if daily.height == 0:
-        raise ValueError("有效评估样本为空：表达式可能全为 null、常数或覆盖率不足")
-    return daily, deciles
+    return daily_lazy, decile_lazy
+
+
+def _collect_direction_frames(
+    base: pl.LazyFrame,
+    fwd: str,
+    horizon: int,
+    portfolio_mode: str,
+    directions: list[int],
+    cfg: dict,
+) -> dict[int, tuple[pl.DataFrame, pl.DataFrame]]:
+    lazy_frames: list[pl.LazyFrame] = []
+    for direction in directions:
+        work = _prepare_direction_work(
+            base,
+            horizon,
+            portfolio_mode,
+            direction,
+            cfg,
+        )
+        daily_lazy, decile_lazy = _direction_aggregates(
+            work,
+            fwd,
+            portfolio_mode,
+            float(cfg["target_capital"]),
+        )
+        lazy_frames.extend([daily_lazy, decile_lazy])
+
+    # collect_all performs common-subplan elimination across every orientation.
+    # The direction-neutral cache above therefore executes exactly once.
+    # Common-subplan and common-subexpression elimination are enabled in the
+    # Polars default optimization set used by collect_all.
+    frames = pl.collect_all(lazy_frames)
+    output: dict[int, tuple[pl.DataFrame, pl.DataFrame]] = {}
+    for index, direction in enumerate(directions):
+        daily = frames[index * 2]
+        deciles = frames[index * 2 + 1]
+        if daily.height == 0:
+            raise ValueError(
+                "有效评估样本为空：表达式可能全为 null、常数或覆盖率不足"
+            )
+        output[direction] = (daily, deciles)
+    return output
+
+
+def _prepare_direction_batch(
+    expression: str,
+    universe_n: int,
+    horizon: int,
+    portfolio_mode: str,
+    directions: list[int],
+    panel_glob: str | None,
+    market: str,
+    layers: list[str],
+    cfg: dict,
+) -> tuple[dict[int, tuple[pl.DataFrame, pl.DataFrame]], dict]:
+    started = time.perf_counter()
+    base, fwd = _prepare_factor_base(
+        expression,
+        universe_n,
+        horizon,
+        panel_glob,
+        market,
+        layers,
+    )
+    planned = time.perf_counter()
+    frames = _collect_direction_frames(
+        base,
+        fwd,
+        horizon,
+        portfolio_mode,
+        directions,
+        cfg,
+    )
+    finished = time.perf_counter()
+    return frames, {
+        "factor_plan_ms": round((planned - started) * 1000.0, 3),
+        "factor_and_portfolio_ms": round((finished - planned) * 1000.0, 3),
+        "total_ms": round((finished - started) * 1000.0, 3),
+        "direction_count": len(directions),
+        "factor_materializations": 1,
+        "execution": "polars_native_shared_subplan",
+    }
+
+
+def _prepare_daily(
+    expression: str,
+    universe_n: int,
+    horizon: int,
+    portfolio_mode: str,
+    direction: int,
+    panel_glob: str | None,
+    market: str,
+    layers: list[str],
+    cfg: dict,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    frames, _ = _prepare_direction_batch(
+        expression,
+        universe_n,
+        horizon,
+        portfolio_mode,
+        [direction],
+        panel_glob,
+        market,
+        layers,
+        cfg,
+    )
+    return frames[direction]
 
 
 def _layer_metrics(
@@ -1185,7 +1327,7 @@ def _evaluate_discovery_orientations(
     market: str,
     evaluation_overrides: dict | None,
     direction_policy: str,
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """Select direction using training-safe layers only.
 
     The effective multiple-testing budget is doubled when both signs are
@@ -1209,20 +1351,41 @@ def _evaluate_discovery_orientations(
         if policy == DIRECTION_POLICY_BOTH
         else [preferred_direction]
     )
+    cfg = evaluation_config(market, effective_overrides)
+    if cost_bps is not None:
+        cfg["base_cost_bps"] = float(cost_bps)
+        if float(cost_bps) not in cfg["stress_cost_bps"]:
+            cfg["stress_cost_bps"] = sorted({
+                *cfg["stress_cost_bps"],
+                float(cost_bps),
+            })
+    direction_frames, runtime = _prepare_direction_batch(
+        expression,
+        universe_n,
+        horizon,
+        portfolio_mode,
+        directions,
+        panel_glob,
+        market,
+        DISCOVERY_LAYERS,
+        cfg,
+    )
+    metrics_started = time.perf_counter()
     candidates: list[dict] = []
     for candidate_direction in directions:
-        layers, cfg = _evaluate_layers(
-            expression,
-            universe_n,
-            horizon,
-            portfolio_mode,
-            candidate_direction,
-            panel_glob,
-            cost_bps,
-            market,
-            DISCOVERY_LAYERS,
-            effective_overrides,
-        )
+        daily, deciles = direction_frames[candidate_direction]
+        layers = {
+            LAYER_ALIASES[layer]: _layer_metrics(
+                daily,
+                deciles,
+                layer,
+                horizon,
+                portfolio_mode,
+                candidate_direction,
+                cfg,
+            )
+            for layer in DISCOVERY_LAYERS
+        }
         discovery = _discovery_score(
             layers["public"],
             layers["gate"],
@@ -1285,7 +1448,20 @@ def _evaluate_discovery_orientations(
         "selected_direction": selected_direction,
         "direction_selection": selection,
     }
-    return selected["layers"], selected["cfg"], discovery
+    metrics_finished = time.perf_counter()
+    runtime = {
+        **runtime,
+        "metrics_ms": round(
+            (metrics_finished - metrics_started) * 1000.0,
+            3,
+        ),
+        "total_ms": round(
+            runtime["total_ms"]
+            + (metrics_finished - metrics_started) * 1000.0,
+            3,
+        ),
+    }
+    return selected["layers"], selected["cfg"], discovery, runtime
 
 
 def evaluate(
@@ -1301,7 +1477,7 @@ def evaluate(
     direction_policy: str = DIRECTION_POLICY_BOTH,
 ) -> dict:
     """Mining-safe discovery evaluation with training-only sign selection."""
-    layers, cfg, discovery = _evaluate_discovery_orientations(
+    layers, cfg, discovery, runtime = _evaluate_discovery_orientations(
         expression,
         universe_n,
         horizon,
@@ -1337,6 +1513,7 @@ def evaluate(
         "public": layers["public"],
         "gate": layers["gate"],
         "discovery": discovery,
+        "runtime": runtime,
         "ranking_policy": (
             "连续学习分仅供 Miner；硬门槛独立；方向只在训练安全层选择并冻结"
         ),
@@ -1356,19 +1533,23 @@ def evaluate_full(
     direction_policy: str = DIRECTION_POLICY_BOTH,
 ) -> dict:
     """Explicit four-layer audit with direction frozen before validation."""
-    discovery_layers, cfg, discovery = _evaluate_discovery_orientations(
-        expression,
-        universe_n,
-        horizon,
-        portfolio_mode,
-        direction,
-        panel_glob,
-        cost_bps,
-        market,
-        evaluation_overrides,
-        direction_policy,
+    full_started = time.perf_counter()
+    discovery_layers, cfg, discovery, discovery_runtime = (
+        _evaluate_discovery_orientations(
+            expression,
+            universe_n,
+            horizon,
+            portfolio_mode,
+            direction,
+            panel_glob,
+            cost_bps,
+            market,
+            evaluation_overrides,
+            direction_policy,
+        )
     )
     selected_direction = int(discovery["selected_direction"])
+    validation_started = time.perf_counter()
     validation_layers, _ = _evaluate_layers(
         expression,
         universe_n,
@@ -1381,6 +1562,7 @@ def evaluate_full(
         ["META_HOLDOUT", "FACTOR_VAULT"],
         cfg,
     )
+    validation_finished = time.perf_counter()
     layers = {
         **discovery_layers,
         **validation_layers,
@@ -1419,6 +1601,17 @@ def evaluate_full(
         "discovery": discovery,
         "eligibility": eligibility,
         "ranking": ranking,
+        "runtime": {
+            "discovery": discovery_runtime,
+            "validation_ms": round(
+                (validation_finished - validation_started) * 1000.0,
+                3,
+            ),
+            "total_ms": round(
+                (time.perf_counter() - full_started) * 1000.0,
+                3,
+            ),
+        },
     }
 
 

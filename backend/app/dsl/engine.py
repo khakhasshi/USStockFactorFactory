@@ -55,13 +55,6 @@ OPERATORS_DOC = {
 }
 
 
-def _percentile_of_last(s: pl.Series) -> float | None:
-    last = s[-1]
-    if last is None:
-        return None
-    return float((s <= last).sum()) / len(s)
-
-
 class FactorPipeline:
     """有序临时列阶段 + 最终表达式; apply 后临时列被丢弃."""
 
@@ -155,7 +148,21 @@ class _Builder:
             arity(2)
             w = _win(a[1])
             x = self.build(a[0])
-            return self._mat(_ts(x.rolling_map(_percentile_of_last, w, min_samples=w)))
+            # The former rolling_map callback calculated
+            # count(window <= current) / window_size.  Native rolling_rank
+            # with max-tie ranking is exactly that statistic, while remaining
+            # inside Polars' vectorised engine instead of invoking Python once
+            # for every security-date window.
+            return self._mat(
+                _ts(
+                    x.rolling_rank(
+                        w,
+                        method="max",
+                        min_samples=w,
+                    )
+                    / float(w)
+                )
+            )
         if fn == "ts_corr":
             arity(3)
             w = _win(a[2])

@@ -81,6 +81,13 @@ class Engine:
             "current_seed": None,
             "current_budget_index": None,
             "current_budget_total": None,
+            "evaluation_active": False,
+            "evaluation_started_at": None,
+            "evaluation_elapsed_seconds": None,
+            "evaluation_heartbeat_count": 0,
+            "evaluation_soft_deadline_seconds": None,
+            "evaluation_deadline_exceeded": False,
+            "last_evaluation_duration_seconds": None,
         }
         self._started_monotonic: float | None = None
         self._last_heartbeat_monotonic = time.monotonic()
@@ -107,6 +114,110 @@ class Engine:
 
     def _touch_progress(self, **detail) -> None:
         self._set_phase(self.status.get("phase") or "running", progress=True, **detail)
+
+    async def _run_blocking_with_heartbeat(
+        self,
+        func,
+        *args,
+        operation: str = "factor_evaluation",
+    ):
+        """Run CPU-bound work without making a healthy worker look dead.
+
+        Cancellation is drained before the research task reports itself
+        stopped.  Python cannot safely kill a running thread; waiting here
+        avoids the previous state where the UI said "stopped" while Polars was
+        still consuming CPU in an orphaned evaluation.
+        """
+        try:
+            heartbeat_seconds = max(
+                0.01,
+                float(os.environ.get("FF_EVALUATION_HEARTBEAT_SECONDS", "15")),
+            )
+        except ValueError:
+            heartbeat_seconds = 15.0
+        try:
+            soft_deadline_seconds = max(
+                heartbeat_seconds,
+                float(os.environ.get("FF_EVALUATION_SOFT_DEADLINE_SECONDS", "180")),
+            )
+        except ValueError:
+            soft_deadline_seconds = 180.0
+
+        started = time.monotonic()
+        started_at = utc_now()
+        heartbeat_count = 0
+        evaluation_task = asyncio.create_task(
+            asyncio.to_thread(func, *args),
+            name=f"research.evaluation.{self.exp_id}",
+        )
+        self._set_phase(
+            self.status.get("phase") or "candidate_mining",
+            current_operation=operation,
+            evaluation_active=True,
+            evaluation_started_at=started_at,
+            evaluation_elapsed_seconds=0.0,
+            evaluation_heartbeat_count=0,
+            evaluation_soft_deadline_seconds=soft_deadline_seconds,
+            evaluation_deadline_exceeded=False,
+        )
+
+        async def wait_until_done(*, draining: bool = False):
+            nonlocal heartbeat_count
+            while True:
+                done, _ = await asyncio.wait(
+                    {evaluation_task},
+                    timeout=heartbeat_seconds,
+                )
+                elapsed = max(0.0, time.monotonic() - started)
+                if done:
+                    return elapsed
+                heartbeat_count += 1
+                self._set_phase(
+                    self.status.get("phase") or "candidate_mining",
+                    current_operation=(
+                        "factor_evaluation_draining"
+                        if draining
+                        else operation
+                    ),
+                    evaluation_active=True,
+                    evaluation_elapsed_seconds=round(elapsed, 3),
+                    evaluation_heartbeat_count=heartbeat_count,
+                    evaluation_deadline_exceeded=(
+                        elapsed >= soft_deadline_seconds
+                    ),
+                )
+
+        try:
+            elapsed = await wait_until_done()
+            return evaluation_task.result()
+        except asyncio.CancelledError:
+            # Keep the task alive and wait for the underlying thread.  This is
+            # intentionally truthful backpressure for the stop endpoint.
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation="factor_evaluation_draining",
+            )
+            elapsed = await wait_until_done(draining=True)
+            try:
+                evaluation_task.result()
+            except Exception:
+                # The candidate will not be persisted after cancellation, but
+                # the exception is consumed so asyncio does not report an
+                # unhandled background-task failure.
+                pass
+            raise
+        finally:
+            elapsed = max(0.0, time.monotonic() - started)
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                evaluation_active=False,
+                evaluation_elapsed_seconds=round(elapsed, 3),
+                evaluation_heartbeat_count=heartbeat_count,
+                evaluation_deadline_exceeded=(
+                    elapsed >= soft_deadline_seconds
+                ),
+                last_evaluation_duration_seconds=round(elapsed, 3),
+            )
 
     async def log(self, msg: str, level: str = "info") -> None:
         now = utc_now()
@@ -189,6 +300,12 @@ class Engine:
             "current_seed": None,
             "current_budget_index": None,
             "current_budget_total": None,
+            "evaluation_active": False,
+            "evaluation_started_at": None,
+            "evaluation_elapsed_seconds": None,
+            "evaluation_heartbeat_count": 0,
+            "evaluation_soft_deadline_seconds": None,
+            "evaluation_deadline_exceeded": False,
         })
         self._set_phase("starting", progress=True)
         self.task = asyncio.create_task(
@@ -642,7 +759,7 @@ class Engine:
                     self.status.get("phase") or "candidate_mining",
                     current_operation="factor_evaluation",
                 )
-                metrics = await asyncio.to_thread(
+                metrics = await self._run_blocking_with_heartbeat(
                     evaluate, expr, task["universe_n"], task["horizon"],
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
                     self._panel_glob(), task.get("cost_bps", 15),
@@ -658,6 +775,7 @@ class Engine:
                     **metrics["public"],
                     "discovery": metrics["discovery"],
                     "protocol_version": metrics["protocol_version"],
+                    "evaluation_runtime": metrics.get("runtime") or {},
                 }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["discovery"].get("score") or 0.0
@@ -714,6 +832,9 @@ class Engine:
                         "score_semantics": (
                             node.public_metrics.get("discovery") or {}
                         ).get("score_semantics"),
+                        "evaluation_runtime": (
+                            node.public_metrics.get("evaluation_runtime") or {}
+                        ),
                         "seed": seed,
                         "protocol_version": EVALUATION_PROTOCOL_VERSION,
                         "feedback_fingerprint": envelope[
@@ -1218,7 +1339,7 @@ class Engine:
                     self.status.get("phase") or "candidate_mining",
                     current_operation="factor_evaluation",
                 )
-                metrics = await asyncio.to_thread(
+                metrics = await self._run_blocking_with_heartbeat(
                     evaluate, expr, task["universe_n"], task["horizon"],
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
                     self._panel_glob(), task.get("cost_bps", 15),
@@ -1234,6 +1355,7 @@ class Engine:
                     **metrics["public"],
                     "discovery": metrics["discovery"],
                     "protocol_version": metrics["protocol_version"],
+                    "evaluation_runtime": metrics.get("runtime") or {},
                 }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["discovery"].get("score") or 0.0
@@ -1288,6 +1410,9 @@ class Engine:
                         "score_semantics": (
                             node.public_metrics.get("discovery") or {}
                         ).get("score_semantics"),
+                        "evaluation_runtime": (
+                            node.public_metrics.get("evaluation_runtime") or {}
+                        ),
                         "protocol_version": EVALUATION_PROTOCOL_VERSION,
                         "feedback_fingerprint": node.feedback_summary[
                             "feedback_fingerprint"

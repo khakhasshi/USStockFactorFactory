@@ -17,7 +17,7 @@ from app.config import (
     evaluation_config,
     get_dsl_fields,
 )
-from app.dsl.engine import validate
+from app.dsl.engine import parse, validate
 from app.eval.harness import _prepare_daily, evaluate, evaluate_full
 from app.miner.agent import _build_system_prompt
 from app.config import DEFAULT_MINER_TEMPLATE
@@ -204,6 +204,32 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertEqual(
             selection["effective_multiple_testing_trials"],
             2 * evaluation_config("ashare")["multiple_testing_trials"],
+        )
+
+    def test_both_directions_share_one_factor_plan(self):
+        with (
+            patch(
+                "app.eval.harness.PanelStore.get",
+                return_value=_SyntheticPanel(self.frame),
+            ),
+            patch("app.eval.harness.parse", wraps=parse) as parser,
+        ):
+            result = evaluate(
+                "rank(close)",
+                universe_n=100,
+                horizon=5,
+                portfolio_mode="long_only",
+                direction=1,
+                panel_glob="synthetic",
+                cost_bps=20,
+                market="ashare",
+            )
+        self.assertEqual(parser.call_count, 1)
+        self.assertEqual(result["runtime"]["direction_count"], 2)
+        self.assertEqual(result["runtime"]["factor_materializations"], 1)
+        self.assertEqual(
+            result["runtime"]["execution"],
+            "polars_native_shared_subplan",
         )
 
     def test_full_audit_freezes_direction_before_validation_layers(self):

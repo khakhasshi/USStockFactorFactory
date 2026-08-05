@@ -1083,6 +1083,17 @@ def build_findings(snapshot: dict) -> list[dict]:
                 f"阶段 {worker.get('phase')}，心跳年龄 {worker.get('heartbeat_age_seconds')} 秒",
                 "检查当前阶段耗时、最近日志、线程/CPU/内存以及面板或 LLM 调用。",
             )
+        if worker.get("running") and worker.get("evaluation_deadline_exceeded"):
+            add(
+                "warning",
+                "worker_evaluation_slow",
+                f"研究任务 {worker.get('experiment_id')} 单因子评价超出软时限",
+                (
+                    f"已运行 {worker.get('evaluation_elapsed_seconds')} 秒，"
+                    f"软时限 {worker.get('evaluation_soft_deadline_seconds')} 秒"
+                ),
+                "查看表达式算子、窗口、面板规模和评价 runtime 分解；任务仍有心跳且会安全排空。",
+            )
         if worker.get("task_done") and worker.get("task_exception"):
             add(
                 "critical",
