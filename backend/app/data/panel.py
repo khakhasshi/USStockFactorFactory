@@ -45,22 +45,24 @@ class PanelStore:
 
     def _load(self) -> pl.DataFrame:
         lf = pl.scan_parquet(PANEL_GLOB, hive_partitioning=True)
-        cols = [
+        base_cols = [
             "trade_date", "ts_code", "open", "high", "low", "close",
-            "vol", "amount", "raw_open", "is_tradable_observation",
-            "is_valid_ohlc", "is_security_identity_consistent",
+            "vol", "amount", "raw_open",
         ]
-        lf = (
-            lf.select(cols)
-            .filter(
-                pl.col("is_tradable_observation")
-                & pl.col("is_valid_ohlc")
-                & pl.col("is_security_identity_consistent")  # fail closed
-            )
-            .drop("is_tradable_observation", "is_valid_ohlc", "is_security_identity_consistent")
-            .with_columns(pl.col("trade_date").cast(pl.Date))
-            .sort("ts_code", "trade_date")
-        )
+        # 质量过滤列: A股数据可能缺少某些列, 按存在性自适应
+        available = set(lf.collect_schema().names())
+        quality_cols = []
+        for c in ["is_tradable_observation", "is_valid_ohlc", "is_security_identity_consistent"]:
+            if c in available:
+                quality_cols.append(c)
+        cols = base_cols + quality_cols
+
+        lf = lf.select(cols)
+        # 逐列过滤 (不存在的列跳过)
+        for qc in quality_cols:
+            lf = lf.filter(pl.col(qc))
+        lf = lf.drop(quality_cols) if quality_cols else lf
+        lf = lf.with_columns(pl.col("trade_date").cast(pl.Date)).sort("ts_code", "trade_date")
 
         by_code = {"partition_by": "ts_code", "order_by": "trade_date"}
         # 前向收益: t 日信号 -> t+1 开盘成交 -> t+1+h 开盘平仓 (前复权 open 口径)

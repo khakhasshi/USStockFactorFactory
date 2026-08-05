@@ -1,5 +1,7 @@
 import os
 
+_MARKET = os.environ.get("FF_MARKET", "us")  # "us" 或 "ashare"
+
 PORT = int(os.environ.get("FF_PORT", "9999"))
 DATABASE_URL = os.environ.get(
     "FF_DATABASE_URL",
@@ -11,16 +13,28 @@ PANEL_GLOB = os.environ.get(
     "processed/daily_panel/trade_year=*/data_0.parquet",
 )
 
-# 四级数据隔离边界 (ProtocolGeneration G1, 冻结)
-LAYER_BOUNDS = {
-    "INNER_PUBLIC": ("2010-06-01", "2019-12-31"),
-    "META_TRAIN": ("2020-01-01", "2022-12-31"),
-    "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
-    "FACTOR_VAULT": ("2025-01-01", "2026-07-31"),
-}
-
-# DSL 可见字段白名单 (仅前复权研究字段 + 量额)
-DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
+# ---- 四级数据隔离边界 ----
+if _MARKET == "ashare":
+    LAYER_BOUNDS = {
+        "INNER_PUBLIC": ("2010-01-01", "2019-12-31"),
+        "META_TRAIN": ("2020-01-01", "2022-12-31"),
+        "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
+        "FACTOR_VAULT": ("2025-01-01", "2026-08-04"),
+    }
+    # A股 DSL 字段: 价量 + 估值 + 市值
+    DSL_FIELDS = [
+        "open", "high", "low", "close", "vol", "amount",
+        "pe", "pe_ttm", "pb", "total_mv", "circ_mv",
+        "turnover_rate", "volume_ratio",
+    ]
+else:
+    LAYER_BOUNDS = {
+        "INNER_PUBLIC": ("2010-06-01", "2019-12-31"),
+        "META_TRAIN": ("2020-01-01", "2022-12-31"),
+        "META_HOLDOUT": ("2023-01-01", "2024-12-31"),
+        "FACTOR_VAULT": ("2025-01-01", "2026-07-31"),
+    }
+    DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
 
 # ---- 旧版 HarnessSpec (保留兼容, A组运行中) ----
 DEFAULT_HARNESS_SPEC = {
