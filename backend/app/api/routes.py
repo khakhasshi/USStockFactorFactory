@@ -1,12 +1,16 @@
 import asyncio
 from datetime import datetime
+from pathlib import Path
 
+import polars as pl
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from ..backtest.engine import run_backtest
 from ..config import (
+    BACKTEST_ARTIFACT_ROOT,
     DEFAULT_ENGINE_CONFIG,
     DEFAULT_EVALUATION_CONFIG,
     DEFAULT_PORTFOLIO_MODE,
@@ -18,12 +22,24 @@ from ..config import (
 )
 from ..data.panel import PanelStore
 from ..db import SessionLocal, get_active_experiment_id
-from ..dsl.engine import OPERATORS_DOC, parse, validate
+from ..dsl.engine import (
+    OPERATORS_DOC,
+    expression_profile,
+    parse,
+    validate,
+)
 from ..eval.harness import evaluate, evaluate_full
+from ..factors.similarity import (
+    build_similarity_index,
+    expression_fingerprint,
+    nearest_factors,
+)
 from ..models import Backtest, EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
 from ..orchestrator import EngineManager
+from ..screener import SCREEN_CACHE, screen_cross_section
 
 router = APIRouter(prefix="/api")
+_similarity_cache: dict[tuple[int, int, int, float], dict] = {}
 
 
 async def _experiment_context(experiment_id: int | None = None) -> tuple[int, dict]:
@@ -234,6 +250,78 @@ async def list_factors(
     }
 
 
+async def _factor_similarity_index(
+    experiment_id: int,
+    threshold: float = 0.64,
+) -> tuple[dict, list[dict]]:
+    async with SessionLocal() as s:
+        rows = (await s.scalars(
+            select(Factor)
+            .where(Factor.experiment_id == experiment_id)
+            .order_by(Factor.id)
+        )).all()
+    items = [
+        {
+            "id": factor.id,
+            "name": factor.name,
+            "expression": factor.expression,
+            "score": (factor.public_metrics or {}).get("score", 0),
+            "grade": (factor.eligibility or {}).get("grade"),
+            "lifecycle_stage": factor.lifecycle_stage,
+        }
+        for factor in rows
+    ]
+    key = (
+        experiment_id,
+        len(items),
+        max((item["id"] for item in items), default=0),
+        round(threshold, 4),
+    )
+    index = _similarity_cache.get(key)
+    if index is None:
+        index = await asyncio.to_thread(build_similarity_index, items, threshold)
+        _similarity_cache.clear()
+        _similarity_cache[key] = index
+    return index, items
+
+
+@router.get("/factors/similarity-groups")
+async def factor_similarity_groups(
+    experiment_id: int | None = None,
+    threshold: float = 0.64,
+    include_singletons: bool = True,
+):
+    eid = experiment_id or await get_active_experiment_id()
+    try:
+        index, _ = await _factor_similarity_index(eid, threshold)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    groups = index["groups"]
+    if not include_singletons:
+        groups = [group for group in groups if group["size"] > 1]
+    return {
+        "experiment_id": eid,
+        "groups": groups,
+        "stats": index["stats"],
+    }
+
+
+@router.get("/factors/{fid}/similar")
+async def similar_factors(fid: int, limit: int = 20):
+    async with SessionLocal() as s:
+        factor = await s.get(Factor, fid)
+    if not factor:
+        raise HTTPException(404, "因子不存在")
+    index, items = await _factor_similarity_index(factor.experiment_id)
+    nearest = await asyncio.to_thread(nearest_factors, items, fid, limit)
+    return {
+        "factor_id": fid,
+        "group_id": index["factor_to_group"].get(fid),
+        "similar": nearest,
+        "algorithm": index["stats"]["algorithm"],
+    }
+
+
 @router.get("/factors/{fid}/detail")
 async def factor_detail(fid: int):
     async with SessionLocal() as s:
@@ -270,9 +358,22 @@ async def factor_detail(fid: int):
     }
     # Detail reads are deliberately O(1).  Full four-layer evaluation is an
     # explicit POST /audit action and its result is persisted on the factor.
+    try:
+        dsl_profile = expression_profile(f.expression)
+        similarity_index, items = await _factor_similarity_index(f.experiment_id)
+        similar = await asyncio.to_thread(nearest_factors, items, f.id, 12)
+    except (SyntaxError, ValueError):
+        dsl_profile = {"latex": "", "operators": [], "fields": [], "windows": []}
+        similarity_index = {"factor_to_group": {}}
+        similar = []
     return {
         "factor": _factor_payload(f, include_validation=True),
         "audit_defaults": audit_defaults,
+        "dsl": dsl_profile,
+        "similarity": {
+            "group_id": similarity_index["factor_to_group"].get(f.id),
+            "nearest": similar,
+        },
     }
 
 
@@ -362,6 +463,10 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
         factor.lifecycle_stage = audit["eligibility"]["stage"]
         factor.provenance_status = provenance_status
         factor.evaluated_at = datetime.utcnow()
+        factor.fingerprint = {
+            **(factor.fingerprint or {}),
+            **expression_fingerprint(factor.expression),
+        }
         meta = dict(factor.research_meta or {})
         meta.update({
             "direction": direction,
@@ -383,6 +488,7 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
         ))
         await s.commit()
         await s.refresh(factor)
+    _similarity_cache.clear()
     return {"factor": _factor_payload(factor, include_validation=True)}
 
 
@@ -600,12 +706,17 @@ class BacktestReq(BaseModel):
     universe_n: int = 500
     start: str = "2015-01-01"
     end: str = "2024-12-31"
-    cost_bps: float = 15.0
+    cost_bps: float | None = None  # legacy compatibility: interpreted as slippage only
     direction: int = 1
     mode: str | None = None
     panel_glob: str | None = None
     borrow_cost_bps_annual: float | None = None
     top_fraction: float = 0.20
+    initial_capital: float = 1_000_000.0
+    rebalance_every: int = 5
+    slippage_bps: float | None = None
+    max_volume_participation: float = 0.10
+    fee_profile: str | None = None
 
 
 @router.post("/backtest")
@@ -615,36 +726,95 @@ async def backtest(req: BacktestReq):
     err = validate(req.expression, get_dsl_fields(market))
     if err:
         raise HTTPException(400, f"表达式非法: {err}")
-    try:
-        mode = req.mode or cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
-        panel_glob = req.panel_glob or cfg.get("panel_glob")
-        resolved_eval = evaluation_config(market, cfg.get("evaluation_config"))
-        borrow_cost = (
-            req.borrow_cost_bps_annual
-            if req.borrow_cost_bps_annual is not None
-            else resolved_eval["borrow_cost_bps_annual"]
-        )
-        result = await asyncio.to_thread(
-            run_backtest, req.expression, req.universe_n, req.start, req.end,
-            req.cost_bps, req.direction, mode, panel_glob, market,
-            borrow_cost, req.top_fraction,
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+    mode = req.mode or cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
+    panel_glob = req.panel_glob or cfg.get("panel_glob")
+    resolved_eval = evaluation_config(market, cfg.get("evaluation_config"))
+    borrow_cost = (
+        req.borrow_cost_bps_annual
+        if req.borrow_cost_bps_annual is not None
+        else resolved_eval["borrow_cost_bps_annual"]
+    )
+    params = {
+        **req.model_dump(),
+        "mode": mode,
+        "market": market,
+        "panel_glob": panel_glob,
+        "borrow_cost_bps_annual": borrow_cost,
+        "protocol": "step_event_v1",
+    }
     async with SessionLocal() as s:
-        s.add(Backtest(
+        record = Backtest(
             experiment_id=eid,
-            params={
-                **req.model_dump(),
-                "mode": mode,
-                "market": market,
-                "panel_glob": panel_glob,
-                "borrow_cost_bps_annual": borrow_cost,
-            },
-            result=result["stats"],
-        ))
+            params=params,
+            result={},
+            status="running",
+        )
+        s.add(record)
         await s.commit()
-    return result
+        await s.refresh(record)
+        run_id = record.id
+    artifact_dir = BACKTEST_ARTIFACT_ROOT / f"{run_id:08d}"
+    try:
+        result = await asyncio.to_thread(
+            run_backtest,
+            req.expression,
+            req.universe_n,
+            req.start,
+            req.end,
+            req.cost_bps,
+            req.direction,
+            mode,
+            panel_glob,
+            market,
+            borrow_cost,
+            req.top_fraction,
+            initial_capital=req.initial_capital,
+            rebalance_every=req.rebalance_every,
+            slippage_bps=req.slippage_bps,
+            max_volume_participation=req.max_volume_participation,
+            fee_profile=req.fee_profile,
+            artifact_dir=artifact_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 - persist failed runs as audit evidence
+        async with SessionLocal() as s:
+            failed = await s.get(Backtest, run_id)
+            failed.status = "failed"
+            failed.error = str(exc)[:4000]
+            await s.commit()
+        if isinstance(exc, ValueError):
+            raise HTTPException(400, str(exc)) from exc
+        raise HTTPException(500, f"事件回测失败: {exc}") from exc
+    persisted = {
+        key: result[key]
+        for key in (
+            "protocol",
+            "config",
+            "fee_schedule",
+            "stats",
+            "curve",
+            "daily_steps",
+            "integrity",
+            "positions",
+            "artifacts",
+        )
+    }
+    async with SessionLocal() as s:
+        completed = await s.get(Backtest, run_id)
+        completed.result = persisted
+        integrity_passed = bool(result.get("integrity", {}).get("all_pass"))
+        completed.status = "done" if integrity_passed else "failed"
+        completed.error = (
+            ""
+            if integrity_passed
+            else "交割单完整性检查失败；结果已保留但禁止作为有效回测使用"
+        )
+        await s.commit()
+    if not integrity_passed:
+        raise HTTPException(
+            500,
+            "交割单完整性检查失败；失败账本已保留，请检查历史回测详情",
+        )
+    return {"id": run_id, **result}
 
 
 @router.get("/backtests")
@@ -658,8 +828,137 @@ async def list_backtests(experiment_id: int | None = None):
             .limit(50)
         )).all()
     return {"backtests": [
-        {"id": b.id, "params": b.params, "stats": b.result, "created_at": str(b.created_at)} for b in rows
+        {
+            "id": b.id,
+            "params": b.params,
+            "stats": (
+                (b.result or {}).get("stats")
+                if isinstance(b.result, dict) and "stats" in b.result
+                else b.result
+            ),
+            "integrity": (b.result or {}).get("integrity", {})
+            if isinstance(b.result, dict) else {},
+            "protocol": (b.result or {}).get("protocol", "legacy_vector")
+            if isinstance(b.result, dict) else "legacy_vector",
+            "status": b.status,
+            "error": b.error,
+            "created_at": str(b.created_at),
+        }
+        for b in rows
     ]}
+
+
+def _artifact_path(backtest_id: int, filename: str) -> Path:
+    root = BACKTEST_ARTIFACT_ROOT.resolve()
+    path = (root / f"{backtest_id:08d}" / filename).resolve()
+    if root not in path.parents:
+        raise HTTPException(400, "非法回测产物路径")
+    return path
+
+
+def _read_artifact_page(
+    backtest_id: int,
+    filename: str,
+    offset: int,
+    limit: int,
+) -> dict:
+    path = _artifact_path(backtest_id, filename)
+    if not path.exists():
+        raise HTTPException(404, "该历史回测没有事件账本产物")
+    frame = pl.read_parquet(path)
+    if frame.columns == ["empty"]:
+        return {"rows": [], "offset": offset, "limit": limit, "total": 0}
+    total = frame.height
+    rows = frame.slice(offset, limit).to_dicts()
+    return {
+        "rows": rows,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "returned": len(rows),
+    }
+
+
+@router.get("/backtests/{backtest_id}")
+async def backtest_detail(backtest_id: int):
+    async with SessionLocal() as s:
+        record = await s.get(Backtest, backtest_id)
+    if not record:
+        raise HTTPException(404, "回测不存在")
+    trades = (
+        await asyncio.to_thread(
+            _read_artifact_page,
+            backtest_id,
+            "settlement_statement.parquet",
+            0,
+            200,
+        )
+        if _artifact_path(
+            backtest_id, "settlement_statement.parquet"
+        ).exists()
+        else {"rows": [], "offset": 0, "limit": 200, "total": 0}
+    )
+    events = (
+        await asyncio.to_thread(
+            _read_artifact_page,
+            backtest_id,
+            "event_ledger.parquet",
+            0,
+            200,
+        )
+        if _artifact_path(
+            backtest_id, "event_ledger.parquet"
+        ).exists()
+        else {"rows": [], "offset": 0, "limit": 200, "total": 0}
+    )
+    return {
+        "id": record.id,
+        "status": record.status,
+        "error": record.error,
+        "params": record.params,
+        "result": record.result,
+        "trades": trades,
+        "events": events,
+        "created_at": str(record.created_at),
+    }
+
+
+@router.get("/backtests/{backtest_id}/trades")
+async def backtest_trades(backtest_id: int, offset: int = 0, limit: int = 200):
+    if offset < 0 or not 1 <= limit <= 1000:
+        raise HTTPException(400, "offset 必须非负，limit 必须在 1..1000")
+    return await asyncio.to_thread(
+        _read_artifact_page,
+        backtest_id,
+        "settlement_statement.parquet",
+        offset,
+        limit,
+    )
+
+
+@router.get("/backtests/{backtest_id}/events")
+async def backtest_events(backtest_id: int, offset: int = 0, limit: int = 200):
+    if offset < 0 or not 1 <= limit <= 1000:
+        raise HTTPException(400, "offset 必须非负，limit 必须在 1..1000")
+    return await asyncio.to_thread(
+        _read_artifact_page,
+        backtest_id,
+        "event_ledger.parquet",
+        offset,
+        limit,
+    )
+
+
+@router.get("/backtests/{backtest_id}/statement.csv")
+async def download_backtest_statement(backtest_id: int):
+    path = _artifact_path(backtest_id, "settlement_statement.csv")
+    if not path.exists():
+        raise HTTPException(404, "该历史回测没有可下载交割单")
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=f"backtest-{backtest_id:08d}-settlement-statement.csv",
+    )
 
 
 # ---------- 设置 ----------
@@ -932,6 +1231,25 @@ async def activate_experiment(eid: int):
 
 # ---------- 选股器 ----------
 
+class DSLInspectReq(BaseModel):
+    expression: str
+    experiment_id: int | None = None
+
+
+@router.post("/dsl/inspect")
+async def inspect_dsl(req: DSLInspectReq):
+    _, cfg = await _experiment_context(req.experiment_id)
+    market = cfg.get("market", "us")
+    error = validate(req.expression, get_dsl_fields(market))
+    if error:
+        raise HTTPException(400, f"表达式非法: {error}")
+    return {
+        "valid": True,
+        "market": market,
+        **expression_profile(req.expression),
+    }
+
+
 class ScreenerReq(BaseModel):
     factors: list[dict] = Field(default_factory=list)  # [{"expression": "...", "weight": 1.0}, ...]
     expression: str | None = None  # 单个 DSL 直接选股
@@ -944,8 +1262,7 @@ class ScreenerReq(BaseModel):
 
 @router.post("/screener")
 async def screener(req: ScreenerReq):
-    """多因子选股: 按加权综合排名返回股票列表。"""
-    import polars as pl
+    """多因子选股: 单一 Polars 计划计算并缓存截面排名。"""
     _, cfg = await _experiment_context()
     panel_glob = req.panel_glob or cfg.get("panel_glob")
     market = cfg.get("market", "us")
@@ -973,77 +1290,40 @@ async def screener(req: ScreenerReq):
         if factor_direction not in {-1, 1}:
             raise HTTPException(400, "因子 direction 必须为 1 或 -1")
 
-    df = PanelStore.get(panel_glob, market).ensure_loaded()
+    store = PanelStore.get(panel_glob, market)
+    df = store.ensure_loaded()
     import datetime as _dt
+    import bisect
     requested_date = None
     if req.date:
         try:
             requested_date = _dt.date.fromisoformat(req.date)
         except ValueError as exc:
             raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
-        target_date = df.filter(
-            pl.col("trade_date") <= requested_date
-        )["trade_date"].max()
-        if target_date is None:
+        index = bisect.bisect_right(store.trading_dates, requested_date) - 1
+        if index < 0:
             raise HTTPException(400, "请求日期早于面板首个交易日")
+        target_date = store.trading_dates[index]
     else:
-        target_date = df["trade_date"].max()
-
-    # 计算每个因子的截面排名
-    rank_cols = []
-    for i, f in enumerate(factors):
-        expr_str = f["expression"]
-        pipe = parse(expr_str, fields)
-        work = pipe.apply(df.lazy()).select(
-            pl.col("trade_date"), pl.col("ts_code"), pl.col("name"),
-            pl.col("univ_rank"), pl.col("factor").alias(f"f{i}")
+        target_date = store.trading_dates[-1]
+    try:
+        screened = await asyncio.to_thread(
+            screen_cross_section,
+            df=df,
+            trading_dates=store.trading_dates,
+            panel_identity=(
+                f"{market}:{panel_glob or 'default'}:{df.height}:"
+                f"{store.trading_dates[-1]}"
+            ),
+            target_date=target_date,
+            factors=factors,
+            fields=fields,
+            universe_n=req.universe_n,
+            top_n=req.top_n,
+            direction=req.direction,
         )
-        # 截面 rank 分值（N=最好，便于多个因子加权后统一按降序输出）
-        ranked = (
-            work.filter(pl.col("trade_date") == target_date)
-            .filter(pl.col("univ_rank") <= req.universe_n)
-            .filter(pl.col(f"f{i}").is_finite())
-            # Polars 的升序 rank 让最高因子值拥有最大的名次分数；
-            # 最终按 score 降序，语义才是“高分优先”。
-            .with_columns(
-                (pl.col(f"f{i}") * int(f.get("direction", 1)))
-                .rank()
-                .alias(f"r{i}")
-            )
-            # 只在第一列保留名称，后续 join 只携带代码和排名，避免 name_right 重复。
-            .select("ts_code", *( ["name"] if i == 0 else [] ), f"r{i}")
-        )
-        rank_cols.append(ranked.collect())
-
-    # 合并 & 加权
-    merged = rank_cols[0]
-    for rc in rank_cols[1:]:
-        merged = merged.join(rc, on="ts_code", how="inner")
-
-    # 加权综合分
-    total_weight = sum(float(f.get("weight", 1.0)) for f in factors)
-    score_expr = pl.lit(0.0)
-    for i, f in enumerate(factors):
-        w = float(f.get("weight", 1.0)) / total_weight
-        score_expr = score_expr + pl.col(f"r{i}") * w
-
-    result = merged.with_columns(score_expr.alias("score"))
-
-    # 排序
-    if req.direction == "bottom":
-        result = result.sort("score")
-    elif req.direction == "both":
-        result = result.with_columns(
-            pl.when(pl.col("score") > pl.col("score").median())
-            .then(pl.col("score"))
-            .otherwise(-pl.col("score"))
-            .alias("score")
-        )
-        result = result.sort("score", descending=True)
-    else:
-        result = result.sort("score", descending=True)
-
-    result = result.head(req.top_n)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     return {
         "date": str(target_date),
@@ -1056,11 +1336,7 @@ async def screener(req: ScreenerReq):
         "market": market,
         "portfolio_mode": cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE),
         "direction": req.direction,
-        "stocks": [
-            {"rank": j + 1, "ts_code": r["ts_code"], "name": r.get("name", ""),
-             "score": round(float(r["score"]), 2)}
-            for j, r in enumerate(result.iter_rows(named=True))
-        ],
+        **screened,
     }
 
 
@@ -1110,6 +1386,12 @@ async def observability():
         "panel_cache": {
             "instances": len(PanelStore._instances),
             "loaded": sum(store.df is not None for store in PanelStore._instances.values()),
+        },
+        "screener_cache": SCREEN_CACHE.stats(),
+        "backtest_artifacts": {
+            "root": str(BACKTEST_ARTIFACT_ROOT),
+            "runs": len(list(BACKTEST_ARTIFACT_ROOT.glob("*/manifest.json")))
+            if BACKTEST_ARTIFACT_ROOT.exists() else 0,
         },
         "workers": manager.all_status(),
         "engine": {"worker_count": len(manager.workers), "running_count": sum(w.running for w in manager.workers.values())},

@@ -1,9 +1,16 @@
 import os
+from pathlib import Path
 
 _MARKET = os.environ.get("FF_MARKET", "us")  # "us" 或 "ashare"
 MARKET_LABEL = "A股" if _MARKET == "ashare" else "美股"
 
 PORT = int(os.environ.get("FF_PORT", "10010"))
+BACKTEST_ARTIFACT_ROOT = Path(
+    os.environ.get(
+        "FF_BACKTEST_ARTIFACT_ROOT",
+        str(Path(__file__).resolve().parents[2] / "var" / "backtests"),
+    )
+).resolve()
 DEFAULT_PORTFOLIO_MODE = "long_only" if _MARKET == "ashare" else "long_short"
 DATABASE_URL = os.environ.get(
     "FF_DATABASE_URL",

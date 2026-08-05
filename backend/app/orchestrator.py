@@ -35,6 +35,7 @@ from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
 from .dsl.engine import normalize_hash
 from .eval.harness import evaluate
+from .factors.similarity import expression_fingerprint
 from .meta.agent import propose_spec, propose_template, validate_template
 from .miner.agent import propose
 from .models import EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
@@ -362,7 +363,7 @@ class Engine:
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
-                    "source": node.source, "expr_hash": normalize_hash(node.expression),
+                    "source": node.source, **expression_fingerprint(node.expression),
                 },
             ))
             await s.commit()
@@ -624,7 +625,7 @@ class Engine:
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
-                    "source": node.source, "expr_hash": normalize_hash(node.expression),
+                    "source": node.source, **expression_fingerprint(node.expression),
                 },
             ))
             await s.commit()

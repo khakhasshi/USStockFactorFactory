@@ -2,7 +2,8 @@
 
 7×24 双层嵌套优化 (bi-level) LLM 因子挖掘工厂。外层 Meta-Optimizer 进化「挖掘器配置 (HarnessSpec)」，
 内层 Miner 在该配置下进化「因子表达式」；Evaluation Protocol V3 把搜索评分与实战准入分离。
-设计蓝图见 [DESIGN.md](DESIGN.md)。
+设计蓝图见 [DESIGN.md](DESIGN.md)，事件回测的冻结口径见
+[docs/BACKTEST_PROTOCOL_V1.md](docs/BACKTEST_PROTOCOL_V1.md)。
 
 ## 快速开始
 
@@ -19,9 +20,9 @@ createdb factor_factory      # 首次
 |---|---|
 | 总览 | 引擎启停、外层 meta-score 步进图 (候选 vs 在位)、在位 Miner 配置、实时日志 |
 | 研发树 | Miner 版本演化表 + 内层搜索树 (draft/improve 血缘, 可缩放, 点击看表达式) |
-| 因子库 | V3 研究分、完整四层审计、F1–F5 生命周期筛选、成本压力、来源状态与失败原因 |
-| 选股器 | 库内多因子组合或直接 DSL 截面选股；按当前任务市场字段校验 |
-| 回测 | 市场专属多空/纯多头组合、真实目标权重换手、费后与主动收益、借券代理 |
+| 因子库 | V3 四层审计、F1–F5 生命周期、结构相似度快速分组/近邻搜索、DSL 与 Web LaTeX 切换 |
+| 选股器 | 单次 Polars 懒执行的多因子或直接 DSL 截面选股；历史窗裁剪、结果缓存与逐股因子归因 |
+| 回测 | `t` 收盘信号 → `t+1` 原始开盘成交的步进事件引擎、逐日状态、事件流、交割单与完整性门 |
 | 设置 | A股/美股研究任务、纯多头/多空、冻结信号方向、成本/容量/OOS 门槛及模型接入 |
 
 ## 架构
@@ -36,6 +37,10 @@ createdb factor_factory      # 首次
   F5 live-candidate-non-pit。F5 仍是 `NON_PIT_RESEARCH`，不是生产批准。
 - **交互性能**: 页面使用 KeepAlive、GET 去重/短缓存和非重载任务切换；列表 API 只返回指标摘要，
   worker 状态不再重复携带日志，元信息接口也不触发冷面板全量加载。
+- **事件回测**: A股使用万2免5及历史印花税/过户费，美股使用 IBKR Pro Fixed；
+  CSV/Parquet 交割单、事件账本、逐日账本与 SHA-256 manifest 来自同一个状态引擎。
+- **因子资产索引**: 规范化 AST、SimHash LSH 与加权 Jaccard 先快速召回再精排，
+  不读取 HOLDOUT/VAULT 收益来决定结构相似度。
 - **技术栈**: FastAPI + SQLAlchemy(asyncpg) + polars / Vue3 + ECharts (CDN, 无构建) / PostgreSQL。
 
 ## DSL 算子

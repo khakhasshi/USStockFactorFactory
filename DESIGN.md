@@ -103,15 +103,19 @@ class AsOfResearchView:
 
 - 六项元数据**强制携带**，评估报告自动注入；`production_eligible=false` 意味着任何因子晋级 `production-candidate` 前必须用第二数据源复核。
 
-### 2.4 公司行动账本（复权研究价与未复权成交价之间的桥）
+### 2.4 公司行动账本（当前实现与边界）
 
-回测持仓按**事件账本**记账，禁止直接用 `raw_open(t+h)/raw_open(t)` 计算持有收益（拆股日会产生阶梯跳变）：
+`step_event_v1` 用未复权 `raw_open/raw_close` 成交和逐日盯市，并在开盘成交前按
+`adjustment_factor` 的变化调整持仓股数，避免拆并股造成机械性净值断点。
 
-- 成交发生在未复权价格（t+1 `raw_open`），产生股数与现金流；
-- 拆股/并股日按 `adjustment_factor` 调整持仓股数，市值保持连续；
-- 分红按除息日进入现金账本（税费参数化）；
-- 逐日盯市用严格配对的前复权收益序列交叉校验账本净值，偏差超阈值即报错；
-- **fail closed**：`price_identity_break_count > 0`、复权接缝异常（`adjustment_ratio_spread` 超限）、`is_security_identity_consistent = false` 的证券当日强制不可交易并隔离——宁可少算，不可算错。
+当前研究面板没有可把拆股、现金分红和送转逐项拆开的公司行动事件表，因此引擎只能把这一调整明确标记为
+`split_dividend_reinvestment_proxy`。这能保持研究序列的经济敞口连续，但不是经纪商级现金分红账本；
+在接入独立公司行动源并完成逐项现金流回归前，结果继续标记为 `NON_PIT_RESEARCH`。
+
+成交资格使用 `can_buy_open_proxy/can_sell_open_proxy`；缺失开盘价、代理不可成交、
+资金不足或成交量参与率受限时，DAY 订单会拒绝或部分成交，不会静默按理论价格补齐。
+完整事件顺序、费用与交割单检查见
+[`docs/BACKTEST_PROTOCOL_V1.md`](docs/BACKTEST_PROTOCOL_V1.md)。
 
 ---
 

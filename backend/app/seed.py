@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 
 from .db import SessionLocal
 from .eval.harness import evaluate
+from .factors.similarity import expression_fingerprint
 from .models import Factor
 
 CLASSICS = [
@@ -50,6 +51,6 @@ async def seed_classics() -> None:
                 name=f"CL{i:03d}_{name}", expression=expr, hypothesis=hypo,
                 status="library-admitted", task_name="classic",
                 public_metrics=m["public"], gate_metrics=m["gate"],
-                fingerprint={"source": "classic-seed"},
+                fingerprint={"source": "classic-seed", **expression_fingerprint(expr)},
             ))
             await s.commit()

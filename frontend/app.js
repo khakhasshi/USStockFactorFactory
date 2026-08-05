@@ -7,6 +7,7 @@ const {
 const appState = reactive({
   experimentId: null,
   experimentVersion: 0,
+  activeTab: localStorage.getItem("factorfactory.tab") || "dash",
   switching: false,
   switchMessage: "",
 });
@@ -170,7 +171,10 @@ const Dashboard = {
       timer = setInterval(refresh, 3000);
     }
     function stopPolling() { clearInterval(timer); timer = null; }
-    watch(() => appState.experimentVersion, refresh);
+    watch(
+      () => appState.experimentVersion,
+      () => { if (appState.activeTab === "dash") refresh(); },
+    );
     onActivated(startPolling);
     onDeactivated(stopPolling);
     onUnmounted(stopPolling);
@@ -260,7 +264,9 @@ const ResearchTree = {
     }
     function stopPolling() { clearInterval(timer); timer = null; }
     watch(() => appState.experimentVersion, () => {
-      selected.value = null; picked.value = null; refresh();
+      selected.value = null;
+      picked.value = null;
+      if (appState.activeTab === "tree") refresh();
     });
     onActivated(startPolling);
     onDeactivated(stopPolling);
@@ -379,14 +385,20 @@ const FactorLibraryWorkbench = {
   template: `
   <div class="factor-workbench">
     <div class="card" style="margin-bottom:14px">
-      <div class="panel-title-row"><div><div class="eyebrow">EVALUATION PROTOCOL V3</div><h1>因子研究资产库</h1><span class="sub">搜索分与实战准入分离；HOLDOUT / VAULT 仅在显式审计时读取。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
+      <div class="panel-title-row"><div><div class="eyebrow">FACTOR LIBRARY / STRUCTURAL INDEX</div><h1>因子研究资产库</h1><span class="sub">生命周期、实战审计与结构相似度索引统一管理；HOLDOUT / VAULT 仅在显式审计时读取。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag green">{{ groupStats.groups || 0 }} 个结构组</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
       <div class="form-row" style="margin-top:14px">
         <input style="flex:3" v-model="query" @keyup.enter="refresh" placeholder="搜索名称、表达式、经济学假设…" />
         <select v-model="status"><option value="">全部生命周期</option><option value="discovery_only">F1 · discovery_only</option><option value="research_pass">F2 · research_pass</option><option value="oos_pass">F3 · oos_pass</option><option value="paper_candidate">F4 · paper_candidate</option><option value="live_candidate_non_pit">F5 · live_candidate_non_pit</option><option value="legacy_unreviewed">旧协议未审计</option><option value="invalid_provenance">来源无效</option><option value="configuration_changed_requires_reaudit">配置变更待复审</option></select>
+        <select v-model="groupFilter"><option value="">全部相似组</option><option v-for="g in groups" :key="g.id" :value="g.id">{{ g.id }} · {{ familyLabel(g.family) }} · {{ g.size }}个</option></select>
         <select v-model="sort"><option value="score">按研究分</option><option value="grade">按实战等级</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
         <button class="btn" @click="refresh">刷新</button><button class="btn primary" @click="compare" :disabled="selected.length<2">比较 {{ selected.length }} 个</button>
       </div>
-      <div class="sub" style="margin-top:10px">V3 使用真实目标权重换手、费后组合收益、成本压力、分层单调性和跨时期稳定性；旧协议数据不会自动升级。</div>
+      <div class="similarity-summary">
+        <span>SimHash LSH + 加权 Jaccard</span>
+        <b>{{ groupStats.duplicate_groups || 0 }}</b><small>个重复簇</small>
+        <b>{{ pct(groupStats.redundancy_ratio) }}</b><small>结构冗余率</small>
+        <button class="text-btn" @click="groupFilter=''">清除分组筛选</button>
+      </div>
     </div>
 
     <div class="grid cols-2" v-if="comparison">
@@ -403,23 +415,37 @@ const FactorLibraryWorkbench = {
     </div>
 
     <div class="card">
-      <div class="panel-title-row"><h2>研究资产</h2><span class="sub">点击行立即读取已存结果；完整审计由用户显式触发</span></div>
-      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>表达式</th><th>协议</th><th>生命周期</th><th>等级</th><th>PUB ICIR</th><th>GATE Sharpe</th><th>研究分</th><th>来源</th></tr>
-        <tr v-for="fa in factors" :key="fa.id" class="clickable" @click="open(fa)">
-          <td @click.stop><input type="checkbox" :value="fa.id" v-model="selected" /></td><td><b>{{ fa.name }}</b></td><td class="mono-expr factor-expression">{{ fa.expression }}</td>
+      <div class="panel-title-row"><h2>研究资产</h2><span class="sub">{{ visibleFactors.length }} 条 · 点击行读取详情与相似因子</span></div>
+      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>结构组</th><th>表达式</th><th>协议</th><th>生命周期</th><th>等级</th><th>PUB ICIR</th><th>GATE Sharpe</th><th>研究分</th><th>来源</th></tr>
+        <tr v-for="fa in visibleFactors" :key="fa.id" class="clickable" @click="open(fa)">
+          <td @click.stop><input type="checkbox" :value="fa.id" v-model="selected" /></td><td><b>{{ fa.name }}</b></td>
+          <td><button class="group-chip" @click.stop="groupFilter=groupFor(fa.id)">{{ groupFor(fa.id) || '—' }}</button></td>
+          <td class="mono-expr factor-expression">{{ fa.expression }}</td>
           <td><span class="tag" :class="fa.evaluation_protocol==='v3.0' ? 'green' : 'amber'">{{ fa.evaluation_protocol }}</span></td>
           <td><span class="tag" :class="{green:fa.lifecycle_stage?.includes('live'), blue:fa.lifecycle_stage==='research_pass', amber:fa.lifecycle_stage?.includes('paper'), red:fa.lifecycle_stage==='legacy_unreviewed'}">{{ fa.lifecycle_stage }}</span></td>
           <td><b :class="gradeClass(fa.eligibility?.grade)">{{ fa.eligibility?.grade || '—' }}</b></td>
           <td>{{ f(fa.public?.icir) }}</td><td>{{ f(layerSharpe(fa.gate)) }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
           <td><span class="tag" :class="fa.provenance_status?.includes('invalid') ? 'red' : ''">{{ fa.provenance_status }}</span></td>
         </tr></table>
-      <div v-if="!factors.length" class="selector-empty"><h2>当前筛选没有结果</h2><p>降低筛选条件，或等待任务产生新的因子。</p></div>
+      <div v-if="!visibleFactors.length" class="selector-empty"><h2>当前筛选没有结果</h2><p>降低筛选条件，或清除相似组筛选。</p></div>
     </div>
 
     <div class="drawer" v-if="detail">
       <button class="btn close" @click="detail=null">✕ 关闭</button>
       <div class="panel-title-row"><div><h2>{{ detail.factor.name }}</h2><div class="sub">{{ detail.factor.lifecycle_stage }} · {{ detail.factor.provenance_status }}</div></div><div><span class="tag" :class="detail.factor.evaluation_protocol==='v3.0'?'green':'amber'">{{ detail.factor.evaluation_protocol }}</span> <span class="tag amber">NON_PIT</span></div></div>
-      <div class="mono-expr">{{ detail.factor.expression }}</div><p class="sub">{{ detail.factor.hypothesis }}</p>
+      <div class="expression-display">
+        <label class="latex-toggle"><input type="checkbox" v-model="showLatex" /> 以 Web LaTeX 渲染 DSL</label>
+        <div v-if="showLatex" ref="latexEl" class="latex-expression"></div>
+        <div v-else class="mono-expr">{{ detail.factor.expression }}</div>
+        <div class="sub">DSL: <code>{{ detail.factor.expression }}</code></div>
+      </div>
+      <p class="sub">{{ detail.factor.hypothesis }}</p>
+      <div class="card similarity-detail" v-if="detail.similarity">
+        <div class="panel-title-row"><div><h3>结构近邻</h3><span class="sub">{{ detail.similarity.group_id || '单因子组' }} · 不读取未来收益</span></div><span class="tag blue">{{ detail.similarity.nearest?.length || 0 }} 个近邻</span></div>
+        <div class="similar-factor-list">
+          <button v-for="row in detail.similarity.nearest" :key="row.id" @click="openSimilar(row)"><span>{{ row.name }}</span><code>{{ row.expression }}</code><b>{{ (row.similarity*100).toFixed(0) }}%</b></button>
+        </div>
+      </div>
       <div v-if="detail.factor.validation?.source_provenance_warning" class="warn-banner">{{ detail.factor.validation.source_provenance_warning }}</div>
       <div class="card audit-controls">
         <div class="panel-title-row"><div><h3>完整 V3 审计</h3><span class="sub">显式读取 HOLDOUT 与 VAULT，并把结果持久化；不会反馈给 Miner。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
@@ -442,21 +468,61 @@ const FactorLibraryWorkbench = {
   setup() {
     const factors = ref([]), selected = ref([]), detail = ref(null), comparison = ref(null);
     const query = ref(""), status = ref(""), sort = ref("score");
+    const groups = ref([]), groupFilter = ref("");
+    const groupStats = reactive({ groups: 0, duplicate_groups: 0, redundancy_ratio: 0 });
+    const showLatex = ref(true), latexEl = ref(null);
     const review = reactive({ tags: "", note: "" });
     const auditForm = reactive({ universe_n: 500, horizon: 5, cost_bps: 20, target_capital: 10000000 });
     const auditing = ref(false), auditErr = ref("");
+    let loadedExperimentVersion = -1;
     const f = v => v == null ? "—" : Number(v).toFixed(3);
     const pct = v => v == null ? "—" : (Number(v) * 100).toFixed(1) + "%";
     const layerSharpe = m => m?.active?.sharpe ?? m?.net?.sharpe ?? m?.long_only_sharpe;
     const layerReturn = m => m?.active?.ann_return ?? m?.net?.ann_return;
     const worstStress = m => m?.cost_stress?.length ? Math.min(...m.cost_stress.map(x=>Number(x.sharpe))) : null;
     const gradeClass = grade => grade === "F5" ? "grade-f5" : grade === "F4" ? "grade-f4" : grade === "F3" ? "grade-f3" : "grade-low";
+    const factorGroupMap = computed(() => {
+      const out = new Map();
+      groups.value.forEach(g => (g.factor_ids || []).forEach(id => out.set(Number(id), g.id)));
+      return out;
+    });
+    const visibleFactors = computed(() => {
+      if (!groupFilter.value) return factors.value;
+      return factors.value.filter(factor => factorGroupMap.value.get(Number(factor.id)) === groupFilter.value);
+    });
+    const groupFor = id => factorGroupMap.value.get(Number(id)) || "";
+    const familyLabel = family => ({
+      valuation:"估值", capital_flow:"资金流", volatility:"波动",
+      liquidity_volume:"流动性/量价", relationship:"关系结构",
+      price_trend_reversal:"趋势/反转", composite:"复合", other:"其他",
+    })[family] || family;
+    async function renderDetailLatex() {
+      await nextTick();
+      if (!showLatex.value || !latexEl.value || !detail.value) return;
+      const latex = detail.value.dsl?.latex || detail.value.factor.expression;
+      if (window.katex?.render) {
+        window.katex.render(latex, latexEl.value, { throwOnError:false, strict:"warn", trust:false, displayMode:true });
+      } else {
+        latexEl.value.textContent = latex;
+      }
+    }
     async function refresh() {
       const params = new URLSearchParams({ limit: "500", sort: sort.value });
       if (query.value) params.set("q", query.value); if (status.value) params.set("lifecycle", status.value);
-      factors.value = (await api("/factors?" + params.toString(), { cacheTtl: 1000 })).factors;
+      const [factorData, groupData] = await Promise.all([
+        api("/factors?" + params.toString(), { cacheTtl: 1000 }),
+        api("/factors/similarity-groups", { cacheTtl: 5000 }),
+      ]);
+      factors.value = factorData.factors;
+      groups.value = groupData.groups || [];
+      Object.assign(groupStats, groupData.stats || {});
+      if (groupFilter.value && !groups.value.some(g => g.id === groupFilter.value)) groupFilter.value = "";
+      loadedExperimentVersion = appState.experimentVersion;
     }
-    function toggleAll(e) { selected.value = e.target.checked ? factors.value.map(fa=>fa.id) : []; }
+    function ensureFresh() {
+      if (loadedExperimentVersion !== appState.experimentVersion) refresh();
+    }
+    function toggleAll(e) { selected.value = e.target.checked ? visibleFactors.value.map(fa=>fa.id) : []; }
     async function open(fa) {
       detail.value = await api(`/factors/${fa.id}/detail`, { cacheTtl: 2000 });
       review.tags = (detail.value.factor.research_meta?.tags || []).join(", ");
@@ -466,13 +532,18 @@ const FactorLibraryWorkbench = {
       auditForm.horizon = detail.value.factor.research_meta?.last_audit_horizon || defaults.horizon || 5;
       auditForm.cost_bps = defaults.cost_bps ?? 15;
       auditForm.target_capital = defaults.target_capital ?? 1000000;
+      renderDetailLatex();
     }
+    async function openSimilar(row) { await open({ id: row.id }); }
     async function compare() { comparison.value = await api("/factors/compare", { method:"POST", body:{ factor_ids:selected.value } }); }
     async function runAudit() {
       auditing.value = true; auditErr.value = "";
       try {
-        detail.value = await api(`/factors/${detail.value.factor.id}/audit`, { method:"POST", body:{ ...auditForm } });
-        invalidateApiCache(); await refresh();
+        const factorId = detail.value.factor.id;
+        await api(`/factors/${factorId}/audit`, { method:"POST", body:{ ...auditForm } });
+        invalidateApiCache();
+        detail.value = await api(`/factors/${factorId}/detail`);
+        await Promise.all([refresh(), renderDetailLatex()]);
       } catch (e) { auditErr.value = e.message; }
       finally { auditing.value = false; }
     }
@@ -482,98 +553,239 @@ const FactorLibraryWorkbench = {
       invalidateApiCache(); refresh();
     }
     watch(() => appState.experimentVersion, () => {
-      selected.value = []; detail.value = null; comparison.value = null; refresh();
+      selected.value = [];
+      detail.value = null;
+      comparison.value = null;
+      groupFilter.value = "";
+      if (appState.activeTab === "factors") ensureFresh();
     });
-    onMounted(refresh);
-    return { factors, selected, detail, comparison, query, status, sort, review, auditForm, auditing, auditErr, f, pct, layerSharpe, layerReturn, worstStress, gradeClass, refresh, toggleAll, open, compare, runAudit, saveReview };
+    watch(showLatex, renderDetailLatex);
+    onActivated(ensureFresh);
+    return {
+      factors, visibleFactors, selected, detail, comparison, query, status, sort,
+      groups, groupFilter, groupStats, groupFor, familyLabel, showLatex, latexEl,
+      review, auditForm, auditing, auditErr, f, pct, layerSharpe, layerReturn,
+      worstStress, gradeClass, refresh, toggleAll, open, openSimilar, compare,
+      runAudit, saveReview,
+    };
   },
 };
 
 /* ============ 回测 ============ */
 const BacktestView = {
   template: `
-  <div>
-    <div class="card" style="margin-bottom:14px">
-      <h3>手动回测</h3>
-      <label>因子表达式</label>
+  <section class="backtest-lab">
+    <div class="selector-heading">
+      <div><div class="eyebrow">CHRONOLOGICAL EXECUTION / EVENT LEDGER</div><h1>步进事件式回测实验室</h1><p>唯一真相来自订单、成交、现金、持仓与费用账本；信号在 t 日收盘生成，只允许 t+1 原始开盘价成交。</p></div>
+      <div><span class="tag blue">{{ market==='ashare' ? 'A股' : '美股' }}</span> <span class="tag green">{{ feeLabel }}</span> <span class="tag amber">{{ taskMode==='long_only' ? '纯多头' : '多空' }}</span></div>
+    </div>
+
+    <div class="card backtest-config">
+      <div class="execution-timeline">
+        <span><b>01</b> t 日收盘读取信号</span><i>→</i><span><b>02</b> 创建目标持仓订单</span><i>→</i><span><b>03</b> t+1 开盘成交/拒单</span><i>→</i><span><b>04</b> 收盘逐仓估值与对账</span>
+      </div>
+      <label>因子 DSL 表达式</label>
       <input v-model="form.expression" placeholder="例: -rank(ts_delta(close, 20))" />
-      <div class="form-row">
-        <div><label>股票池</label><select v-model.number="form.universe_n"><option :value="500">Top500</option><option :value="1500">Top1500</option></select></div>
-        <div><label>开始</label><input v-model="form.start" /></div>
-        <div><label>结束</label><input v-model="form.end" /></div>
-        <div><label>成本 bps</label><input v-model.number="form.cost_bps" type="number" /></div>
-        <div><label>方向</label><select v-model.number="form.direction"><option :value="1">正向</option><option :value="-1">反向</option></select></div>
-        <div><label>任务持仓约束</label><span class="tag blue">{{ taskMode==='long_only' ? '纯多头' : '多空' }}</span><div class="sub">继承当前研究任务</div></div>
+      <div class="backtest-form-grid">
+        <div><label>股票池</label><select v-model.number="form.universe_n"><option :value="100">Top100</option><option :value="300">Top300</option><option :value="500">Top500</option><option :value="1000">Top1000</option><option :value="1500">Top1500</option></select></div>
+        <div><label>开始日期</label><input type="date" v-model="form.start" /></div>
+        <div><label>结束日期</label><input type="date" v-model="form.end" /></div>
+        <div><label>初始资金</label><input type="number" v-model.number="form.initial_capital" min="10000" /></div>
+        <div><label>调仓步长</label><select v-model.number="form.rebalance_every"><option :value="1">每日</option><option :value="5">每5日</option><option :value="10">每10日</option><option :value="20">每20日</option></select></div>
+        <div><label>单边选股比例</label><input type="number" v-model.number="form.top_fraction" min="0.01" max="0.5" step="0.05" /></div>
+        <div><label>基础滑点 bps</label><input type="number" v-model.number="form.slippage_bps" min="0" step="0.5" /></div>
+        <div><label>最大成交量参与率</label><input type="number" v-model.number="form.max_volume_participation" min="0.01" max="1" step="0.01" /></div>
+        <div><label>方向</label><select v-model.number="form.direction"><option :value="1">高值优先</option><option :value="-1">低值优先</option></select></div>
+        <div v-if="taskMode==='long_short'"><label>年化借券成本 bps</label><input type="number" v-model.number="form.borrow_cost_bps_annual" min="0" /></div>
       </div>
-      <div style="margin-top:12px"><button class="btn primary" @click="run" :disabled="running">{{ running ? '回测中…' : '运行回测' }}</button>
-        <span v-if="err" style="color:var(--red); margin-left:12px">{{ err }}</span></div>
+      <div class="fee-disclosure">
+        <b>{{ feeLabel }}</b>
+        <span v-if="market==='ashare'">券商佣金万2免5；卖出印花税按历史日期；过户费双向按历史日期。</span>
+        <span v-else>每股 $0.005、每单最低 $1、最高成交额 1%；固定费率中的交易规费不重复扣除。</span>
+      </div>
+      <div class="run-row"><button class="btn primary" @click="run" :disabled="running || !form.expression.trim()">{{ running ? '正在生成事件账本…' : '运行事件回测' }}</button><span v-if="err" class="selector-error inline-error">{{ err }}</span></div>
     </div>
-    <div class="grid cols-2" v-if="result">
-      <div class="card">
-        <h3>净值曲线 (费后)</h3>
-        <div class="chart" ref="curveEl"></div>
+
+    <template v-if="result">
+      <div class="metric-strip backtest-metrics">
+        <div class="metric-card accent"><span>费后期末净值</span><b>{{ num(result.stats.final_nav, 4) }}</b><small>{{ money(result.stats.final_nlv) }}</small></div>
+        <div class="metric-card"><span>年化 / Sharpe</span><b>{{ pct(result.stats.ann_ret) }}</b><small>Sharpe {{ num(result.stats.sharpe, 2) }}</small></div>
+        <div class="metric-card"><span>最大回撤</span><b>{{ pct(result.stats.max_dd) }}</b><small>日均换手 {{ pct(result.stats.avg_daily_turnover) }}</small></div>
+        <div class="metric-card"><span>订单 / 成交</span><b>{{ result.stats.orders }} / {{ result.stats.fills }}</b><small>成交率 {{ pct(result.stats.fill_rate) }}</small></div>
+        <div class="metric-card"><span>佣金税费</span><b>{{ money(result.stats.commission_and_tax) }}</b><small>滑点 {{ money(result.stats.slippage_cost) }}</small></div>
+        <div class="metric-card"><span>账本完整性</span><b :class="result.integrity?.all_pass ? 'ok-text' : 'bad-text'">{{ result.integrity?.all_pass ? 'PASS' : 'FAIL' }}</b><small>{{ result.stats.protocol }}</small></div>
       </div>
-      <div class="card">
-        <h3>绩效统计</h3>
-        <table>
-          <tr v-for="(v,k) in result.stats" :key="k"><td style="color:var(--muted)">{{ labels[k] || k }}</td><td><b>{{ typeof v==='number' ? v.toFixed(4) : v }}</b></td></tr>
-        </table>
+
+      <div class="grid cols-2 backtest-analysis">
+        <div class="card"><div class="panel-title-row"><div><h3>净值重放</h3><span class="sub">费后净值与相同成交的无成本代理</span></div><span class="tag">{{ result.curve?.dates?.length || 0 }} 日</span></div><div class="chart" ref="curveEl"></div></div>
+        <div class="card integrity-card">
+          <div class="panel-title-row"><div><h3>交割单回归检查</h3><span class="sub">API、CSV 与净值共用同一成交账本</span></div><span class="grade-pill" :class="result.integrity?.all_pass ? 'grade-f5' : 'grade-low'">{{ result.integrity?.all_pass ? '全部通过' : '存在异常' }}</span></div>
+          <table><tr><th>检查项</th><th>结果</th></tr>
+            <tr v-for="(value,key) in result.integrity" :key="key"><td>{{ integrityLabels[key] || key }}</td><td :class="integrityOk(key,value) ? 'ok-text' : 'bad-text'">{{ typeof value==='number' ? num(value,8) : value }}</td></tr>
+          </table>
+        </div>
       </div>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h3>历史回测</h3>
-      <table>
-        <tr><th>#</th><th>表达式</th><th>区间</th><th>Sharpe</th><th>年化</th><th>最大回撤</th><th>时间</th></tr>
-        <tr v-for="b in history" :key="b.id">
-          <td>{{ b.id }}</td>
-          <td class="mono-expr" style="max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ b.params.expression }}</td>
-          <td class="sub">{{ b.params.start }}~{{ b.params.end }}</td>
-          <td>{{ b.stats?.sharpe?.toFixed(2) }}</td><td>{{ (b.stats?.ann_ret*100)?.toFixed(1) }}%</td><td>{{ (b.stats?.max_dd*100)?.toFixed(1) }}%</td>
-          <td class="sub">{{ b.created_at?.slice(5,16) }}</td>
+
+      <div class="card step-inspector" v-if="result.daily_steps?.length">
+        <div class="panel-title-row"><div><h3>逐日步进状态</h3><span class="sub">拖动时间轴查看当日现金、敞口、成交与事件</span></div><span class="tag blue">{{ currentStep?.trade_date }}</span></div>
+        <input class="step-range" type="range" min="0" :max="result.daily_steps.length-1" v-model.number="stepCursor" />
+        <div class="step-state-grid" v-if="currentStep">
+          <div><span>收盘 NLV</span><b>{{ money(currentStep.close_nlv) }}</b></div><div><span>现金</span><b>{{ money(currentStep.cash) }}</b></div><div><span>多头市值</span><b>{{ money(currentStep.long_market_value) }}</b></div><div><span>空头市值</span><b>{{ money(currentStep.short_market_value) }}</b></div><div><span>成交 / 事件</span><b>{{ currentStep.fills }} / {{ currentStep.events }}</b></div><div><span>净敞口</span><b>{{ pct(currentStep.net_exposure) }}</b></div>
+        </div>
+      </div>
+
+      <div class="card ledger-card">
+        <div class="panel-title-row">
+          <div><h3>详细交割与事件账本</h3><span class="sub">每笔费用、滑点、现金与成交后持仓均可独立复算</span></div>
+          <div class="ledger-actions"><button class="btn" :class="{primary:ledgerTab==='trades'}" @click="switchLedger('trades')">交割单</button><button class="btn" :class="{primary:ledgerTab==='events'}" @click="switchLedger('events')">事件流</button><a v-if="currentId" class="btn-link" :href="'/api/backtests/'+currentId+'/statement.csv'">下载完整 CSV</a></div>
+        </div>
+        <div class="ledger-scroll" v-if="ledgerTab==='trades'">
+          <table><thead><tr><th>成交日</th><th>信号日</th><th>证券</th><th>方向</th><th>成交数量</th><th>基准/成交价</th><th>佣金</th><th>印花税</th><th>过户费</th><th>滑点</th><th>总费用</th><th>成交后现金</th><th>成交后持仓</th></tr></thead>
+          <tbody><tr v-for="row in ledgerRows" :key="row.fill_id"><td>{{ row.trade_date }}</td><td>{{ row.signal_date }}</td><td><code>{{ row.symbol }}</code><div class="sub">{{ row.name }}</div></td><td :class="row.side==='BUY'?'ok-text':'bad-text'">{{ row.side }}</td><td>{{ num(row.filled_quantity,2) }}</td><td>{{ num(row.reference_price,4) }} / {{ num(row.fill_price,4) }}</td><td>{{ money(row.commission) }}</td><td>{{ money(row.stamp_duty) }}</td><td>{{ money(row.transfer_fee) }}</td><td>{{ money(row.slippage_cost) }}</td><td><b>{{ money(row.total_fees) }}</b></td><td>{{ money(row.cash_after) }}</td><td>{{ num(row.position_after,2) }}</td></tr></tbody></table>
+        </div>
+        <div class="ledger-scroll" v-else>
+          <table><thead><tr><th>#</th><th>日期</th><th>阶段</th><th>事件</th><th>证券</th><th>订单</th><th>说明</th></tr></thead><tbody><tr v-for="row in ledgerRows" :key="row.seq"><td>{{ row.seq }}</td><td>{{ row.trade_date }}</td><td>{{ row.phase }}</td><td>{{ row.event_type }}</td><td><code>{{ row.symbol }}</code></td><td>{{ row.order_id }}</td><td>{{ row.message }}</td></tr></tbody></table>
+        </div>
+        <div class="ledger-pager"><span>{{ ledgerPage.offset+1 }}–{{ Math.min(ledgerPage.offset+ledgerRows.length, ledgerPage.total) }} / {{ ledgerPage.total }}</span><button class="btn" @click="pageLedger(-1)" :disabled="ledgerPage.offset===0">上一页</button><button class="btn" @click="pageLedger(1)" :disabled="ledgerPage.offset+ledgerPage.limit>=ledgerPage.total">下一页</button></div>
+      </div>
+    </template>
+
+    <div class="card history-card">
+      <div class="panel-title-row"><div><h3>历史回测档案</h3><span class="sub">旧向量回测保留但标记 legacy；新记录可重放交割单</span></div><button class="btn" @click="loadHistory">刷新</button></div>
+      <table><tr><th>#</th><th>协议</th><th>状态</th><th>表达式</th><th>区间</th><th>Sharpe</th><th>年化</th><th>回撤</th><th>交割检查</th><th>时间</th></tr>
+        <tr v-for="b in history" :key="b.id" class="clickable" @click="openHistory(b)">
+          <td>{{ b.id }}</td><td><span class="tag" :class="b.protocol==='step_event_v1'?'green':'amber'">{{ b.protocol }}</span></td><td>{{ b.status }}</td><td class="mono-expr factor-expression">{{ b.params.expression }}</td><td class="sub">{{ b.params.start }}~{{ b.params.end }}</td><td>{{ num(b.stats?.sharpe,2) }}</td><td>{{ pct(b.stats?.ann_ret) }}</td><td>{{ pct(b.stats?.max_dd) }}</td><td :class="b.integrity?.all_pass?'ok-text':'bad-text'">{{ b.integrity?.all_pass ? 'PASS' : '—' }}</td><td class="sub">{{ b.created_at?.slice(0,16) }}</td>
         </tr>
       </table>
     </div>
-  </div>`,
+  </section>`,
   setup() {
-    const form = reactive({ expression: "-rank(ts_delta(close, 20))", universe_n: 500, start: "2015-01-01", end: "2024-12-31", cost_bps: 15, direction: 1, mode: null });
-    const taskMode = ref("long_only");
+    const form = reactive({
+      expression:"-rank(ts_delta(close, 20))", universe_n:500,
+      start:"2015-01-01", end:"2024-12-31", direction:1, mode:null,
+      initial_capital:1000000, rebalance_every:5, top_fraction:0.20,
+      slippage_bps:2, max_volume_participation:0.10,
+      borrow_cost_bps_annual:0, fee_profile:null,
+    });
+    const taskMode = ref("long_only"), market = ref("us");
     const result = ref(null), history = ref([]), err = ref(""), running = ref(false);
-    const curveEl = ref(null);
-    const labels = { days: "交易日数", ann_ret: "年化收益", ann_vol: "年化波动", sharpe: "Sharpe", max_dd: "最大回撤", avg_daily_turnover: "日均双边交易额/净值", avg_one_way_turnover: "日均单边换手", final_nav: "期末净值" };
+    const currentId = ref(null), curveEl = ref(null), stepCursor = ref(0);
+    const ledgerTab = ref("trades"), ledgerRows = ref([]);
+    const ledgerPage = reactive({ offset:0, limit:200, total:0 });
+    let loadedExperimentVersion = -1;
+    const feeLabel = computed(() => market.value === "ashare" ? "万2免5" : "IBKR Pro Fixed");
+    const currentStep = computed(() => result.value?.daily_steps?.[stepCursor.value] || null);
+    const integrityLabels = {
+      statement_rows:"交割单成交行数",
+      cash_reconciliation_max_error:"逐笔现金恒等式最大误差",
+      fee_formula_max_error:"费率公式复算最大误差",
+      fee_component_sum_max_error:"费用分项加总最大误差",
+      gross_amount_max_error:"成交额复算最大误差",
+      slippage_formula_max_error:"滑点复算最大误差",
+      position_formula_max_error:"持仓变动复算最大误差",
+      same_day_signal_fill_violations:"同日信号成交违规",
+      scheduled_execution_date_violations:"计划成交日不一致",
+      duplicate_fill_id_violations:"重复成交编号",
+      nonpositive_fill_violations:"非正数量或价格成交",
+      side_sign_violations:"买卖方向与持仓变动冲突",
+      fee_profile_violations:"费率档案不一致",
+      ashare_buy_lot_violations:"A股买入非整手",
+      event_phase_order_violations:"事件阶段乱序",
+      long_only_negative_position_violations:"纯多头负持仓违规",
+      ledger_source_of_truth:"净值是否来自账本",
+      all_pass:"总检查",
+    };
+    const num = (value, digits=4) => value == null || Number.isNaN(Number(value)) ? "—" : Number(value).toFixed(digits);
+    const pct = value => value == null || Number.isNaN(Number(value)) ? "—" : (Number(value)*100).toFixed(2)+"%";
+    const money = value => value == null || Number.isNaN(Number(value)) ? "—" : new Intl.NumberFormat("zh-CN",{style:"currency",currency:market.value==="ashare"?"CNY":"USD",maximumFractionDigits:2}).format(Number(value));
+    const integrityOk = (key, value) => {
+      if (key === "statement_rows") return Number(value) >= 0;
+      if (key.endsWith("_max_error")) return Number(value) <= 1e-5;
+      return value === 0 || value === true;
+    };
     async function run() {
       running.value = true; err.value = "";
       try {
         result.value = await api("/backtest", { method: "POST", body: { ...form } });
-        nextTick(drawCurve);
+        currentId.value = result.value.id;
+        ledgerTab.value = "trades";
+        ledgerRows.value = result.value.trades || [];
+        Object.assign(ledgerPage, result.value.trade_page || {offset:0,limit:200,total:ledgerRows.value.length});
+        stepCursor.value = Math.max(0, (result.value.daily_steps?.length || 1)-1);
+        await nextTick(); drawCurve();
         loadHistory();
-      } catch (e) { err.value = e.message; }
-      running.value = false;
+      } catch (e) {
+        err.value = e.message;
+        await loadHistory();
+      }
+      finally { running.value = false; }
     }
     function drawCurve() {
-      if (!curveEl.value || !result.value) return;
+      if (!curveEl.value || !result.value?.curve?.dates) return;
       const c = result.value.curve;
       mountChart(curveEl.value, {
         ...DARK,
-        grid: { left: 55, right: 20, top: 20, bottom: 40 },
+        legend:{data:["费后净值","相同成交无成本代理"],textStyle:{color:"#8b949e"}},
+        grid: { left: 55, right: 20, top: 42, bottom: 40 },
         tooltip: { trigger: "axis" },
         xAxis: { type: "category", data: c.dates, axisLabel: { color: "#8b949e" } },
         yAxis: { type: "value", scale: true, splitLine: { lineStyle: { color: "#21262d" } } },
         dataZoom: [{ type: "inside" }, { type: "slider", height: 16, bottom: 6 }],
-        series: [{ type: "line", data: c.equity, showSymbol: false, lineStyle: { color: "#3fb950", width: 1.5 }, areaStyle: { color: "rgba(63,185,80,0.08)" } }],
+        series: [
+          { name:"费后净值", type:"line", data:c.equity, showSymbol:false, lineStyle:{color:"#3fb950",width:1.7}, areaStyle:{color:"rgba(63,185,80,0.07)"} },
+          { name:"相同成交无成本代理", type:"line", data:c.cost_free_proxy, showSymbol:false, lineStyle:{color:"#58a6ff",width:1,type:"dashed"} },
+        ],
       });
     }
     async function loadHistory() { history.value = (await api("/backtests", { cacheTtl: 1000 })).backtests; }
+    async function openHistory(backtest) {
+      const detail = await api(`/backtests/${backtest.id}`, { cacheTtl:1000 });
+      currentId.value = detail.id;
+      result.value = detail.result?.stats ? detail.result : {stats:detail.result || {},curve:null,integrity:{}};
+      ledgerTab.value = "trades"; ledgerRows.value = detail.trades?.rows || [];
+      Object.assign(ledgerPage, detail.trades || {offset:0,limit:200,total:0});
+      stepCursor.value = Math.max(0,(result.value.daily_steps?.length || 1)-1);
+      await nextTick(); drawCurve();
+    }
+    async function switchLedger(tab) {
+      ledgerTab.value = tab; ledgerPage.offset = 0; await loadLedger();
+    }
+    async function loadLedger() {
+      if (!currentId.value) return;
+      const page = await api(`/backtests/${currentId.value}/${ledgerTab.value}?offset=${ledgerPage.offset}&limit=${ledgerPage.limit}`);
+      ledgerRows.value = page.rows || []; Object.assign(ledgerPage, page);
+    }
+    async function pageLedger(direction) {
+      ledgerPage.offset = Math.max(0, ledgerPage.offset + direction * ledgerPage.limit);
+      await loadLedger();
+    }
     async function loadContext() {
       result.value = null;
       const meta = await api("/meta", { cacheTtl: 1500 });
+      market.value = meta.market || "us";
       taskMode.value = meta.portfolio_mode || "long_only";
       form.mode = taskMode.value;
-      form.cost_bps = meta.evaluation_config?.base_cost_bps ?? form.cost_bps;
+      form.initial_capital = meta.evaluation_config?.target_capital ?? (market.value==="ashare"?10000000:1000000);
+      form.slippage_bps = market.value === "ashare" ? 5 : 2;
+      form.borrow_cost_bps_annual = meta.evaluation_config?.borrow_cost_bps_annual ?? 0;
+      currentId.value = null; ledgerRows.value = []; Object.assign(ledgerPage,{offset:0,limit:200,total:0});
       await loadHistory();
+      loadedExperimentVersion = appState.experimentVersion;
     }
-    watch(() => appState.experimentVersion, loadContext);
-    onMounted(loadContext);
-    return { form, taskMode, result, history, err, running, run, curveEl, labels };
+    function ensureContext() {
+      if (loadedExperimentVersion !== appState.experimentVersion) loadContext();
+    }
+    watch(
+      () => appState.experimentVersion,
+      () => { if (appState.activeTab === "backtest") ensureContext(); },
+    );
+    onActivated(ensureContext);
+    return {
+      form, taskMode, market, feeLabel, result, history, err, running, run,
+      curveEl, currentId, currentStep, stepCursor, ledgerTab, ledgerRows,
+      ledgerPage, integrityLabels, num, pct, money, loadHistory, openHistory,
+      integrityOk, switchLedger, pageLedger,
+    };
   },
 };
 
@@ -770,6 +982,7 @@ const ExperimentsView = {
     const form = reactive({ name: "", description: "" });
     const editForm = reactive({ name: "", description: "" });
     const editing = ref(null), err = ref("");
+    let loadedExperimentVersion = -1;
     async function refresh() {
       const [experiments, obs] = await Promise.all([
         api("/experiments", { cacheTtl: 800 }),
@@ -778,6 +991,10 @@ const ExperimentsView = {
       exps.value = experiments.experiments;
       Object.keys(runtime).forEach(key => delete runtime[key]);
       (obs.workers || []).forEach(w => { runtime[w.experiment_id] = w; });
+      loadedExperimentVersion = appState.experimentVersion;
+    }
+    function ensureFresh() {
+      if (loadedExperimentVersion !== appState.experimentVersion) refresh();
     }
     async function create() {
       err.value = "";
@@ -809,8 +1026,11 @@ const ExperimentsView = {
       try { await api("/engine/stop", { method: "POST", body: { experiment_id: e.id } }); refresh(); }
       catch (ex) { err.value = ex.message; }
     }
-    watch(() => appState.experimentVersion, refresh);
-    onMounted(refresh);
+    watch(
+      () => appState.experimentVersion,
+      () => { if (appState.activeTab === "exps") ensureFresh(); },
+    );
+    onActivated(ensureFresh);
     return { exps, runtime, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, start, stop };
   },
 };
@@ -840,6 +1060,7 @@ const App = {
   setup() {
     const savedTab = localStorage.getItem("factorfactory.tab");
     const tab = ref(savedTab || "dash");
+    appState.activeTab = tab.value;
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
       { id: "factors", label: "因子库" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
@@ -876,6 +1097,7 @@ const App = {
       catch (e) { alert("切换失败: " + e.message); loadExps(); }
     }
     function selectTab(id) {
+      appState.activeTab = id;
       tab.value = id;
       localStorage.setItem("factorfactory.tab", id);
     }
@@ -890,9 +1112,9 @@ const ScreenerView = {
   <section class="selector-page">
     <div class="selector-heading">
       <div>
-        <div class="eyebrow">RESEARCH WORKBENCH / CROSS-SECTIONAL RANKING</div>
-        <h1>多因子选股器</h1>
-        <p>从已入库因子构建一次研究快照，按截面综合排名生成候选股票清单。</p>
+        <div class="eyebrow">SINGLE-PASS POLARS / CACHED CROSS-SECTION</div>
+        <h1>高性能多因子选股器</h1>
+        <p>一次懒执行计划计算所有因子，自动裁剪所需历史窗口并缓存完全相同的截面快照。</p>
       </div>
       <span class="tag amber">研究用途 · 非交易批准</span>
     </div>
@@ -900,7 +1122,8 @@ const ScreenerView = {
       <div class="selector-toolbar card">
       <div class="selector-field selector-dsl">
         <label>直接 DSL 选股（可选）</label>
-        <input v-model="directExpr" placeholder="例如：-rank(ts_delta(close, 20))" />
+        <input v-model="directExpr" @blur="inspectDsl" @keyup.enter="inspectDsl" placeholder="例如：-rank(ts_delta(close, 20))" />
+        <small v-if="dslInfo" class="dsl-hint">合法 · 需 {{ dslInfo.required_history }} 个交易日 · 复杂度 {{ dslInfo.complexity }}</small>
       </div>
       <div class="selector-field selector-date">
         <label>截面日期</label>
@@ -922,6 +1145,10 @@ const ScreenerView = {
           <option :value="50">50 只</option>
           <option :value="100">100 只</option>
         </select>
+      </div>
+      <div class="selector-field selector-small">
+        <label>输出方向</label>
+        <select v-model="outputDirection"><option value="top">高分端</option><option value="bottom">低分端</option><option value="both">两端</option></select>
       </div>
       <div class="selector-actions">
         <button class="btn" @click="loadFactors" :disabled="loading">刷新因子</button>
@@ -945,21 +1172,25 @@ const ScreenerView = {
             <button class="text-btn" @click="selectAll">全选</button>
             <button class="text-btn" @click="clearAll">清空</button>
           </div>
+          <div class="factor-filter-box">
+            <input v-model="factorSearch" placeholder="快速查找因子…" />
+            <select v-model="factorGroup"><option value="">全部结构组</option><option v-for="g in groups" :key="g.id" :value="g.id">{{ g.id }} · {{ g.size }}</option></select>
+          </div>
           <div v-if="!factors.length" class="factor-empty">正在加载因子库…</div>
           <div v-else class="factor-list">
-            <label v-for="f in factors" :key="f.expression" class="factor-row" :class="{active:f.enabled}">
+            <label v-for="f in filteredFactors" :key="f.expression" class="factor-row" :class="{active:f.enabled}">
               <input type="checkbox" v-model="f.enabled" />
               <span class="factor-mark"></span>
               <span class="factor-copy">
                 <span class="factor-name">{{ f.name }}</span>
                 <code :title="f.expression">{{ f.expression }}</code>
-                <span class="factor-meta">{{ f.grade || '未审计' }} · {{ f.lifecycle }} · 研究分 {{ formatScore(f.score) }}</span>
+                <span class="factor-meta">{{ f.group || '单组' }} · {{ f.grade || '未审计' }} · 研究分 {{ formatScore(f.score) }}</span>
               </span>
               <input class="weight-input" v-model.number="f.weight" type="number" min="0.5" max="5" step="0.5" :disabled="!f.enabled" title="因子权重" />
             </label>
           </div>
           <div class="factor-footer">
-            <span>组合权重</span><b>{{ totalWeight.toFixed(1) }}</b>
+            <span>{{ filteredFactors.length }} 条可见 · 组合权重</span><b>{{ totalWeight.toFixed(1) }}</b>
           </div>
         </div>
       </aside>
@@ -978,18 +1209,24 @@ const ScreenerView = {
         <template v-if="result && !loading">
           <div class="result-summary">
             <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · 综合排名</h2><small v-if="result.date_adjusted" class="sub">请求日 {{ result.requested_date }} 非交易日或超出面板，已回退到最近交易日</small></div><span class="tag blue">已完成</span></div>
-          <div class="metric-strip">
+          <div class="metric-strip selector-metrics">
               <div class="metric-card"><span>股票池</span><b>Top {{ result.universe_n || univN }}</b><small>按 60 日成交额</small></div>
               <div class="metric-card"><span>启用因子</span><b>{{ result.factor_count }}</b><small>加权截面排名</small></div>
               <div class="metric-card"><span>输出数量</span><b>{{ result.stocks.length }}</b><small>候选清单</small></div>
-              <div class="metric-card accent"><span>最高综合分</span><b>{{ topScore }}</b><small>{{ result.expression_mode ? '单条 DSL 排名' : '相对排序分数' }}</small></div>
+              <div class="metric-card accent"><span>{{ result.direction === 'bottom' ? '最低综合分' : '首位综合分' }}</span><b>{{ topScore }}</b><small>{{ result.expression_mode ? '单条 DSL 排名' : '相对排序分数' }}</small></div>
+              <div class="metric-card"><span>有效截面</span><b>{{ result.eligible_count }}</b><small>完整因子交集</small></div>
+              <div class="metric-card" :class="{accent:result.performance?.cache_hit}"><span>计算性能</span><b>{{ result.performance?.elapsed_ms }} ms</b><small>{{ result.performance?.cache_hit ? '命中缓存' : '单计划实时计算' }}</small></div>
             </div>
           </div>
           <div class="card result-table-card">
-            <div class="panel-title-row"><div><h2>候选清单</h2><span class="sub">综合分越高代表因子排名组合越靠前</span></div><span class="tag">{{ result.date }}</span></div>
-            <table class="result-table"><thead><tr><th>排名</th><th>证券</th><th>名称</th><th>综合分</th><th>相对位置</th></tr></thead>
-              <tbody><tr v-for="s in result.stocks" :key="s.rank" :class="{'top-pick':s.rank<=10}"><td><span class="rank-number">{{ String(s.rank).padStart(2,"0") }}</span></td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
+            <div class="panel-title-row"><div><h2>候选清单</h2><span class="sub">点击股票查看每个因子的原值、截面名次与分数贡献</span></div><span class="tag">{{ result.date }} · 历史起点 {{ result.history_start }}</span></div>
+            <table class="result-table"><thead><tr><th>排名</th><th>端</th><th>证券</th><th>名称</th><th>原始收盘</th><th>成交额</th><th>综合分</th><th>相对位置</th></tr></thead>
+              <tbody><tr v-for="s in result.stocks" :key="s.rank" class="clickable" :class="{'top-pick':s.rank<=10,'selected-stock':selectedStock?.ts_code===s.ts_code}" @click="selectedStock=s"><td><span class="rank-number">{{ String(s.rank).padStart(2,"0") }}</span></td><td><span class="tag" :class="s.side==='top'?'green':'red'">{{ s.side }}</span></td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td>{{ formatPrice(s.raw_close) }}</td><td>{{ compactAmount(s.amount) }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
             </table>
+          </div>
+          <div class="card contribution-card" v-if="selectedStock">
+            <div class="panel-title-row"><div><h2>{{ selectedStock.ts_code }} · 排名归因</h2><span class="sub">{{ selectedStock.name }} · 综合分 {{ formatScore(selectedStock.score) }}</span></div><button class="btn" @click="selectedStock=null">关闭</button></div>
+            <table><tr><th>因子表达式</th><th>方向</th><th>权重</th><th>因子原值</th><th>截面分</th><th>贡献</th></tr><tr v-for="row in selectedStock.components" :key="row.expression"><td class="mono-expr">{{ row.expression }}</td><td>{{ row.direction===1?'正向':'反向' }}</td><td>{{ (row.weight*100).toFixed(1) }}%</td><td>{{ formatScore(row.value) }}</td><td>{{ formatScore(row.rank_score) }}</td><td><b>{{ formatScore(row.contribution) }}</b></td></tr></table>
           </div>
           <div class="selector-disclaimer"><span>ⓘ</span> 这是基于当前研究面板的横截面排序。数据为 non-PIT 当前成分股回看历史，结果不等同于可交易信号。</div>
         </template>
@@ -1000,13 +1237,41 @@ const ScreenerView = {
     const date = ref(new Date().toISOString().slice(0,10));
     const univN = ref(500); const topN = ref(50);
     const factors = ref([]);
+    const groups = ref([]);
+    const factorSearch = ref("");
+    const factorGroup = ref("");
     const directExpr = ref("");
+    const dslInfo = ref(null);
+    const outputDirection = ref("top");
     const result = ref(null); const error = ref(""); const loading = ref(false);
+    const selectedStock = ref(null);
+    let loadedExperimentVersion = -1;
     const enabledCount = computed(() => factors.value.filter(f=>f.enabled).length);
     const canRun = computed(() => Boolean(directExpr.value.trim()) || enabledCount.value > 0);
     const totalWeight = computed(() => factors.value.filter(f=>f.enabled).reduce((sum, f) => sum + (Number(f.weight) || 0), 0));
     const topScore = computed(() => result.value?.stocks?.length ? formatScore(result.value.stocks[0].score) : "—");
+    const filteredFactors = computed(() => {
+      const query = factorSearch.value.trim().toLowerCase();
+      return factors.value.filter(f => {
+        if (factorGroup.value && f.group !== factorGroup.value) return false;
+        if (!query) return true;
+        return [f.name, f.expression, f.group, f.family, f.grade]
+          .some(value => String(value || "").toLowerCase().includes(query));
+      });
+    });
     function formatScore(value) { return value == null ? "—" : Number(value).toFixed(2); }
+    function formatPrice(value) {
+      if (value == null || !Number.isFinite(Number(value))) return "—";
+      return Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+    }
+    function compactAmount(value) {
+      const amount = Number(value);
+      if (!Number.isFinite(amount)) return "—";
+      if (Math.abs(amount) >= 1e9) return `${(amount / 1e9).toFixed(2)}B`;
+      if (Math.abs(amount) >= 1e6) return `${(amount / 1e6).toFixed(2)}M`;
+      if (Math.abs(amount) >= 1e3) return `${(amount / 1e3).toFixed(2)}K`;
+      return amount.toFixed(0);
+    }
     function rankWidth(stock) {
       if (!result.value?.stocks?.length) return "0%";
       return `${((result.value.stocks.length - stock.rank + 1) / result.value.stocks.length) * 100}%`;
@@ -1014,7 +1279,16 @@ const ScreenerView = {
 
     async function loadFactors() {
       try {
-        const d = await api("/factors?sort=grade", { cacheTtl: 1000 });
+        error.value = "";
+        const [d, similarity] = await Promise.all([
+          api("/factors?sort=grade", { cacheTtl: 1000 }),
+          api("/factors/similarity-groups", { cacheTtl: 1000 }),
+        ]);
+        const groupByFactor = new Map();
+        for (const group of similarity.groups || []) {
+          for (const id of group.factor_ids || []) groupByFactor.set(Number(id), group);
+        }
+        groups.value = (similarity.groups || []).filter(group => group.size > 1);
         const fs = (d.factors||[]).filter(f=>f.expression);
         const seen=new Set(); const uniq=[];
         for (const f of fs.sort((a,b)=>(b.public?.score||0)-(a.public?.score||0))) {
@@ -1032,34 +1306,67 @@ const ScreenerView = {
           lifecycle: f.lifecycle_stage,
           score: f.public?.score,
           direction: Number(f.research_meta?.direction || 1),
+          group: groupByFactor.get(Number(f.id))?.id,
+          family: groupByFactor.get(Number(f.id))?.family,
         }));
+        loadedExperimentVersion = appState.experimentVersion;
       } catch(e) { error.value="加载因子失败: "+e.message; }
     }
+    function ensureFresh() {
+      if (loadedExperimentVersion !== appState.experimentVersion) loadFactors();
+    }
 
-    function selectAll() { factors.value.forEach(f => { f.enabled = true; }); }
+    function selectAll() { filteredFactors.value.forEach(f => { f.enabled = true; }); }
     function clearAll() { factors.value.forEach(f => { f.enabled = false; }); }
+
+    async function inspectDsl() {
+      const expression = directExpr.value.trim();
+      dslInfo.value = null;
+      if (!expression) return;
+      try {
+        dslInfo.value = await api("/dsl/inspect", {
+          method: "POST",
+          body: { expression },
+        });
+        error.value = "";
+      } catch (e) {
+        error.value = `DSL 检查失败: ${e.message}`;
+      }
+    }
 
     async function run() {
       const enabled = factors.value.filter(f=>f.enabled);
       if (!enabled.length && !directExpr.value.trim()) { error.value="请至少选择一个因子或输入 DSL 表达式"; return; }
-      loading.value=true; error.value=""; result.value=null;
+      loading.value=true; error.value=""; result.value=null; selectedStock.value=null;
       try {
         const r = await api("/screener", { method:"POST", body:{
           expression: directExpr.value.trim() || undefined,
           factors: enabled.map(f=>({expression:f.expression,weight:f.weight,direction:f.direction})),
-          date: date.value, universe_n: univN.value, top_n: topN.value, direction:"top"
+          date: date.value, universe_n: univN.value, top_n: topN.value, direction:outputDirection.value
         }});
         result.value = r;
       } catch(e) { error.value = "选股失败: "+e.message; }
       finally { loading.value=false; }
     }
 
-    watch(() => appState.experimentVersion, () => { result.value=null; directExpr.value=""; loadFactors(); });
-    onMounted(loadFactors);
-    return { date, univN, topN, directExpr, factors, result, error, loading, enabledCount, canRun, totalWeight, topScore, formatScore, rankWidth, selectAll, clearAll, run, loadFactors };
+    watch(directExpr, () => { dslInfo.value = null; });
+    watch(() => appState.experimentVersion, () => {
+      result.value=null;
+      selectedStock.value=null;
+      directExpr.value="";
+      factorSearch.value="";
+      factorGroup.value="";
+      if (appState.activeTab === "screener") ensureFresh();
+    });
+    onActivated(ensureFresh);
+    return {
+      date, univN, topN, directExpr, dslInfo, outputDirection,
+      factors, groups, factorSearch, factorGroup, filteredFactors,
+      result, selectedStock, error, loading, enabledCount, canRun,
+      totalWeight, topScore, formatScore, formatPrice, compactAmount,
+      rankWidth, selectAll, clearAll, inspectDsl, run, loadFactors,
+    };
   },
 };
 App.components.ScreenerView = ScreenerView;
 createApp(App).mount("#app");
-
-// ========== 选股器组件 ==========

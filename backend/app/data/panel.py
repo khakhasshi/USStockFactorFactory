@@ -26,6 +26,7 @@ class PanelStore:
 
     def __init__(self, panel_glob: str | None = None, market: str | None = None) -> None:
         self.df: pl.DataFrame | None = None
+        self.trading_dates: list[date] = []
         self.load_error: str = ""
         self.panel_glob = panel_glob or os.environ.get("FF_PANEL_GLOB")
         self.market = market or os.environ.get("FF_MARKET", "us")
@@ -58,7 +59,7 @@ class PanelStore:
         lf = pl.scan_parquet(panel_glob, hive_partitioning=True)
         base_cols = [
             "trade_date", "ts_code", "name", "open", "high", "low", "close",
-            "vol", "amount", "raw_open",
+            "vol", "amount", "raw_open", "raw_close",
         ]
         # 额外字段: A股估值/市值/流动性/资金流向 (按存在性自适应)
         extra_fields = [
@@ -75,13 +76,35 @@ class PanelStore:
         for c in ["is_tradable_observation", "is_valid_ohlc", "is_security_identity_consistent"]:
             if c in available:
                 quality_cols.append(c)
-        cols = base_cols + [f for f in extra_fields if f in available] + quality_cols
+        execution_fields = [
+            "can_buy_open_proxy", "can_sell_open_proxy",
+            "up_limit", "down_limit", "adjustment_factor", "adj_factor",
+        ]
+        cols = (
+            [column for column in base_cols if column in available]
+            + [f for f in extra_fields if f in available]
+            + [f for f in execution_fields if f in available]
+            + quality_cols
+        )
 
         lf = lf.select(cols)
         # 逐列过滤 (不存在的列跳过)
         for qc in quality_cols:
             lf = lf.filter(pl.col(qc))
         lf = lf.drop(quality_cols) if quality_cols else lf
+        if "raw_open" not in cols:
+            lf = lf.with_columns(pl.col("open").alias("raw_open"))
+        if "raw_close" not in cols:
+            lf = lf.with_columns(pl.col("close").alias("raw_close"))
+        if "adjustment_factor" not in cols:
+            if "adj_factor" in cols:
+                lf = lf.with_columns(pl.col("adj_factor").alias("adjustment_factor"))
+            else:
+                lf = lf.with_columns(pl.lit(1.0).alias("adjustment_factor"))
+        if "can_buy_open_proxy" not in cols:
+            lf = lf.with_columns(pl.lit(True).alias("can_buy_open_proxy"))
+        if "can_sell_open_proxy" not in cols:
+            lf = lf.with_columns(pl.lit(True).alias("can_sell_open_proxy"))
         lf = lf.with_columns(pl.col("trade_date").cast(pl.Date)).sort("ts_code", "trade_date")
 
         by_code = {"partition_by": "ts_code", "order_by": "trade_date"}
@@ -112,7 +135,9 @@ class PanelStore:
                 .otherwise(layer_expr)
             )
         lf = lf.with_columns(layer_expr.alias("layer"))
-        return lf.collect()
+        frame = lf.collect()
+        self.trading_dates = frame["trade_date"].unique().sort().to_list()
+        return frame
 
     def summary(self, ensure_loaded: bool = True) -> dict:
         if not ensure_loaded and self.df is None:

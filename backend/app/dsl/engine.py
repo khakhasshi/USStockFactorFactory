@@ -7,6 +7,7 @@
 
 import ast
 import hashlib
+import re
 
 import polars as pl
 
@@ -210,3 +211,143 @@ def validate(expression: str, fields: list[str] | None = None) -> str | None:
         return None
     except (ValueError, SyntaxError) as e:
         return str(e)
+
+
+def _history_for_node(node: ast.expr) -> int:
+    """Conservative trading-session history required to evaluate one DSL node."""
+    if isinstance(node, (ast.Constant, ast.Name)):
+        return 1
+    if isinstance(node, ast.UnaryOp):
+        return _history_for_node(node.operand)
+    if isinstance(node, ast.BinOp):
+        return max(_history_for_node(node.left), _history_for_node(node.right))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        fn = node.func.id
+        child = max((_history_for_node(arg) for arg in node.args if not isinstance(arg, ast.Constant)), default=1)
+        if fn == "delay" and len(node.args) == 2:
+            return child + _win(node.args[1])
+        if fn in {"ts_mean", "ts_std", "ts_sum", "ts_min", "ts_max", "ts_rank", "ts_delta"} \
+                and len(node.args) == 2:
+            return child + _win(node.args[1])
+        if fn == "ts_corr" and len(node.args) == 3:
+            return child + _win(node.args[2])
+        return child
+    return 1
+
+
+def required_history(expression: str) -> int:
+    """Return a safe lookback count used by fast point-in-time screening."""
+    tree = ast.parse(expression, mode="eval")
+    _degenerate_check(tree.body)
+    return min(1000, max(1, _history_for_node(tree.body)))
+
+
+def _latex_name(name: str) -> str:
+    escaped = name.replace("_", r"\_")
+    return rf"\mathrm{{{escaped}}}"
+
+
+def _latex_number(value: int | float) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _latex_for_node(node: ast.expr, parent_precedence: int = 0) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return _latex_number(node.value)
+    if isinstance(node, ast.Name):
+        return _latex_name(node.id)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _latex_for_node(node.operand, 30)
+        return rf"-{inner}"
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Div):
+            return rf"\frac{{{_latex_for_node(node.left)}}}{{{_latex_for_node(node.right)}}}"
+        if isinstance(node.op, ast.Mult):
+            value = rf"{_latex_for_node(node.left, 20)} \cdot {_latex_for_node(node.right, 20)}"
+            precedence = 20
+        elif isinstance(node.op, ast.Add):
+            value = rf"{_latex_for_node(node.left, 10)} + {_latex_for_node(node.right, 10)}"
+            precedence = 10
+        elif isinstance(node.op, ast.Sub):
+            value = rf"{_latex_for_node(node.left, 10)} - {_latex_for_node(node.right, 11)}"
+            precedence = 10
+        else:
+            raise ValueError(f"无法转换的运算符: {type(node.op).__name__}")
+        return rf"\left({value}\right)" if precedence < parent_precedence else value
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        fn = node.func.id
+        args = node.args
+        rendered = [_latex_for_node(arg) for arg in args]
+        if fn == "rank":
+            return rf"\operatorname{{Rank}}_{{cs}}\left({rendered[0]}\right)"
+        if fn == "zscore":
+            return rf"\operatorname{{ZScore}}_{{cs}}\left({rendered[0]}\right)"
+        if fn == "winsor":
+            return rf"\operatorname{{Winsor}}_{{2.5\sigma}}\left({rendered[0]}\right)"
+        if fn == "log":
+            return rf"\log\left(\left|{rendered[0]}\right|+\epsilon\right)"
+        if fn == "abs":
+            return rf"\left|{rendered[0]}\right|"
+        if fn == "sign":
+            return rf"\operatorname{{sgn}}\left({rendered[0]}\right)"
+        if fn == "delay":
+            return rf"\operatorname{{Delay}}_{{{rendered[1]}}}\left({rendered[0]}\right)"
+        if fn == "ts_delta":
+            return rf"\Delta_{{{rendered[1]}}}\left({rendered[0]}\right)"
+        if fn == "ts_corr":
+            return (
+                rf"\operatorname{{Corr}}_{{{rendered[2]}}}"
+                rf"\left({rendered[0]},\,{rendered[1]}\right)"
+            )
+        rolling = {
+            "ts_mean": "Mean",
+            "ts_std": "Std",
+            "ts_sum": "Sum",
+            "ts_min": "Min",
+            "ts_max": "Max",
+            "ts_rank": "Rank",
+        }
+        if fn in rolling:
+            return rf"\operatorname{{{rolling[fn]}}}_{{{rendered[1]}}}\left({rendered[0]}\right)"
+        raise ValueError(f"无法转换的 DSL 算子: {fn}")
+    raise ValueError(f"无法转换的语法节点: {type(node).__name__}")
+
+
+def expression_to_latex(expression: str) -> str:
+    """Translate a validated DSL expression to safe KaTeX-compatible LaTeX."""
+    tree = ast.parse(expression, mode="eval")
+    _degenerate_check(tree.body)
+    return _latex_for_node(tree.body)
+
+
+def expression_profile(expression: str) -> dict:
+    """Return cheap structural metadata used by the factor library and UI."""
+    tree = ast.parse(expression, mode="eval")
+    _degenerate_check(tree.body)
+    operators: list[str] = []
+    fields: list[str] = []
+    windows: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            operators.append(node.func.id)
+            for arg in node.args[1:]:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                    windows.append(arg.value)
+        elif isinstance(node, ast.Name) and not isinstance(getattr(node, "ctx", None), ast.Load):
+            fields.append(node.id)
+        elif isinstance(node, ast.Name):
+            # Function names also appear as ast.Name; remove them below.
+            fields.append(node.id)
+    fields = [name for name in fields if name not in set(operators)]
+    canonical = re.sub(r"\s+", "", ast.unparse(tree.body))
+    return {
+        "canonical": canonical,
+        "operators": sorted(set(operators)),
+        "fields": sorted(set(fields)),
+        "windows": sorted(set(windows)),
+        "required_history": required_history(expression),
+        "complexity": sum(1 for _ in ast.walk(tree)),
+        "latex": expression_to_latex(expression),
+    }
