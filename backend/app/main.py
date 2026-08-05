@@ -10,7 +10,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api.routes import router
-from .config import PORT
+from .config import (
+    ALLOW_REMOTE_UNAUTHENTICATED,
+    HOST,
+    PORT,
+    is_loopback_host,
+)
 from .db import init_db
 from .observability import OBSERVABILITY
 from .seed import seed_classics
@@ -26,15 +31,28 @@ async def lifespan(app: FastAPI):
         seed_classics(),
         name="startup.seed_classics",
     )  # 首次启动播种经典因子 (后台, 幂等)
+    OBSERVABILITY.track_task(seed_task)
     try:
         yield
     finally:
-        await OBSERVABILITY.stop()
         if not seed_task.done():
             seed_task.cancel()
+        await asyncio.gather(seed_task, return_exceptions=True)
+        await OBSERVABILITY.stop()
 
 
-app = FastAPI(title="USStockFactorFactory", lifespan=lifespan)
+app = FastAPI(
+    title="FactorFactory Research Service",
+    version="4.1",
+    lifespan=lifespan,
+)
+
+
+def _route_template(request: Request) -> str:
+    route = getattr(request.scope.get("route"), "path", None)
+    if route is None:
+        return "/__unmatched__"
+    return route or "/__frontend__"
 
 
 @app.middleware("http")
@@ -44,7 +62,7 @@ async def request_telemetry(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception as exc:
-        route = getattr(request.scope.get("route"), "path", request.url.path)
+        route = _route_template(request)
         duration_ms = OBSERVABILITY.finish_request(
             request_id=request_id,
             method=request.method,
@@ -68,9 +86,13 @@ async def request_telemetry(request: Request, call_next):
             headers={
                 "X-Request-ID": request_id,
                 "Server-Timing": f"app;dur={duration_ms:.3f}",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
             },
         )
-    route = getattr(request.scope.get("route"), "path", request.url.path)
+    route = _route_template(request)
     duration_ms = OBSERVABILITY.finish_request(
         request_id=request_id,
         method=request.method,
@@ -80,6 +102,11 @@ async def request_telemetry(request: Request, call_next):
     )
     response.headers["X-Request-ID"] = request_id
     response.headers["Server-Timing"] = f"app;dur={duration_ms:.3f}"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -94,7 +121,12 @@ app.mount("/", StaticFiles(directory=str(FRONTEND), html=True), name="frontend")
 
 
 def main() -> None:
-    uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, log_level="info")
+    if not is_loopback_host(HOST) and not ALLOW_REMOTE_UNAUTHENTICATED:
+        raise RuntimeError(
+            "拒绝在无认证状态下监听非本机地址。若已确认处于隔离网络，"
+            "请显式设置 FF_ALLOW_REMOTE_UNAUTHENTICATED=1。"
+        )
+    uvicorn.run("app.main:app", host=HOST, port=PORT, log_level="info")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,21 @@
+import ipaddress
 import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 _MARKET = os.environ.get("FF_MARKET", "us")  # "us" 或 "ashare"
 MARKET_LABEL = "A股" if _MARKET == "ashare" else "美股"
 
+HOST = os.environ.get("FF_HOST", "127.0.0.1").strip() or "127.0.0.1"
 PORT = int(os.environ.get("FF_PORT", "10010"))
+ALLOW_REMOTE_UNAUTHENTICATED = os.environ.get(
+    "FF_ALLOW_REMOTE_UNAUTHENTICATED",
+    "",
+).strip().lower() in {"1", "true", "yes", "on"}
 BACKTEST_ARTIFACT_ROOT = Path(
     os.environ.get(
         "FF_BACKTEST_ARTIFACT_ROOT",
@@ -26,6 +37,16 @@ US_PANEL_GLOB = (
     "processed/daily_panel/trade_year=*/data_0.parquet"
 )
 ASHARE_PANEL_GLOB = "/Users/jiangjingzhe/Portfolios/MultiFactorAshare/data/trade_year=*/data_0.parquet"
+
+
+def is_loopback_host(host: str = HOST) -> bool:
+    """Return whether a bind address is local-only."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def default_panel_glob(market: str | None = None) -> str:

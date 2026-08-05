@@ -12,9 +12,19 @@ from datetime import date, datetime, timezone
 
 import polars as pl
 
-from ..config import PANEL_GLOB, get_layer_bounds
+from ..config import PANEL_GLOB, get_dsl_fields, get_layer_bounds
 
 HORIZONS = [1, 5, 10, 20]
+REQUIRED_PANEL_COLUMNS = {
+    "trade_date",
+    "ts_code",
+    "open",
+    "high",
+    "low",
+    "close",
+    "vol",
+    "amount",
+}
 
 PANEL_META = {
     "pit_quality": "non_pit_current_constituents",
@@ -121,6 +131,13 @@ class PanelStore:
         ]
         # 质量过滤列: 按存在性自适应
         available = set(lf.collect_schema().names())
+        expected = set(get_dsl_fields(self.market)) | REQUIRED_PANEL_COLUMNS
+        missing = sorted(expected - available)
+        if missing:
+            raise ValueError(
+                f"{self.market} 面板缺少系统已声明可用的字段: "
+                f"{', '.join(missing)}"
+            )
         quality_cols = []
         for c in ["is_tradable_observation", "is_valid_ohlc", "is_security_identity_consistent"]:
             if c in available:
@@ -259,6 +276,34 @@ class PanelStore:
                 identity = hashlib.sha256(
                     "\n".join(identity_rows).encode("utf-8")
                 ).hexdigest()[:16]
+                schema_columns: list[str] = []
+                schema_error: str | None = None
+                if paths:
+                    try:
+                        schema_columns = (
+                            pl.scan_parquet(
+                                source,
+                                hive_partitioning=True,
+                            )
+                            .collect_schema()
+                            .names()
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        schema_error = str(exc)[:1200]
+                required_columns = sorted(REQUIRED_PANEL_COLUMNS)
+                expected_dsl_fields = get_dsl_fields(self.market)
+                missing_required = sorted(
+                    set(required_columns) - set(schema_columns)
+                )
+                missing_dsl = sorted(
+                    set(expected_dsl_fields) - set(schema_columns)
+                )
+                schema_status = (
+                    "error"
+                    if schema_error or missing_required or missing_dsl
+                    else "ok" if paths
+                    else "unavailable"
+                )
                 result = {
                     "source": source,
                     "file_count": len(paths),
@@ -276,6 +321,14 @@ class PanelStore:
                     ),
                     "identity": identity,
                     "source_error": None if paths else "panel glob 未匹配任何文件",
+                    "schema_status": schema_status,
+                    "schema_error": schema_error,
+                    "available_columns": schema_columns,
+                    "available_column_count": len(schema_columns),
+                    "required_columns": required_columns,
+                    "missing_required_columns": missing_required,
+                    "expected_dsl_fields": expected_dsl_fields,
+                    "missing_dsl_fields": missing_dsl,
                 }
             except (OSError, ValueError) as exc:
                 result = {
@@ -286,6 +339,14 @@ class PanelStore:
                     "latest_mtime": None,
                     "identity": None,
                     "source_error": str(exc)[:1200],
+                    "schema_status": "error",
+                    "schema_error": str(exc)[:1200],
+                    "available_columns": [],
+                    "available_column_count": 0,
+                    "required_columns": sorted(REQUIRED_PANEL_COLUMNS),
+                    "missing_required_columns": sorted(REQUIRED_PANEL_COLUMNS),
+                    "expected_dsl_fields": get_dsl_fields(self.market),
+                    "missing_dsl_fields": get_dsl_fields(self.market),
                 }
             self._inventory_cache = result
             self._inventory_cached_at = now
@@ -295,7 +356,10 @@ class PanelStore:
         inventory = self._source_inventory()
         loaded = dict(self._loaded_summary)
         state = self.load_state
-        if state == "cold" and inventory.get("source_error"):
+        if state == "cold" and (
+            inventory.get("source_error")
+            or inventory.get("schema_status") == "error"
+        ):
             state = "error"
         return {
             "id": hashlib.sha256(

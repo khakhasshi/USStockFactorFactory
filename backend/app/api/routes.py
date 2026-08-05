@@ -44,8 +44,10 @@ from ..factors.similarity import (
 )
 from ..models import Backtest, EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
 from ..observability import (
+    AsyncTTLCache,
     OBSERVABILITY,
     build_findings,
+    build_slo,
     fingerprint_payload,
     overall_health,
     redact_text,
@@ -65,6 +67,18 @@ _similarity_cache_stats = {
     "last_build_ms": None,
     "last_build_at": None,
 }
+_observability_components_cache = AsyncTTLCache(
+    ttl_seconds=10.0,
+    capacity=1,
+)
+_observability_events_cache = AsyncTTLCache(
+    ttl_seconds=3.0,
+    capacity=32,
+)
+
+
+def _invalidate_observability_components() -> None:
+    _observability_components_cache.clear()
 
 
 async def _experiment_context(experiment_id: int | None = None) -> tuple[int, dict]:
@@ -719,6 +733,7 @@ async def set_factor_status(fid: int, req: FactorStatusReq):
             raise HTTPException(404)
         f.status = req.status
         await s.commit()
+    _invalidate_observability_components()
     return {"ok": True}
 
 
@@ -1223,6 +1238,7 @@ async def save_settings(req: SettingsReq):
             else:
                 s.add(Setting(key="engine_config", value=req.engine_config))
         await s.commit()
+    _invalidate_observability_components()
     return {"ok": True}
 
 
@@ -1316,6 +1332,7 @@ async def create_experiment(req: ExperimentReq):
         s.add(e)
         await s.commit()
         await s.refresh(e)
+    _invalidate_observability_components()
     return {"ok": True, "id": e.id}
 
 
@@ -1404,6 +1421,7 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
                 raise HTTPException(400, "引擎运行中, 不能归档活动实验")
             e.status = req.status
         await s.commit()
+    _invalidate_observability_components()
     return {"ok": True}
 
 
@@ -1427,6 +1445,7 @@ async def activate_experiment(eid: int):
         else:
             s.add(Setting(key="active_experiment", value={"id": eid}))
         await s.commit()
+    _invalidate_observability_components()
     return {
         "ok": True,
         "active_id": eid,
@@ -1855,19 +1874,49 @@ async def _recent_engine_events(
         return [], redact_text(exc, 1200)
 
 
+async def _collect_observability_components() -> dict:
+    """Collect the slower database/filesystem surfaces once per short TTL."""
+    database, active_and_providers = await asyncio.gather(
+        _database_observability(),
+        _active_configuration_snapshot(),
+    )
+    active_task, providers = active_and_providers
+    data, artifacts = await asyncio.gather(
+        asyncio.to_thread(PanelStore.registry_snapshot),
+        asyncio.to_thread(_artifact_observability),
+    )
+    return {
+        "collected_at": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ),
+        "database": database,
+        "active_task": active_task,
+        "providers": providers,
+        "data": data,
+        "artifacts": artifacts,
+    }
+
+
 async def _collect_observability(
     *,
     events_limit: int = 50,
     event_level: str | None = None,
     event_experiment_id: int | None = None,
     window_seconds: int = 300,
+    force: bool = False,
 ) -> dict:
+    collector_started = time.perf_counter()
     manager = EngineManager.get()
-    database, active_and_providers = await asyncio.gather(
-        _database_observability(),
-        _active_configuration_snapshot(),
+    components = await _observability_components_cache.get(
+        "components",
+        _collect_observability_components,
+        force=force,
     )
-    active_task, providers = active_and_providers
+    database = components["database"]
+    active_task = components["active_task"]
+    providers = components["providers"]
+    data = components["data"]
+    artifacts = components["artifacts"]
     workers = manager.all_status(include_logs=False)
     required_panel_sources = {
         active_task.get("panel_glob")
@@ -1879,19 +1928,28 @@ async def _collect_observability(
         required_panel_sources.add(
             worker.task_config.get("panel_glob") or default_panel_glob(market)
         )
-    data, artifacts = await asyncio.gather(
-        asyncio.to_thread(PanelStore.registry_snapshot),
-        asyncio.to_thread(_artifact_observability),
-    )
     for panel in data["panels"]:
         panel["required"] = panel.get("source") in required_panel_sources
         if panel.get("source") == active_task.get("panel_glob"):
             active_task["panel_id"] = panel.get("id")
             active_task["panel_identity"] = panel.get("identity")
-    events, events_error = await _recent_engine_events(
-        limit=events_limit,
-        level=event_level,
-        experiment_id=event_experiment_id,
+    event_cache_key = (
+        events_limit,
+        event_level or "",
+        event_experiment_id,
+    )
+
+    async def load_events() -> tuple[list[dict], str | None]:
+        return await _recent_engine_events(
+            limit=events_limit,
+            level=event_level,
+            experiment_id=event_experiment_id,
+        )
+
+    events, events_error = await _observability_events_cache.get(
+        event_cache_key,
+        load_events,
+        force=force,
     )
     active_id = active_task.get("experiment_id")
     active_worker = (
@@ -1905,7 +1963,7 @@ async def _collect_observability(
     requests = OBSERVABILITY.request_snapshot(window_seconds)
     service = OBSERVABILITY.service_snapshot()
     snapshot = {
-        "schema_version": "factorfactory.observability/v2",
+        "schema_version": "factorfactory.observability/v3",
         "generated_at": service["generated_at"],
         "service": service,
         "process": OBSERVABILITY.process_snapshot(),
@@ -1918,6 +1976,10 @@ async def _collect_observability(
             },
             "screener": SCREEN_CACHE.stats(),
             "factor_similarity": _similarity_cache_observability(),
+            "observability_components": (
+                _observability_components_cache.stats()
+            ),
+            "observability_events": _observability_events_cache.stats(),
         },
         "artifacts": artifacts,
         "active_task": active_task,
@@ -1932,7 +1994,20 @@ async def _collect_observability(
         "workers": workers,
         "recent_events": events,
         "recent_events_error": events_error,
+        "collector": {
+            "components_collected_at": components["collected_at"],
+            "forced": force,
+            "total_ms": round(
+                (time.perf_counter() - collector_started) * 1000.0,
+                3,
+            ),
+            "policy": (
+                "进程/请求/worker 每次实时采集；数据库、面板与产物清单缓存 "
+                "10 秒；持久化事件缓存 3 秒。"
+            ),
+        },
     }
+    snapshot["slo"] = build_slo(snapshot)
     findings = build_findings(snapshot)
     snapshot["findings"] = findings
     snapshot["health"] = overall_health(findings)
@@ -1949,6 +2024,7 @@ async def observability(
     event_level: str | None = None,
     event_experiment_id: int | None = None,
     window_seconds: int = 300,
+    force: bool = False,
 ):
     """Secret-safe engineering snapshot for diagnosis and incident hand-off."""
     if not 0 <= events_limit <= 200:
@@ -1960,6 +2036,7 @@ async def observability(
         event_level=event_level,
         event_experiment_id=event_experiment_id,
         window_seconds=window_seconds,
+        force=force,
     )
 
 
@@ -1985,7 +2062,11 @@ async def health_ready():
         panel
         for panel in snapshot["data"]["panels"]
         if panel.get("required")
-        and (panel.get("state") == "error" or panel.get("source_error"))
+        and (
+            panel.get("state") == "error"
+            or panel.get("source_error")
+            or panel.get("schema_status") == "error"
+        )
     ]
     ready = snapshot["database"]["status"] == "ok" and not panel_errors
     payload = {
@@ -2017,6 +2098,7 @@ async def prometheus_metrics():
     snapshot = await _collect_observability(events_limit=0, window_seconds=300)
     requests = snapshot["requests"]
     lifetime = requests["lifetime"]
+    window = requests["window"]
     process = snapshot["process"]
     pool = snapshot["database"]["pool"]
     data = snapshot["data"]
@@ -2047,15 +2129,20 @@ async def prometheus_metrics():
         "# TYPE factorfactory_http_latency_milliseconds gauge",
         (
             'factorfactory_http_latency_milliseconds{quantile="0.50"} '
-            f'{lifetime["latency_ms"]["p50"]}'
+            f'{window["latency_ms"]["p50"]}'
         ),
         (
             'factorfactory_http_latency_milliseconds{quantile="0.95"} '
-            f'{lifetime["latency_ms"]["p95"]}'
+            f'{window["latency_ms"]["p95"]}'
         ),
         (
             'factorfactory_http_latency_milliseconds{quantile="0.99"} '
-            f'{lifetime["latency_ms"]["p99"]}'
+            f'{window["latency_ms"]["p99"]}'
+        ),
+        "# TYPE factorfactory_http_window_requests_per_second gauge",
+        (
+            "factorfactory_http_window_requests_per_second "
+            f'{window["requests_per_second"]}'
         ),
         "# TYPE factorfactory_process_resident_memory_bytes gauge",
         f'factorfactory_process_resident_memory_bytes {process.get("rss_bytes", 0)}',
@@ -2110,6 +2197,16 @@ async def prometheus_metrics():
         (
             "factorfactory_backtest_artifact_bytes "
             f'{snapshot["artifacts"]["total_bytes"]}'
+        ),
+        "# TYPE factorfactory_observability_collection_milliseconds gauge",
+        (
+            "factorfactory_observability_collection_milliseconds "
+            f'{snapshot["collector"]["total_ms"]}'
+        ),
+        "# TYPE factorfactory_slo_objectives gauge",
+        (
+            'factorfactory_slo_objectives{status="failed"} '
+            f'{snapshot["slo"]["failed"]}'
         ),
     ]
     for route in requests["routes"]:

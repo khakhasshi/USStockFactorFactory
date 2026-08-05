@@ -1,6 +1,6 @@
-# USStockFactorFactory
+# FactorFactory
 
-7×24 双层嵌套优化 (bi-level) LLM 因子挖掘工厂。外层 Meta-Optimizer 进化「挖掘器配置 (HarnessSpec)」，
+支持 A 股与美股并行任务的 7×24 双层嵌套优化 (bi-level) LLM 因子挖掘工厂。外层 Meta-Optimizer 进化「挖掘器配置 (HarnessSpec)」，
 内层 Miner 在该配置下进化「因子表达式」；Evaluation Protocol V4 把搜索发现分、实盘排序分与最终校准分离。
 设计蓝图见 [DESIGN.md](DESIGN.md)，事件回测的冻结口径见
 [docs/BACKTEST_PROTOCOL_V1.md](docs/BACKTEST_PROTOCOL_V1.md)。
@@ -9,10 +9,16 @@
 
 ```bash
 createdb factor_factory      # 首次
-./run.sh                     # 建 venv、装依赖、启动服务
+./service.sh start           # 建 venv、锁定依赖、后台启动唯一实例
+./service.sh status          # PID、端口与 readiness
+./service.sh logs            # 最近服务日志；加 -f 持续跟踪
+./service.sh restart
+./service.sh stop
 ```
 
-访问 http://localhost:10010 (可用 `FF_PORT=xxxx ./run.sh` 换端口)。
+访问 http://localhost:10010。`service.sh` 使用当前 macOS 用户的 launchd 会话托管并防止双实例；
+`run.sh` 仍可用于前台开发。依赖文件未变化时不会重复安装，敏感环境变量可写入已忽略的 `.env`，
+无需出现在进程命令行。
 
 ## 页面
 
@@ -23,7 +29,7 @@ createdb factor_factory      # 首次
 | 因子库 | V4 四层审计、费后实盘排序及 Vault 校准诊断、F1–F5 生命周期、结构相似度分组、Web LaTeX |
 | 选股器 | 单次 Polars 懒执行的多因子或直接 DSL 截面选股；历史窗裁剪、结果缓存与逐股因子归因 |
 | 回测 | `t` 收盘信号 → `t+1` 原始开盘成交的步进事件引擎、逐日状态、事件流、交割单与完整性门 |
-| 诊断 | 请求 P50/P95/P99、5xx 与请求 ID、进程/事件循环、PostgreSQL 连接池、面板文件身份、缓存、worker 阶段/心跳及脱敏事件 |
+| 诊断 | 滚动窗口 P50/P95/P99、显式 SLO、5xx 与请求 ID、进程/事件循环、数据库连接池、面板 schema/DSL 契约、采集开销、worker 心跳与跨重启事故日志 |
 | 设置 | A股/美股研究任务、纯多头/多空、冻结信号方向、成本/容量/OOS 门槛及模型接入 |
 
 ## 架构
@@ -42,8 +48,10 @@ createdb factor_factory      # 首次
 - **交互性能**: 页面使用 KeepAlive、GET 去重/短缓存和非重载任务切换；列表 API 只返回指标摘要，
   worker 状态不再重复携带日志，元信息接口也不触发冷面板全量加载。
 - **可观测性**: `/api/health/live` 提供轻量存活检查，`/api/health/ready` 验证数据库与任务面板，
-  `/api/observability` 返回脱敏工程快照，`/api/metrics` 暴露低基数 Prometheus 指标。诊断只保留有界
-  内存窗口，不采集请求体、DSL 输入或 LLM 密钥。
+  `/api/observability` 返回脱敏工程快照，`/api/metrics` 暴露低基数 Prometheus 指标。慢采集层采用
+  single-flight TTL 缓存，避免诊断轮询反过来拖慢研究；严重错误写入有界滚动 JSONL，跨重启保留。
+- **运行安全**: 默认只监听 `127.0.0.1`，API 响应禁止缓存并附带基础浏览器安全头；前端 CDN 版本精确锁定
+  且启用 SRI。非本机监听必须显式设置不安全确认变量，防止把无认证控制面意外暴露到局域网。
 - **事件回测**: A股使用万2免5及历史印花税/过户费，美股使用 IBKR Pro Fixed；
   CSV/Parquet 交割单、事件账本、逐日账本与 SHA-256 manifest 来自同一个状态引擎。
 - **因子资产索引**: 规范化 AST、SimHash LSH 与加权 Jaccard 先快速召回再精排，
@@ -59,7 +67,9 @@ createdb factor_factory      # 首次
 
 | 变量 | 默认 |
 |---|---|
+| `FF_HOST` | 127.0.0.1（仅本机） |
 | `FF_PORT` | 10010 |
+| `FF_ALLOW_REMOTE_UNAUTHENTICATED` | 空；仅非本机监听且确认隔离网络时设为 1 |
 | `FF_DATABASE_URL` | postgresql+asyncpg://jiangjingzhe@localhost:5432/factor_factory |
 | `FF_PANEL_GLOB` | MultiFactorUS yfinance 研究面板 parquet 路径 |
 

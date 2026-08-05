@@ -1116,7 +1116,7 @@ const ObservabilityView = {
           ● {{ healthLabel(snapshot.health) }}
         </span>
         <button class="btn" @click="togglePause">{{ paused ? '继续自动刷新' : '暂停自动刷新' }}</button>
-        <button class="btn primary" @click="load" :disabled="loading">{{ loading ? '刷新中…' : '立即刷新' }}</button>
+        <button class="btn primary" @click="load(true)" :disabled="loading">{{ loading ? '刷新中…' : '深度刷新' }}</button>
         <button class="btn" @click="copySnapshot" :disabled="!snapshot">{{ copied || '复制脱敏快照' }}</button>
       </div>
     </div>
@@ -1128,7 +1128,8 @@ const ObservabilityView = {
       <div class="ops-meta">
         <span>schema {{ snapshot.schema_version }}</span>
         <span>生成 {{ formatDate(snapshot.generated_at) }}</span>
-        <span>自动刷新 {{ paused ? '已暂停' : '3 秒' }}</span>
+        <span>自动刷新 {{ paused ? '已暂停' : '5 秒' }}</span>
+        <span>采集 {{ n(snapshot.collector.total_ms, 1) }} ms · 慢层缓存 {{ n(snapshot.caches.observability_components.hit_rate * 100, 0) }}%</span>
         <a href="/api/health/live" target="_blank">liveness</a>
         <a href="/api/health/ready" target="_blank">readiness</a>
         <a href="/api/metrics" target="_blank">Prometheus</a>
@@ -1143,16 +1144,30 @@ const ObservabilityView = {
         </article>
       </div>
 
+      <div class="ops-slo">
+        <div class="panel-title-row">
+          <div><h2>运行 SLO</h2><p>{{ snapshot.slo.note }}</p></div>
+          <span class="tag" :class="{green:snapshot.slo.status==='pass', red:snapshot.slo.status==='fail'}">{{ snapshot.slo.failed }} failed</span>
+        </div>
+        <div class="ops-slo-grid">
+          <article v-for="objective in snapshot.slo.objectives" :key="objective.code" :class="'slo-' + objective.status">
+            <span>{{ objective.label }}</span>
+            <b>{{ sloValue(objective) }}</b>
+            <small>{{ objective.target }} · {{ objective.status }}</small>
+          </article>
+        </div>
+      </div>
+
       <div class="ops-metrics">
         <article class="metric-card">
           <span>服务 / 部署</span>
           <b>PID {{ snapshot.service.pid }}</b>
           <small>{{ formatDuration(snapshot.service.uptime_seconds) }} · {{ snapshot.service.deployment.commit_short }}</small>
-          <small>{{ snapshot.service.deployment.branch }}<template v-if="snapshot.service.deployment.dirty_at_start"> · dirty-at-start</template></small>
+          <small>{{ snapshot.service.deployment.branch }}<template v-if="snapshot.service.deployment.dirty_at_start"> · dirty-at-start</template> · {{ snapshot.service.network.bind }}</small>
         </article>
         <article class="metric-card" :class="{danger: snapshot.requests.window.server_errors}">
           <span>HTTP · {{ snapshot.requests.window.seconds }} 秒窗口</span>
-          <b>{{ snapshot.requests.lifetime.latency_ms.p95 }} ms</b>
+          <b>{{ snapshot.requests.window.latency_ms.p95 }} ms</b>
           <small>P95 · {{ snapshot.requests.window.requests }} 请求 · {{ snapshot.requests.window.server_errors }} 个 5xx</small>
           <small>{{ snapshot.requests.in_flight }} in-flight · 生命周期 {{ snapshot.requests.lifetime.requests }}</small>
         </article>
@@ -1180,6 +1195,18 @@ const ObservabilityView = {
           <small>选股命中 · {{ snapshot.caches.screener.entries }}/{{ snapshot.caches.screener.capacity }} entries</small>
           <small>相似度 {{ pct(snapshot.caches.factor_similarity.hit_rate) }} · 前端 {{ clientTelemetry.cacheEntries }} entries</small>
         </article>
+        <article class="metric-card" :class="{danger: !snapshot.service.network.loopback_only}">
+          <span>网络安全边界</span>
+          <b>{{ snapshot.service.network.scope }}</b>
+          <small>{{ snapshot.service.network.bind }} · {{ snapshot.service.network.loopback_only ? '仅本机可访问' : '无认证远程暴露' }}</small>
+          <small>API no-store · frame deny · nosniff</small>
+        </article>
+        <article class="metric-card" :class="{danger: snapshot.process.supervised_tasks.failed}">
+          <span>后台任务 / 事故留痕</span>
+          <b>{{ snapshot.process.supervised_tasks.running }} / {{ snapshot.process.supervised_tasks.tracked }}</b>
+          <small>running / tracked · {{ snapshot.process.supervised_tasks.failed }} failed</small>
+          <small>journal {{ formatBytes(snapshot.service.journal.current_bytes) }} · {{ snapshot.service.journal.error || 'writable' }}</small>
+        </article>
       </div>
 
       <div class="grid cols-2 ops-grid">
@@ -1201,16 +1228,16 @@ const ObservabilityView = {
         </div>
 
         <div class="card ops-table-card">
-          <div class="panel-title-row"><div><h2>面板身份与加载状态</h2><p>文件清单、mtime、内存与加载耗时</p></div></div>
+          <div class="panel-title-row"><div><h2>面板身份与数据契约</h2><p>文件身份、Parquet schema、DSL 字段与加载状态</p></div></div>
           <div class="ops-table-scroll">
             <table>
               <tr><th>市场 / ID</th><th>状态</th><th>文件</th><th>样本</th><th>加载</th></tr>
               <tr v-for="panel in snapshot.data.panels" :key="panel.id">
                 <td><span class="tag blue">{{ panel.market }}</span><div class="sub">{{ panel.identity || panel.id }}</div></td>
-                <td><span class="tag" :class="{green:panel.state==='ready', red:panel.state==='error', amber:panel.state==='loading'}">{{ panel.state }}</span><div v-if="panel.source_error || panel.load_error" class="bad-text ops-wrap">{{ panel.source_error || panel.load_error }}</div></td>
+                <td><span class="tag" :class="{green:panel.schema_status==='ok', red:panel.state==='error', amber:panel.state==='loading'}">{{ panel.state }} / {{ panel.schema_status }}</span><div v-if="panel.source_error || panel.load_error || panel.schema_error" class="bad-text ops-wrap">{{ panel.source_error || panel.load_error || panel.schema_error }}</div><div v-if="panel.missing_dsl_fields?.length" class="bad-text ops-wrap">missing DSL: {{ panel.missing_dsl_fields.join(', ') }}</div></td>
                 <td>{{ panel.file_count }} · {{ formatBytes(panel.total_bytes) }}<div class="sub">{{ formatDate(panel.latest_mtime) }}</div></td>
                 <td>{{ panel.rows ?? '—' }} rows<div class="sub">{{ panel.securities ?? '—' }} securities · {{ panel.date_min || '—' }} → {{ panel.date_max || '—' }}</div></td>
-                <td>{{ panel.load_duration_ms == null ? '—' : n(panel.load_duration_ms,1)+' ms' }}<div class="sub">{{ panel.load_attempts }} attempt(s)</div></td>
+                <td>{{ panel.load_duration_ms == null ? '—' : n(panel.load_duration_ms,1)+' ms' }}<div class="sub">{{ panel.load_attempts }} attempt(s) · {{ panel.available_column_count ?? '—' }} cols</div></td>
               </tr>
             </table>
           </div>
@@ -1234,9 +1261,9 @@ const ObservabilityView = {
         </div>
       </div>
 
-      <div class="grid cols-2 ops-grid">
+      <div class="grid cols-3 ops-grid">
         <div class="card ops-list-card">
-          <div class="panel-title-row"><div><h2>最近异常与请求 ID</h2><p>HTTP 5xx、未捕获异常和 error 日志</p></div></div>
+          <div class="panel-title-row"><div><h2>当前进程异常</h2><p>HTTP 5xx、未捕获异常和 error 日志</p></div></div>
           <div class="ops-event-list">
             <article v-for="incident in snapshot.requests.incidents.slice(0,30)" :key="incident.at + incident.request_id + incident.message">
               <span class="tag red">{{ incident.kind || incident.level }}</span>
@@ -1245,6 +1272,18 @@ const ObservabilityView = {
               <p>{{ incident.error || incident.message || ('HTTP ' + incident.status) }}</p>
             </article>
             <div v-if="!snapshot.requests.incidents.length" class="ops-empty">当前进程没有记录到异常</div>
+          </div>
+        </div>
+        <div class="card ops-list-card">
+          <div class="panel-title-row"><div><h2>跨重启事故日志</h2><p>滚动 JSONL 中保留的服务启停与严重错误</p></div></div>
+          <div class="ops-event-list">
+            <article v-for="event in snapshot.service.journal.recent_events" :key="event.at + event.kind + (event.request_id || '')">
+              <span class="tag" :class="{red:event.kind?.includes('failure') || event.kind?.includes('5xx'), blue:event.kind?.includes('service_')}">{{ event.kind }}</span>
+              <time>{{ formatDate(event.at) }}</time>
+              <code>{{ event.request_id || event.task || ('PID ' + (event.pid ?? '—')) }}</code>
+              <p>{{ event.error || event.message || event.route || event.commit || '—' }}</p>
+            </article>
+            <div v-if="!snapshot.service.journal.recent_events.length" class="ops-empty">尚无跨重启事件</div>
           </div>
         </div>
         <div class="card ops-list-card">
@@ -1311,7 +1350,7 @@ const ObservabilityView = {
   setup() {
     const snapshot = ref(null), error = ref(""), loading = ref(false);
     const paused = ref(false), copied = ref("");
-    let timer = null, active = true;
+    let timer = null, active = false;
     const clientTelemetry = computed(() => ({
       cacheEntries: responseCache.size,
       inflightGets: inflightGets.size,
@@ -1320,11 +1359,12 @@ const ObservabilityView = {
     const totalPanelFiles = computed(() =>
       (snapshot.value?.data?.panels || []).reduce((sum, panel) => sum + Number(panel.file_count || 0), 0)
     );
-    async function load() {
+    async function load(force = false) {
       if (loading.value) return;
       loading.value = true; error.value = "";
       try {
-        snapshot.value = await api("/observability?events_limit=80&window_seconds=300");
+        const forceArg = force === true ? "&force=true" : "";
+        snapshot.value = await api(`/observability?events_limit=40&window_seconds=300${forceArg}`);
       } catch (e) {
         error.value = `诊断快照加载失败：${e.message}`;
       } finally {
@@ -1332,10 +1372,11 @@ const ObservabilityView = {
       }
     }
     function startPolling() {
+      if (active) return;
       active = true;
       if (!timer) timer = setInterval(() => {
         if (active && !paused.value) load();
-      }, 3000);
+      }, 5000);
       load();
     }
     function stopPolling() {
@@ -1386,16 +1427,22 @@ const ObservabilityView = {
     function healthLabel(value) {
       return ({ healthy: "健康", degraded: "降级", unhealthy: "故障" })[value] || value;
     }
+    function sloValue(objective) {
+      if (objective.status === "no_data") return "NO DATA";
+      if (objective.code === "http_5xx_rate" || objective.code === "disk_free") return pct(objective.value);
+      if (objective.code === "http_p95" || objective.code === "database" || objective.code === "event_loop") return `${n(objective.value, 1)} ms`;
+      return String(objective.value ?? "—");
+    }
     function entries(value) { return Object.entries(value || {}); }
     function pretty(value) { return JSON.stringify(value, null, 2); }
     onMounted(startPolling);
     onActivated(startPolling);
-    onDeactivated(() => { active = false; });
+    onDeactivated(stopPolling);
     onUnmounted(stopPolling);
     return {
       snapshot, error, loading, paused, copied, clientTelemetry, totalPanelFiles,
       load, togglePause, copySnapshot, n, pct, formatBytes, formatDuration,
-      age, formatDate, healthLabel, entries, pretty,
+      age, formatDate, healthLabel, sloValue, entries, pretty,
     };
   },
 };
@@ -1406,7 +1453,7 @@ const App = {
   template: `
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
-    <div class="tabs">
+    <div class="tabs" ref="tabsEl">
       <button v-for="t in tabs" :key="t.id" :class="{active: tab===t.id}" @click="selectTab(t.id)">{{ t.label }}</button>
     </div>
     <div class="spacer"></div>
@@ -1433,6 +1480,7 @@ const App = {
     ];
     const engState = ref("…");
     const exps = ref([]), selExp = ref(null);
+    const tabsEl = ref(null);
     let timer = null, polling = false;
     const activeComponent = computed(() => ({
       dash: Dashboard, tree: ResearchTree, factors: FactorLibraryWorkbench,
@@ -1466,9 +1514,19 @@ const App = {
       tab.value = id;
       localStorage.setItem("factorfactory.tab", id);
     }
-    onMounted(() => { poll(); loadExps(); timer = setInterval(poll, 5000); });
+    function revealActiveTab() {
+      tabsEl.value?.querySelector("button.active")
+        ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+    watch(tab, () => nextTick(revealActiveTab), { flush: "post" });
+    onMounted(() => {
+      poll();
+      loadExps();
+      nextTick(revealActiveTab);
+      timer = setInterval(poll, 5000);
+    });
     onUnmounted(() => clearInterval(timer));
-    return { tab, tabs, engState, exps, selExp, switchExp, selectTab, activeComponent, appState };
+    return { tab, tabs, tabsEl, engState, exps, selExp, switchExp, selectTab, activeComponent, appState };
   },
 };
 
