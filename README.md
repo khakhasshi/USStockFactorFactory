@@ -33,6 +33,12 @@ createdb factor_factory      # 首次
 ```
 
 运行记录逐条落入 `var/reports`，中断后以相同 `--output-dir` 重跑即可续算。
+完成后可从冻结结果生成无网络依赖的单文件交互报表：
+
+```bash
+.venv/bin/python backend/scripts/render_factor_leaderboard_html.py \
+  --report-dir var/reports/ashare-factor-leaderboard-YYYYMMDD-HHMMSS
+```
 
 ## 页面
 

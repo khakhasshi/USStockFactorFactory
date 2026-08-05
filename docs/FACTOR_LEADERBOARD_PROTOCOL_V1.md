@@ -100,6 +100,18 @@ chronology, fill identity, fee profile, A-share lots, event-phase order, and
 long-only positions. Frozen finalists are replayed again with full settlement,
 event, and daily ledgers; each artifact is hashed in its manifest.
 
+## Offline HTML derivative
+
+`render_factor_leaderboard_html.py` converts a completed report directory into
+one self-contained `leaderboard.html`. It embeds all ranked and duplicate rows,
+the invalid-expression appendix, frozen dimension champions, Vault results,
+and finalist-ledger summaries. Search, filters, sorting, charts, details, and
+filtered CSV export run locally with no CDN or other network dependency.
+
+The sibling `leaderboard_manifest.json` records the HTML hash and hashes of
+every source JSON used to render it. The HTML is a presentation derivative; it
+does not change the frozen ranking, Vault selection, or source manifest.
+
 ## Interpretation boundary
 
 The current A-share panel is a non-PIT current-constituent research panel and
