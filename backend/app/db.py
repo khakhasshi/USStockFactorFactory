@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -10,6 +12,7 @@ class Base(DeclarativeBase):
 
 engine = create_async_engine(DATABASE_URL, pool_size=10, max_overflow=5)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+logger = logging.getLogger("database.migration")
 
 
 async def init_db() -> None:
@@ -72,6 +75,78 @@ async def init_db() -> None:
             "ALTER TABLE factors ADD COLUMN IF NOT EXISTS evaluated_at TIMESTAMP"
         ))
         await conn.execute(text(
+            "ALTER TABLE miner_versions ADD COLUMN IF NOT EXISTS evaluation_protocol "
+            "VARCHAR(32) NOT NULL DEFAULT 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE miner_versions ADD COLUMN IF NOT EXISTS feedback_summary "
+            "JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE miner_versions ADD COLUMN IF NOT EXISTS reflection "
+            "JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE miner_versions ADD COLUMN IF NOT EXISTS context_fingerprint "
+            "VARCHAR(64) NOT NULL DEFAULT ''"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE outer_steps ADD COLUMN IF NOT EXISTS evaluation_protocol "
+            "VARCHAR(32) NOT NULL DEFAULT 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE outer_steps ADD COLUMN IF NOT EXISTS context_fingerprint "
+            "VARCHAR(64) NOT NULL DEFAULT ''"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS evaluation_protocol "
+            "VARCHAR(32) NOT NULL DEFAULT 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS seed INTEGER"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS proposal_meta "
+            "JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS feedback_summary "
+            "JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS evaluation_protocol "
+            "VARCHAR(32) NOT NULL DEFAULT 'legacy_unoriented'"
+        ))
+        # Recover protocol lineage from immutable payloads without changing
+        # historical scores or deleting interrupted work.
+        await conn.execute(text(
+            "UPDATE nodes SET evaluation_protocol = "
+            "COALESCE(NULLIF(public_metrics->>'protocol_version', ''), 'legacy_unoriented') "
+            "WHERE evaluation_protocol = 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "UPDATE trials SET evaluation_protocol = "
+            "COALESCE(NULLIF(statistic->>'protocol_version', ''), 'legacy_unoriented') "
+            "WHERE evaluation_protocol = 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "UPDATE outer_steps SET evaluation_protocol = "
+            "COALESCE(NULLIF(detail->>'protocol_version', ''), 'legacy_unoriented') "
+            "WHERE evaluation_protocol = 'legacy_unoriented'"
+        ))
+        await conn.execute(text(
+            "UPDATE miner_versions AS m SET evaluation_protocol = 'v4.0' "
+            "WHERE m.evaluation_protocol = 'legacy_unoriented' "
+            "AND EXISTS ("
+            "  SELECT 1 FROM nodes n WHERE n.miner_version_id = m.id "
+            "  AND n.evaluation_protocol = 'v4.0'"
+            ") "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM nodes n WHERE n.miner_version_id = m.id "
+            "  AND n.evaluation_protocol <> 'v4.0'"
+            ")"
+        ))
+        await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_factors_evaluation_protocol ON factors (evaluation_protocol)"
         ))
         await conn.execute(text(
@@ -80,6 +155,27 @@ async def init_db() -> None:
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_factors_provenance_status ON factors (provenance_status)"
         ))
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS ix_miner_versions_evaluation_protocol "
+            "ON miner_versions (evaluation_protocol)",
+            "CREATE INDEX IF NOT EXISTS ix_outer_steps_evaluation_protocol "
+            "ON outer_steps (evaluation_protocol)",
+            "CREATE INDEX IF NOT EXISTS ix_nodes_evaluation_protocol "
+            "ON nodes (evaluation_protocol)",
+            "CREATE INDEX IF NOT EXISTS ix_trials_evaluation_protocol "
+            "ON trials (evaluation_protocol)",
+            "CREATE INDEX IF NOT EXISTS ix_nodes_feedback_lookup "
+            "ON nodes (experiment_id, evaluation_protocol, miner_version_id, task_name, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_miner_versions_protocol_status "
+            "ON miner_versions (experiment_id, evaluation_protocol, status, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_outer_steps_protocol_step "
+            "ON outer_steps (experiment_id, evaluation_protocol, step_no)",
+            "CREATE INDEX IF NOT EXISTS ix_trials_protocol_task "
+            "ON trials (experiment_id, evaluation_protocol, task_name, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_llm_call_audits_experiment_id_desc "
+            "ON llm_call_audits (experiment_id, id DESC)",
+        ):
+            await conn.execute(text(statement))
         # Preserve contaminated historical expressions while preventing them
         # from appearing as validated research assets.
         await conn.execute(text(
@@ -99,6 +195,76 @@ async def init_db() -> None:
         await conn.execute(text(
             "SELECT setval('experiments_id_seq', (SELECT COALESCE(MAX(id),1) FROM experiments))"
         ))
+    await _backfill_v4_feedback()
+
+
+async def _backfill_v4_feedback() -> int:
+    """Populate the new safe envelope for pre-migration V4 nodes only."""
+    from sqlalchemy import select, text
+
+    from .config import EVALUATION_PROTOCOL_VERSION
+    from .feedback import build_feedback_envelope
+    from .models import Experiment, Node
+
+    async with SessionLocal() as session:
+        nodes = (
+            await session.scalars(
+                select(Node)
+                .where(
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                    text(
+                        "COALESCE(nodes.feedback_summary::jsonb, '{}'::jsonb) "
+                        "= '{}'::jsonb"
+                    ),
+                )
+                .order_by(Node.id)
+            )
+        ).all()
+        if not nodes:
+            return 0
+        experiments: dict[int, Experiment | None] = {}
+        written = 0
+        for node in nodes:
+            if node.experiment_id not in experiments:
+                experiments[node.experiment_id] = await session.get(
+                    Experiment,
+                    node.experiment_id,
+                )
+            experiment = experiments[node.experiment_id]
+            config = dict(experiment.research_config or {}) if experiment else {}
+            market = str(config.get("market") or "us")
+            portfolio_mode = str(
+                config.get("portfolio_mode")
+                or ("long_only" if market == "ashare" else "long_short")
+            )
+            try:
+                node.feedback_summary = build_feedback_envelope(
+                    node_id=node.id,
+                    parent_id=node.parent_id,
+                    task_name=node.task_name,
+                    expression=node.expression,
+                    hypothesis=node.hypothesis,
+                    source=node.source,
+                    status=node.status,
+                    error=node.error,
+                    public_score=node.public_score,
+                    public_metrics=node.public_metrics,
+                    evaluation_protocol=node.evaluation_protocol,
+                    market=market,
+                    portfolio_mode=portfolio_mode,
+                    direction=int(config.get("direction", 1)),
+                    proposal_meta=node.proposal_meta,
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001 - preserve source history
+                logger.warning(
+                    "V4 节点 %s 反馈信封回填失败，原记录保持不变: %s",
+                    node.id,
+                    str(exc)[:300],
+                )
+        if written:
+            await session.commit()
+        return written
 
 
 async def get_active_experiment_id() -> int:

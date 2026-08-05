@@ -1163,6 +1163,67 @@ def build_findings(snapshot: dict) -> list[dict]:
             "若预期使用 LLM，请在设置页绑定外层 provider；仅配置不代表网络可达。",
         )
 
+    active_task = snapshot.get("active_task") or {}
+    pipeline = snapshot.get("llm_pipeline") or {}
+    pipeline_protocol = pipeline.get("evaluation_protocol")
+    task_protocol = active_task.get("evaluation_protocol")
+    if (
+        task_protocol
+        and pipeline_protocol
+        and task_protocol != pipeline_protocol
+    ):
+        add(
+            "warning",
+            "evaluation_protocol_mismatch",
+            "活动任务评价协议不是当前协议",
+            f"任务={task_protocol}，运行时={pipeline_protocol}",
+            "升级任务配置或新建任务；不要把旧协议分数与当前外层决策混用。",
+        )
+    calls = pipeline.get("calls") or {}
+    if int(calls.get("errors_1h") or 0) > 0:
+        add(
+            "warning",
+            "recent_llm_call_errors",
+            "最近一小时存在 LLM 调用失败",
+            (
+                f"{calls.get('errors_1h')} / "
+                f"{calls.get('calls_1h', 0)} 次调用失败"
+            ),
+            "在 LLM 调用审计中按 role/phase 查看脱敏错误，并确认 provider、网络和返回 JSON。",
+        )
+    coverage = pipeline.get("feedback_coverage") or {}
+    if (
+        int(coverage.get("nodes_total") or 0) > 0
+        and float(coverage.get("nodes_ratio") or 0.0) < 1.0
+    ):
+        add(
+            "info",
+            "feedback_backfill_incomplete",
+            "部分当前协议历史节点没有持久化反馈信封",
+            (
+                f"{coverage.get('nodes_with_feedback', 0)} / "
+                f"{coverage.get('nodes_total', 0)} 已持久化；旧节点会在读取时安全重建。"
+            ),
+            "无需删除历史；新节点应达到 100%，必要时运行离线回填审计。",
+        )
+    if (
+        int(coverage.get("versions_evaluated") or 0) > 0
+        and (
+            float(coverage.get("reports_ratio") or 0.0) < 1.0
+            or float(coverage.get("reflections_ratio") or 0.0) < 1.0
+        )
+    ):
+        add(
+            "info",
+            "outer_reflection_history_incomplete",
+            "部分既有外层版本缺少新版报告或反思",
+            (
+                f"report={float(coverage.get('reports_ratio') or 0):.0%}，"
+                f"reflection={float(coverage.get('reflections_ratio') or 0):.0%}"
+            ),
+            "这是历史升级留痕；后续完成的外层步必须同时写入报告、比较和结果反思。",
+        )
+
     if not any(
         row["severity"] in {"critical", "warning"} for row in findings
     ):

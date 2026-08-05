@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
+from .config import EVALUATION_PROTOCOL_VERSION
 from .db import Base
 
 
@@ -37,6 +38,12 @@ class MinerVersion(Base):
     status: Mapped[str] = mapped_column(String(16), default="candidate")  # incumbent/candidate/rejected
     meta_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     proposal_note: Mapped[str] = mapped_column(Text, default="")
+    evaluation_protocol: Mapped[str] = mapped_column(
+        String(32), default=EVALUATION_PROTOCOL_VERSION, index=True
+    )
+    feedback_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    reflection: Mapped[dict] = mapped_column(JSON, default=dict)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -50,6 +57,10 @@ class OuterStep(Base):
     candidate_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     incumbent_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    evaluation_protocol: Mapped[str] = mapped_column(
+        String(32), default=EVALUATION_PROTOCOL_VERSION, index=True
+    )
+    context_fingerprint: Mapped[str] = mapped_column(String(64), default="")
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -68,9 +79,15 @@ class Node(Base):
     hypothesis: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="ok")  # ok/error
     error: Mapped[str] = mapped_column(Text, default="")
+    evaluation_protocol: Mapped[str] = mapped_column(
+        String(32), default=EVALUATION_PROTOCOL_VERSION, index=True
+    )
+    seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     public_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     public_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     gate_metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # META_TRAIN, 不进提示词
+    proposal_meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    feedback_summary: Mapped[dict] = mapped_column(JSON, default=dict)
     source: Mapped[str] = mapped_column(String(16), default="llm")  # llm/random
     task_name: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -108,7 +125,38 @@ class Trial(Base):
     expression_hash: Mapped[str] = mapped_column(String(64), index=True)
     layer: Mapped[str] = mapped_column(String(24))
     task_name: Mapped[str] = mapped_column(String(64), default="")
+    evaluation_protocol: Mapped[str] = mapped_column(
+        String(32), default=EVALUATION_PROTOCOL_VERSION, index=True
+    )
     statistic: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class LLMCallAudit(Base):
+    """Secret-safe, append-only trace of the rendered LLM research context."""
+
+    __tablename__ = "llm_call_audits"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    role: Mapped[str] = mapped_column(String(32), index=True)
+    phase: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    provider_name: Mapped[str] = mapped_column(String(128), default="")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    evaluation_protocol: Mapped[str] = mapped_column(
+        String(32), default=EVALUATION_PROTOCOL_VERSION, index=True
+    )
+    miner_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    outer_step_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    task_name: Mapped[str] = mapped_column(String(64), default="")
+    prompt_hash: Mapped[str] = mapped_column(String(64), index=True)
+    feedback_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    user_prompt: Mapped[str] = mapped_column(Text, default="")
+    response: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    trace_meta: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

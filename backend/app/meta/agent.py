@@ -7,12 +7,20 @@
 """
 
 import json
+import hashlib
 import logging
 import random
 from copy import deepcopy
 
-from ..config import DEFAULT_MINER_TEMPLATE
+from ..config import DEFAULT_MINER_TEMPLATE, EVALUATION_PROTOCOL_VERSION
+from ..feedback import (
+    DEFAULT_CONTEXT_POLICY,
+    ensure_training_safe,
+    normalise_scoring_weights,
+    resolve_context_policy,
+)
 from ..llm import client as llm
+from ..observability import redact_text, redact_value
 
 logger = logging.getLogger("meta")
 
@@ -101,6 +109,16 @@ def clamp_template(raw: dict, base: dict | None = None) -> dict:
                 "consistency_weight": max(0.05, min(0.5, float(sw.get("consistency_weight", 0.25)))),
                 "turnover_weight": max(0.1, min(0.7, float(sw.get("turnover_weight", 0.30)))),
             }
+            base["scoring_weights"] = normalise_scoring_weights(base)
+
+    if "context_policy" in raw and isinstance(raw["context_policy"], dict):
+        candidate = {
+            **DEFAULT_CONTEXT_POLICY,
+            **raw["context_policy"],
+        }
+        base["context_policy"] = resolve_context_policy(
+            {"context_policy": candidate}
+        )
 
     # DSL 模板: LLM 可能返回字符串, 自动修复
     if "dsl_exploration_templates" in raw:
@@ -148,6 +166,7 @@ def random_jitter(template: dict) -> tuple[dict, str]:
         if len(keys) >= 2:
             a, b = random.sample(keys, 2)
             sw[a], sw[b] = round(random.uniform(0.1, 0.7), 2), round(random.uniform(0.1, 0.7), 2)
+            t["scoring_weights"] = normalise_scoring_weights(t)
             return t, f"随机交换评分权重 {a}<->{b}"
     elif action == "add_template":
         tpl = random.choice([
@@ -179,23 +198,203 @@ _SYSTEM_V2 = """你是自动化因子挖掘系统的元优化器 (Meta-Optimizer
 1. **system_prompt**: 内层 LLM 的系统提示词 (经济学假设模板/防过拟合指令/输出格式)
 2. **draft_strategy**: 起草新因子的策略描述 (探索方向/机制多样性/窗口偏好)
 3. **improve_strategy**: 改进已有因子的策略描述 (复合方式/算子替换/归一化)
-4. **context_strategy**: 如何向 LLM 展示历史因子 (top-k/聚类/失败模式摘要)
-5. **diversity_instruction**: 多样性约束措辞
-6. **scoring_weights**: 评分偏好权重 (icir/consistency/turnover 三者权重)
-7. **dsl_exploration_templates**: 引导探索的 DSL 模板列表 (带占位符)
+4. **context_strategy**: 如何解释和使用评价反馈
+5. **context_policy**: 高分/近失/失败/错误样本的数量边界
+6. **diversity_instruction**: 多样性约束措辞
+7. **scoring_weights**: 只控制上下文示例优先级, 绝不改变权威评价分
+8. **dsl_exploration_templates**: 会真实进入内层提示词的 DSL 结构样例
 
 安全边界 (你绝不能触碰):
-- 评估器代码 (只读) | 数据层 (只读) | 四级隔离边界 (只读)
+- 权威 V4 评估器与数据层只读；最终封存评价不可作为训练反馈
 - 不得在模板中引用特定年份/era/数据层名称
 - 不得注入 Python 代码或文件系统操作
+- 所有改动必须引用历史报告中的证据；没有证据时应声明为探索性假设
 
 你会看到:
 - 当前在位模板
-- 历史模板版本与其 meta-score (跨任务/多种子 gate 分数均值)
-- 最近失败提案 (可选)
+- 同一评价协议下的历史模板版本
+- 跨任务/多种子的通过率、分数方差、组件均值、失败原因与重复率
+- 上轮提案假设、结果反思和下一步建议
 
-只回复 JSON: {{"changed_fields": ["字段名列表"], "template": {{要修改的字段}}, "note": "改动逻辑与预期效果"}}
-如果认为当前模板已足够好, 返回: {{"changed_fields": [], "note": "无需改动"}}"""
+只回复 JSON:
+{{
+  "reflection": {{
+    "diagnosis": ["基于证据的问题"],
+    "lessons_applied": ["本轮吸取的经验"],
+    "evidence_used": ["引用的版本/任务/指标"],
+    "hypothesis": "本次改动为何应改善评价"
+  }},
+  "changed_fields": ["字段名列表"],
+  "template": {{要修改的字段}},
+  "note": "改动逻辑、预期改善组件和停止条件"
+}}
+如果证据不足或当前模板已足够好, 返回 changed_fields=[] 并明确说明。"""
+
+
+def _compact_feedback_report(report: dict | None) -> dict:
+    report = dict(report or {})
+    compact = {
+        "attempts": report.get("attempts", 0),
+        "errors": report.get("errors", 0),
+        "pass_rate": report.get("pass_rate", 0.0),
+        "seed_score_mean": report.get(
+            "seed_score_mean",
+            report.get("score_mean", 0.0),
+        ),
+        "seed_score_std": report.get(
+            "seed_score_std",
+            report.get("score_std", 0.0),
+        ),
+        "duplicate_rate": report.get("duplicate_rate", 0.0),
+        "source_counts": report.get("source_counts", {}),
+        "component_means": report.get("component_means", {}),
+        "metric_means": {
+            key: value
+            for key, value in (report.get("metric_means") or {}).items()
+            if key in {
+                "icir",
+                "portfolio_sharpe",
+                "return_hac_t",
+                "sharpe_lcb",
+                "ann_return_lcb",
+                "era_consistency",
+                "profitable_era_rate",
+                "monotonicity",
+                "daily_turnover",
+                "worst_stress_sharpe",
+                "cost_cushion_multiple",
+            }
+        },
+        "failure_reason_counts": dict(
+            list((report.get("failure_reason_counts") or {}).items())[:8]
+        ),
+        "improvement_target_counts": dict(
+            list(
+                (report.get("improvement_target_counts") or {}).items()
+            )[:6]
+        ),
+        "seeds": [
+            {
+                "seed": row.get("seed"),
+                "meta_score": row.get("meta_score"),
+                "task_best_scores": row.get("task_best_scores", {}),
+            }
+            for row in (report.get("seeds") or [])[:8]
+            if isinstance(row, dict)
+        ],
+        "by_task": {
+            task: {
+                "attempts": row.get("attempts", 0),
+                "pass_rate": row.get("pass_rate", 0.0),
+                "score_mean": row.get("score_mean", 0.0),
+                "score_best": row.get("score_best", 0.0),
+                "errors": row.get("errors", 0),
+                "duplicate_rate": row.get("duplicate_rate", 0.0),
+                "failure_reason_counts": dict(
+                    list(
+                        (row.get("failure_reason_counts") or {}).items()
+                    )[:4]
+                ),
+            }
+            for task, row in (report.get("by_task") or {}).items()
+        },
+        "feedback_fingerprint": report.get("feedback_fingerprint"),
+    }
+    ensure_training_safe(compact)
+    return compact
+
+
+def _compact_template(template: dict | None) -> dict:
+    template = dict(template or {})
+    return {
+        "system_prompt": str(template.get("system_prompt") or "")[:500],
+        "anti_overfit_instruction": str(
+            template.get("anti_overfit_instruction") or ""
+        )[:300],
+        "draft_strategy": str(template.get("draft_strategy") or "")[:500],
+        "improve_strategy": str(
+            template.get("improve_strategy") or ""
+        )[:500],
+        "context_strategy": str(
+            template.get("context_strategy") or ""
+        )[:400],
+        "context_policy": resolve_context_policy(template),
+        "diversity_instruction": str(
+            template.get("diversity_instruction") or ""
+        )[:300],
+        "scoring_weights": normalise_scoring_weights(template),
+        "dsl_exploration_templates": [
+            str(item)[:200]
+            for item in (
+                template.get("dsl_exploration_templates") or []
+            )[:8]
+        ],
+    }
+
+
+def _as_text_list(value: object, limit: int) -> list[str]:
+    if value is None:
+        return []
+    rows = value if isinstance(value, list) else [value]
+    return [
+        str(item)[:limit]
+        for item in rows[:10]
+        if str(item).strip()
+    ]
+
+
+def _clean_reflection(value: dict | None) -> dict:
+    value = dict(value) if isinstance(value, dict) else {}
+    result = {
+        "diagnosis": _as_text_list(value.get("diagnosis"), 400)[:8],
+        "lessons_applied": _as_text_list(
+            value.get("lessons_applied"),
+            400,
+        )[:8],
+        "evidence_used": _as_text_list(
+            value.get("evidence_used"),
+            300,
+        )[:10],
+        "hypothesis": str(value.get("hypothesis") or "")[:1000],
+    }
+    ensure_training_safe(result)
+    return result
+
+
+def _history_context(
+    history: list[dict],
+    protocol: str = EVALUATION_PROTOCOL_VERSION,
+) -> tuple[str, str]:
+    """Render only comparable history and return its context fingerprint."""
+    comparable = [
+        row
+        for row in history
+        if row.get("evaluation_protocol") == protocol
+    ][-10:]
+    payload = []
+    for row in comparable:
+        payload.append({
+            "version": row.get("version_no"),
+            "status": row.get("status"),
+            "meta_score": row.get("meta_score"),
+            "note": str(row.get("template_note") or "")[:300],
+            "feedback": _compact_feedback_report(
+                row.get("feedback_summary")
+            ),
+            "reflection": redact_value(row.get("reflection") or {}),
+            "template_controls": _compact_template(row.get("template")),
+            "context_fingerprint": row.get("context_fingerprint"),
+        })
+    ensure_training_safe(payload)
+    text = (
+        json.dumps(payload, ensure_ascii=False, indent=2)
+        if payload
+        else "(当前协议暂无已完成历史)"
+    )
+    fingerprint = hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()[:16]
+    return text, fingerprint
 
 
 async def propose_template(
@@ -205,30 +404,19 @@ async def propose_template(
     market: str = "us",
     portfolio_mode: str = "long_short",
     direction: int = 1,
-) -> tuple[dict, str, str]:
-    """返回 (new_template, note, source).
+    trace_context: dict | None = None,
+) -> tuple[dict, str, str, dict]:
+    """返回 (new_template, note, source, proposal_reflection).
 
-    history: [{"version_no": int, "meta_score": float, "status": str, "template_note": str}, ...]
+    Only rows tagged with the current protocol may become model feedback.
     """
+    hist_text, history_fingerprint = _history_context(history)
+    fallback_reason = "provider_not_configured"
+    text: str | None = None
     if provider:
         try:
-            # 构造历史上下文
-            hist_lines = []
-            for h in history[-12:]:
-                ms = h.get('meta_score')
-                meta_str = f"{ms:.3f}" if ms is not None else "?"
-                hist_lines.append(
-                    f"- v{h['version_no']} meta={meta_str} "
-                    f"status={h['status']} note={str(h.get('template_note','?'))[:80]}"
-                )
-            hist_text = "\n".join(hist_lines) if hist_lines else "(无历史)"
-
-            # 展示当前在位模板的关键字段
             current_summary = {
-                "draft_strategy": incumbent_template.get("draft_strategy", "")[:200],
-                "improve_strategy": incumbent_template.get("improve_strategy", "")[:200],
-                "scoring_weights": incumbent_template.get("scoring_weights", {}),
-                "dsl_templates_count": len(incumbent_template.get("dsl_exploration_templates", [])),
+                **_compact_template(incumbent_template),
                 "min_public_icir": incumbent_template.get("min_public_icir", 0.25),
             }
 
@@ -238,32 +426,68 @@ async def propose_template(
                 f"({'高因子值偏多' if direction == 1 else '低因子值偏多'})\n"
                 f"{'只能做多，评价只奖励正向收益和多头稳定性。' if portfolio_mode == 'long_only' else '允许多空，评价可同时使用多头和空头收益。'}\n\n"
                 f"=== 当前在位模板 ===\n{current_summary}\n\n"
-                f"=== 历史版本 ===\n{hist_text}\n\n"
-                f"请分析当前模板的问题, 提出改进。"
-                f"重点考虑: 1)探索方向是否过于单一 2)评分是否过于偏好高IC高换手 "
-                f"3)指令是否足够具体 4)是否缺少多样性约束。"
+                f"=== 同协议历史与评价反馈 ===\n{hist_text}\n\n"
+                "请先判断上轮假设得到支持、被证伪还是证据不足，再提出下一项最小可归因改动。"
+                "重点检查任务间退化、种子方差、通过率、失败原因、重复率、随机回退率和最弱评价组件。"
             )
 
             logger.info("外层 LLM 调用中...")
-            text = await llm.chat(provider, _SYSTEM_V2, user, 0.7)
+            text = await llm.chat(
+                provider,
+                _SYSTEM_V2,
+                user,
+                0.7,
+                trace={
+                    **(trace_context or {}),
+                    "role": "outer",
+                    "phase": "template_proposal",
+                    "feedback_fingerprint": history_fingerprint,
+                },
+            )
             logger.info("外层 LLM 返回 %d 字符", len(text))
             data = llm.extract_json(text)
+            reflection = _clean_reflection(data.get("reflection"))
+            reflection["history_context_fingerprint"] = history_fingerprint
 
             changed = data.get("changed_fields", [])
             if not changed:
                 logger.info("外层 LLM 判定无需改动")
-                return deepcopy(incumbent_template), "外层 LLM 判定无需改动", "llm"
+                await llm.mark_validation(text, accepted=True)
+                return (
+                    deepcopy(incumbent_template),
+                    str(data.get("note") or "外层 LLM 判定无需改动")[:500],
+                    "llm",
+                    reflection,
+                )
 
+            if (
+                not reflection["hypothesis"]
+                or not reflection["diagnosis"]
+            ):
+                raise llm.LLMError(
+                    "外层改动缺少可审计的 diagnosis/hypothesis"
+                )
             raw_updates = data.get("template", {})
             logger.info("外层 LLM 拟改动 %d 个字段: %s", len(raw_updates), list(raw_updates.keys())[:10])
             new_template = clamp_template(raw_updates, incumbent_template)
-            note = str(data.get("note", ""))[:300]
+            note = str(data.get("note", ""))[:500]
 
             # 安全检查
             err = validate_template(new_template)
             if err:
                 logger.warning("外层模板安全检查拒绝: %s", err)
-                return deepcopy(incumbent_template), f"安全检查拒绝: {err}", "llm_rejected"
+                reflection["diagnosis"].append(f"模板安全检查拒绝: {err}")
+                await llm.mark_validation(
+                    text,
+                    accepted=False,
+                    error=err,
+                )
+                return (
+                    deepcopy(incumbent_template),
+                    f"安全检查拒绝: {err}",
+                    "llm_rejected",
+                    reflection,
+                )
 
             # 检查实质改动
             changed_keys = [k for k in new_template if new_template.get(k) != incumbent_template.get(k)]
@@ -272,13 +496,194 @@ async def propose_template(
             else:
                 logger.warning("外层模板无实质改动 (LLM返回了changed_fields但clamp后无变化)")
 
-            return new_template, note, "llm"
+            reflection["changed_fields"] = changed_keys
+            await llm.mark_validation(text, accepted=True)
+            return new_template, note, "llm", reflection
 
-        except Exception as e:
-            logger.warning("外层 LLM 异常, 回退随机: %s", str(e)[:300])
+        except Exception as exc:
+            fallback_reason = redact_text(exc, 300)
+            await llm.mark_validation(
+                text,
+                accepted=False,
+                error=fallback_reason,
+            )
+            logger.warning(
+                "外层 LLM 异常, 回退随机: %s",
+                fallback_reason,
+            )
 
     t, note = random_jitter(incumbent_template)
-    return t, note, "random"
+    return (
+        t,
+        note,
+        "random",
+        {
+            "diagnosis": ["外层 LLM 不可用或输出无效"],
+            "lessons_applied": [],
+            "evidence_used": [history_fingerprint] if history_fingerprint else [],
+            "hypothesis": "随机微调仅用于维持搜索连续性，不视为模型反思。",
+            "fallback_reason": fallback_reason,
+            "history_context_fingerprint": history_fingerprint,
+        },
+    )
+
+
+_REFLECTION_SYSTEM = """你是因子研究外层审稿人。
+你只能依据同一评价协议下的训练安全聚合报告，复盘模板改动是否有效。
+不得臆测未提供的数据，不得要求查看最终封存评价，不得改写权威评价器。
+只回复 JSON:
+{
+  "hypothesis_result": "supported|refuted|inconclusive",
+  "lessons": [{"observation":"证据","interpretation":"解释","action":"下一轮动作"}],
+  "avoid_patterns": ["应避免的重复失败"],
+  "next_experiment": "一个最小、可归因的下一步实验",
+  "stop_condition": "何时停止沿此方向搜索"
+}"""
+
+
+def _deterministic_outcome_reflection(
+    comparison: dict,
+    *,
+    accepted: bool,
+) -> dict:
+    deltas = comparison.get("deltas") or {}
+    failures = comparison.get("candidate_failures") or {}
+    result = "supported" if accepted else "refuted"
+    if abs(float(deltas.get("seed_score_mean") or 0.0)) < 1e-9:
+        result = "inconclusive"
+    top_failure = next(iter(failures), "没有可归因的失败样本")
+    return {
+        "hypothesis_result": result,
+        "lessons": [{
+            "observation": (
+                f"seed_score_delta={deltas.get('seed_score_mean', 0)}, "
+                f"pass_rate_delta={deltas.get('pass_rate', 0)}, "
+                f"duplicate_delta={deltas.get('duplicate_rate', 0)}"
+            ),
+            "interpretation": (
+                "候选模板通过统计门"
+                if accepted
+                else f"候选模板未通过统计门；主要失败为 {top_failure}"
+            ),
+            "action": (
+                "保留改动并只验证一个相邻假设"
+                if accepted
+                else "撤销本次改动，针对主要失败做单变量实验"
+            ),
+        }],
+        "avoid_patterns": list(failures)[:5],
+        "next_experiment": (
+            "围绕最弱评价组件做一个单字段模板改动，并冻结其他字段。"
+        ),
+        "stop_condition": "连续两轮同一失败原因占主导且组件无改善时停止该方向。",
+        "source": "deterministic",
+    }
+
+
+async def reflect_on_outcome(
+    *,
+    proposal_reflection: dict,
+    candidate_report: dict,
+    incumbent_report: dict,
+    comparison: dict,
+    accepted: bool,
+    p_value: float,
+    provider: dict | None,
+    trace_context: dict | None = None,
+) -> tuple[dict, str]:
+    """Persistable post-decision reflection that becomes next-step context."""
+    safe_payload = {
+        "proposal_reflection": proposal_reflection,
+        "candidate_report": _compact_feedback_report(candidate_report),
+        "incumbent_report": _compact_feedback_report(incumbent_report),
+        "comparison": comparison,
+        "decision": {
+            "accepted": bool(accepted),
+            "p_value": round(float(p_value), 6),
+        },
+    }
+    ensure_training_safe(safe_payload)
+    text: str | None = None
+    if provider:
+        try:
+            user = json.dumps(safe_payload, ensure_ascii=False, indent=2)
+            text = await llm.chat(
+                provider,
+                _REFLECTION_SYSTEM,
+                user,
+                0.2,
+                trace={
+                    **(trace_context or {}),
+                    "role": "outer_reflection",
+                    "phase": "post_decision_reflection",
+                    "feedback_fingerprint": comparison.get(
+                        "comparison_fingerprint",
+                        "",
+                    ),
+                },
+            )
+            data = llm.extract_json(text)
+            lessons = []
+            raw_lessons = data.get("lessons") or []
+            if not isinstance(raw_lessons, list):
+                raw_lessons = [raw_lessons]
+            for row in raw_lessons[:8]:
+                if not isinstance(row, dict):
+                    continue
+                lessons.append({
+                    "observation": str(row.get("observation") or "")[:500],
+                    "interpretation": str(
+                        row.get("interpretation") or ""
+                    )[:500],
+                    "action": str(row.get("action") or "")[:500],
+                })
+            hypothesis_result = str(
+                data.get("hypothesis_result") or "inconclusive"
+            ).lower()
+            if hypothesis_result not in {
+                "supported",
+                "refuted",
+                "inconclusive",
+            }:
+                hypothesis_result = "inconclusive"
+            next_experiment = str(
+                data.get("next_experiment") or ""
+            )[:1000]
+            stop_condition = str(
+                data.get("stop_condition") or ""
+            )[:800]
+            if not lessons or not next_experiment or not stop_condition:
+                raise llm.LLMError(
+                    "外层结果反思缺少 lessons/next_experiment/stop_condition"
+                )
+            result = {
+                "hypothesis_result": hypothesis_result,
+                "lessons": lessons,
+                "avoid_patterns": _as_text_list(
+                    data.get("avoid_patterns"),
+                    300,
+                )[:8],
+                "next_experiment": next_experiment,
+                "stop_condition": stop_condition,
+                "source": "llm",
+                "comparison_fingerprint": comparison.get(
+                    "comparison_fingerprint",
+                ),
+            }
+            ensure_training_safe(result)
+            await llm.mark_validation(text, accepted=True)
+            return result, "llm"
+        except Exception as exc:
+            await llm.mark_validation(
+                text,
+                accepted=False,
+                error=exc,
+            )
+            logger.warning("外层结果反思失败，使用确定性摘要: %s", str(exc)[:300])
+    return _deterministic_outcome_reflection(
+        comparison,
+        accepted=accepted,
+    ), "deterministic"
 
 
 # ============================================================
@@ -330,6 +735,7 @@ async def propose_spec(
     incumbent_spec: dict, history: list[dict], provider: dict | None
 ) -> tuple[dict, str, str]:
     """旧版接口: 返回 (new_spec, note, source)。A组兼容。"""
+    text: str | None = None
     if provider:
         try:
             hist = "\n".join(
@@ -343,8 +749,19 @@ async def propose_spec(
             data = llm.extract_json(text)
             new_spec = _clamp({**incumbent_spec, **data.get("spec", {})})
             if new_spec != incumbent_spec:
+                await llm.mark_validation(text, accepted=True)
                 return new_spec, str(data.get("note", ""))[:300], "llm"
-        except Exception as e:
-            logger.warning("外层 LLM 回退随机: %s", str(e)[:200])
+            await llm.mark_validation(
+                text,
+                accepted=False,
+                error="旧版外层返回与在位配置相同",
+            )
+        except Exception as exc:
+            await llm.mark_validation(
+                text,
+                accepted=False,
+                error=exc,
+            )
+            logger.warning("外层 LLM 回退随机: %s", str(exc)[:200])
     spec, note = _random_jitter_old(incumbent_spec)
     return spec, note, "random"

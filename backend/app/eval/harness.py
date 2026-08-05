@@ -848,6 +848,25 @@ def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -
         "score": round(score, 4),
         "passed": passed,
         "components": {key: round(value, 4) for key, value in components.items()},
+        # These are the conservative PUBLIC/META_TRAIN aggregates that
+        # actually drove the discovery decision.  They are safe to feed back
+        # to the miner and prevent a single optimistic layer from being shown
+        # as the reason for a score.
+        "effective_metrics": {
+            "coverage": round(coverage, 6),
+            "icir": round(icir, 4),
+            "portfolio_sharpe": round(sharpe, 4),
+            "era_consistency": round(consistency, 4),
+            "profitable_era_rate": round(profitable_era_rate, 4),
+            "monotonicity": round(monotonicity, 4),
+            "daily_turnover": round(turnover, 6),
+            "worst_stress_sharpe": round(stress, 4),
+            "return_hac_t": round(return_t, 4),
+            "sharpe_lcb": round(sharpe_lcb, 4),
+            "ann_return_lcb": round(ann_return_lcb, 6),
+            "cost_cushion_multiple": round(cost_cushion, 4),
+            "hac_p_value": round(hac_p, 6),
+        },
         "selection_evidence": {
             "multiple_testing_trials": trials,
             "hurdle_t": round(selection_hurdle, 4),

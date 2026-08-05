@@ -1,6 +1,6 @@
 """内层 Factor Miner v2: 由 MinerTemplate 驱动 (prompt/策略/模板全部可被外层改写).
 
-纪律: 提示词只包含 INNER_PUBLIC 层指标, gate 指标永不进入上下文.
+纪律: 提示词只包含训练安全的 V4 聚合反馈；最终封存层永不进入上下文.
 """
 
 import logging
@@ -8,7 +8,13 @@ import random
 
 from ..config import DEFAULT_MINER_TEMPLATE, DSL_FIELDS, get_dsl_fields
 from ..dsl.engine import OPERATORS_DOC, validate
+from ..feedback import (
+    build_feedback_envelope,
+    build_inner_feedback_context,
+    ensure_training_safe,
+)
 from ..llm import client as llm
+from ..observability import redact_text
 
 logger = logging.getLogger("miner")
 
@@ -19,9 +25,14 @@ _WINDOWS = [3, 5, 10, 20, 40, 60, 120]
 # 随机回退 (无 LLM 时)
 # ============================================================
 
-def random_expression(templates: list[str] | None = None, fields: list[str] | None = None) -> str:
+def random_expression(
+    templates: list[str] | None = None,
+    fields: list[str] | None = None,
+    rng: random.Random | None = None,
+) -> str:
     """使用模板生成随机表达式。"""
-    f = random.choice
+    generator = rng or random
+    f = generator.choice
     w = lambda: f(_WINDOWS)  # noqa: E731
     field = lambda: f(fields or _FIELDS)  # noqa: E731
 
@@ -31,7 +42,10 @@ def random_expression(templates: list[str] | None = None, fields: list[str] | No
         expr = tpl.replace("{window}", str(w()))
         expr = expr.replace("{field1}", field()).replace("{field2}", field())
         expr = expr.replace("{field}", field())
-        expr = expr.replace("{-}", "-" if random.random() < 0.5 else "")
+        expr = expr.replace(
+            "{-}",
+            "-" if generator.random() < 0.5 else "",
+        )
         if validate(expr, fields or _FIELDS) is None:
             return expr
 
@@ -53,12 +67,14 @@ def mutate_expression(
     expr: str,
     templates: list[str] | None = None,
     fields: list[str] | None = None,
+    rng: random.Random | None = None,
 ) -> str:
     """轻量随机变异: 换窗口/翻方向/加 rank。"""
+    generator = rng or random
     out = expr
     for old, new in [(str(a), str(b)) for a in _WINDOWS for b in _WINDOWS if a != b]:
         token = f", {old})"
-        if token in out and random.random() < 0.3:
+        if token in out and generator.random() < 0.3:
             out = out.replace(token, f", {new})", 1)
             break
     if out == expr:
@@ -104,44 +120,75 @@ def _build_system_prompt(
         f"可用字段 ({len(fields)}个): {', '.join(fields)}\n"
         f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
         f"窗口: 1..250 整数\n"
-        f"输出格式: 只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"...\"}}\n"
+        "权威目标: 改善 V4 保守 discovery score 的最弱组件；"
+        "费后收益/下置信界、HAC 置信度、跨期稳定性、分位单调性、"
+        "压力成本和可实施性不能由高 ICIR 抵消。\n"
+        "输出格式: 只回复 JSON: "
+        "{\"expression\":\"...\",\"hypothesis\":\"...\","
+        "\"reflection\":\"从反馈提炼的经验与本次改变\","
+        "\"targeted_failures\":[\"本次针对的失败原因\"],"
+        "\"expected_effect\":\"预期改善的评价组件\"}\n"
     )
     return constraints + "\n" + strategy_part
 
 
-def _build_context_block(top_nodes: list[dict], template: dict) -> str:
-    """按模板的 context_strategy 构造上下文。"""
-    if not top_nodes:
-        return "(暂无历史尝试)"
+def _feedback_envelopes(
+    nodes: list[dict],
+    *,
+    market: str,
+    portfolio_mode: str,
+    direction: int,
+) -> list[dict]:
+    envelopes = []
+    for node in nodes:
+        if node.get("feedback_summary"):
+            envelopes.append(dict(node["feedback_summary"]))
+            continue
+        envelopes.append(build_feedback_envelope(
+            node_id=node.get("id"),
+            parent_id=node.get("parent_id"),
+            task_name=str(node.get("task_name") or ""),
+            expression=str(node.get("expression") or ""),
+            hypothesis=str(node.get("hypothesis") or ""),
+            source=str(node.get("source") or "unknown"),
+            status=str(node.get("status") or "ok"),
+            error=node.get("error"),
+            public_score=node.get("public_score"),
+            public_metrics=dict(node.get("public_metrics") or {}),
+            evaluation_protocol=str(
+                node.get("evaluation_protocol")
+                or (node.get("public_metrics") or {}).get(
+                    "protocol_version",
+                    "legacy_unoriented",
+                )
+            ),
+            market=market,
+            portfolio_mode=portfolio_mode,
+            direction=direction,
+            proposal_meta=dict(node.get("proposal_meta") or {}),
+        ))
+    return envelopes
 
-    top_k = min(len(top_nodes), 8)
-    lines = []
 
-    # 高分因子
-    for i, n in enumerate(top_nodes[:top_k]):
-        lines.append(
-            f"- #{i+1} score={n['public_score']:.3f} icir={n['public_metrics'].get('icir',0):+.2f} "
-            f"daily_turnover={n['public_metrics'].get('daily_turnover', n['public_metrics'].get('turnover',0)):.1%} "
-            f"expr: {n['expression']}"
-        )
-
-    # 失败模式摘要 (如果模板要求)
-    ctx_strategy = template.get("context_strategy", "")
-    if "失败" in ctx_strategy or "fail" in ctx_strategy.lower():
-        low_nodes = [n for n in top_nodes if (n.get('public_score') or 0) < 0.3]
-        if low_nodes:
-            # 简单归纳: 统计常见算子
-            from collections import Counter
-            ops = Counter()
-            for n in low_nodes[:20]:
-                expr = n.get('expression', '')
-                for op in ['ts_corr', 'ts_delta', 'ts_rank', 'ts_mean', 'ts_std', 'rank', 'zscore']:
-                    if op in expr:
-                        ops[op] += 1
-            common_ops = [k for k, v in ops.most_common(2)]
-            lines.append(f"⚠ 失败模式: {len(low_nodes)} 个低分尝试, 常见算子: {common_ops}")
-
-    return "\n".join(lines)
+def _build_context_block(
+    top_nodes: list[dict],
+    template: dict,
+    *,
+    market: str = "us",
+    portfolio_mode: str = "long_short",
+    direction: int = 1,
+) -> str:
+    """Compatibility wrapper around the structured V4 feedback renderer."""
+    context, _ = build_inner_feedback_context(
+        _feedback_envelopes(
+            top_nodes,
+            market=market,
+            portfolio_mode=portfolio_mode,
+            direction=direction,
+        ),
+        template,
+    )
+    return context
 
 
 # ============================================================
@@ -155,8 +202,10 @@ async def propose(
     top_nodes: list[dict],
     provider: dict | None,
     fields: list[str] | None = None,
-) -> tuple[str, str, str]:
-    """返回 (expression, hypothesis, source).
+    trace_context: dict | None = None,
+    rng: random.Random | None = None,
+) -> tuple[str, str, str, dict]:
+    """返回 (expression, hypothesis, source, proposal_meta).
 
     template_or_spec: MinerTemplate (v2) 或 HarnessSpec (v1 兼容)
     LLM 失败/未配置时回退随机.
@@ -167,6 +216,8 @@ async def propose(
     portfolio_mode = task.get("mode", "long_short")
     market = task.get("market", "us")
     direction = int(task.get("direction", 1))
+    fallback_reason = "provider_not_configured"
+    text: str | None = None
 
     if provider:
         try:
@@ -187,44 +238,175 @@ async def propose(
                     direction,
                 )
             )
-            context = _build_context_block(top_nodes, template) if template else _context_block_old(top_nodes, template_or_spec)
+            if template:
+                context, feedback_snapshot = build_inner_feedback_context(
+                    _feedback_envelopes(
+                        top_nodes,
+                        market=market,
+                        portfolio_mode=portfolio_mode,
+                        direction=direction,
+                    ),
+                    template,
+                )
+            else:
+                context = _context_block_old(top_nodes, template_or_spec)
+                feedback_snapshot = {
+                    "schema_version": "legacy",
+                    "context_fingerprint": "",
+                }
+            base = max(
+                (
+                    node
+                    for node in top_nodes
+                    if str(node.get("status") or "ok") == "ok"
+                ),
+                key=lambda node: float(node.get("public_score") or 0.0),
+                default=None,
+            )
+            dsl_examples = (
+                "\n".join(
+                    f"- {row}"
+                    for row in template.get(
+                        "dsl_exploration_templates",
+                        [],
+                    )[:10]
+                )
+                if template
+                else ""
+            )
+            context_instruction = (
+                template.get("context_strategy", "")
+                if template
+                else ""
+            )
 
             if op == "draft":
                 draft_inst = template.get("draft_strategy", "提出与历史不同的新因子。") if template else "请提出一个与历史尝试思路不同的新因子。"
                 div_inst = template.get("diversity_instruction", "") if template else ""
                 user = (
                     f"任务: market={market}, portfolio_mode={portfolio_mode}, direction={direction}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
-                    f"历史尝试:\n{context}\n\n"
-                    f"策略指令: {draft_inst}\n{div_inst}"
+                    f"评价反馈与历史经验:\n{context}\n\n"
+                    f"上下文使用要求: {context_instruction}\n"
+                    f"策略指令: {draft_inst}\n{div_inst}\n"
+                    f"可探索的 DSL 结构样例（只作语法启发，不得机械复制）:\n{dsl_examples or '(无)'}"
                 )
             else:  # improve
-                base = top_nodes[0] if top_nodes else None
                 impr_inst = template.get("improve_strategy", "改进当前最优因子。") if template else "请改进当前最优因子 (调整结构/窗口/复合), 保持简洁。"
                 user = (
                     f"任务: market={market}, portfolio_mode={portfolio_mode}, direction={direction}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
                     f"当前最优: {base['expression'] if base else '无'} "
                     f"(score={base['public_score']:.3f} icir={base['public_metrics'].get('icir',0):+.2f})\n"
-                    f"其余尝试:\n{_build_context_block(top_nodes[1:], template) if template else _context_block_old(top_nodes[1:], template_or_spec)}\n\n"
-                    f"改进策略: {impr_inst}"
+                    f"完整评价反馈与经验:\n{context}\n\n"
+                    f"上下文使用要求: {context_instruction}\n"
+                    f"改进策略: {impr_inst}\n"
+                    f"可探索的 DSL 结构样例（只作语法启发，不得机械复制）:\n{dsl_examples or '(无)'}"
                 )
 
             temp_val = float(template.get("llm_temperature", 0.9)) if template else float(template_or_spec.get("llm_temperature", 0.9))
-            text = await llm.chat(provider, system, user, temp_val)
+            trace = {
+                **(trace_context or {}),
+                "role": "inner",
+                "phase": f"proposal_{op}",
+                "task_name": task.get("name"),
+                "feedback_fingerprint": feedback_snapshot.get(
+                    "context_fingerprint",
+                    "",
+                ),
+                "feedback_schema": feedback_snapshot.get("schema_version"),
+            }
+            text = await llm.chat(
+                provider,
+                system,
+                user,
+                temp_val,
+                trace=trace,
+            )
             data = llm.extract_json(text)
             expr = str(data.get("expression", "")).strip()
             err = validate(expr, fields or _FIELDS)
             if err:
                 raise llm.LLMError(f"表达式非法: {err} | {expr}")
-            return expr, str(data.get("hypothesis", ""))[:500], "llm"
+            hypothesis = str(data.get("hypothesis") or "").strip()[:500]
+            reflection = str(data.get("reflection") or "").strip()[:800]
+            expected_effect = str(
+                data.get("expected_effect") or ""
+            ).strip()[:500]
+            targeted = data.get("targeted_failures") or []
+            if not isinstance(targeted, list):
+                targeted = [str(targeted)]
+            targeted = [
+                str(item).strip()[:240]
+                for item in targeted[:6]
+                if str(item).strip()
+            ]
+            if not hypothesis or not reflection or not expected_effect:
+                raise llm.LLMError(
+                    "LLM 输出缺少 hypothesis/reflection/expected_effect"
+                )
+            if top_nodes and not targeted:
+                raise llm.LLMError(
+                    "已有评价反馈时 targeted_failures 不能为空"
+                )
+            proposal_meta = {
+                "reflection": reflection,
+                "targeted_failures": targeted,
+                "expected_effect": expected_effect,
+                "feedback_context_fingerprint": feedback_snapshot.get(
+                    "context_fingerprint",
+                    "",
+                ),
+                "feedback_protocol": feedback_snapshot.get(
+                    "protocol_version",
+                ),
+            }
+            ensure_training_safe(proposal_meta)
+            await llm.mark_validation(text, accepted=True)
+            return (
+                expr,
+                hypothesis,
+                "llm",
+                proposal_meta,
+            )
 
-        except Exception as e:
-            logger.warning("LLM 回退随机: %s", str(e)[:200])
+        except Exception as exc:
+            fallback_reason = redact_text(exc, 300)
+            await llm.mark_validation(
+                text,
+                accepted=False,
+                error=fallback_reason,
+            )
+            logger.warning("LLM 回退随机: %s", fallback_reason[:200])
 
     # 回退随机
     tpls = template.get("dsl_exploration_templates") if template else None
+    fallback_meta = {
+        "reflection": "LLM 不可用或输出无效；本轮使用确定性随机回退，不作为模型经验。",
+        "targeted_failures": [],
+        "expected_effect": "仅维持搜索连续性",
+        "fallback_reason": fallback_reason,
+    }
     if op == "improve" and top_nodes:
-        return mutate_expression(top_nodes[0]["expression"], tpls, fields), "随机变异自当前最优", "random"
-    return random_expression(tpls, fields), "随机模板生成", "random"
+        base = max(
+            (
+                node
+                for node in top_nodes
+                if str(node.get("status") or "ok") == "ok"
+            ),
+            key=lambda node: float(node.get("public_score") or 0.0),
+            default=top_nodes[0],
+        )
+        return (
+            mutate_expression(base["expression"], tpls, fields, rng),
+            "随机变异自当前最优",
+            "random",
+            fallback_meta,
+        )
+    return (
+        random_expression(tpls, fields, rng),
+        "随机模板生成",
+        "random",
+        fallback_meta,
+    )
 
 
 # ============================================================

@@ -42,7 +42,18 @@ from ..factors.similarity import (
     expression_fingerprint,
     nearest_factors,
 )
-from ..models import Backtest, EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
+from ..models import (
+    Backtest,
+    EngineEvent,
+    Experiment,
+    Factor,
+    LLMCallAudit,
+    MinerVersion,
+    Node,
+    OuterStep,
+    Setting,
+    Trial,
+)
 from ..observability import (
     AsyncTTLCache,
     OBSERVABILITY,
@@ -223,9 +234,14 @@ class EngineStartReq(BaseModel):
 
 @router.post("/engine/start")
 async def engine_start(req: EngineStartReq | None = None):
-    mode = req.mode if req else "v1"
+    mode = req.mode if req else "v2"
     if mode not in ("v1", "v2"):
         raise HTTPException(400, "mode 必须为 v1 或 v2")
+    if mode == "v1":
+        raise HTTPException(
+            409,
+            "V1 引擎已冻结为历史只读实现；新研究只能使用 V2",
+        )
     return await EngineManager.get().start(mode, req.experiment_id if req else None)
 
 
@@ -241,17 +257,56 @@ async def engine_status():
     exp_id = await get_active_experiment_id()
     async with SessionLocal() as s:
         exp = await s.get(Experiment, exp_id)
+        protocol = (
+            (exp.research_config or {}).get("evaluation_protocol")
+            if exp
+            else EVALUATION_PROTOCOL_VERSION
+        ) or EVALUATION_PROTOCOL_VERSION
+        n_factors_all = await s.scalar(
+            select(func.count(Factor.id)).where(
+                Factor.experiment_id == exp_id
+            )
+        )
         n_factors = await s.scalar(
-            select(func.count(Factor.id)).where(Factor.experiment_id == exp_id))
+            select(func.count(Factor.id)).where(
+                Factor.experiment_id == exp_id,
+                Factor.evaluation_protocol == protocol,
+            )
+        )
+        n_nodes_all = await s.scalar(
+            select(func.count(Node.id)).where(Node.experiment_id == exp_id)
+        )
         n_nodes = await s.scalar(
-            select(func.count(Node.id)).where(Node.experiment_id == exp_id))
+            select(func.count(Node.id)).where(
+                Node.experiment_id == exp_id,
+                Node.evaluation_protocol == protocol,
+            )
+        )
+        n_steps_all = await s.scalar(
+            select(func.count(OuterStep.id)).where(
+                OuterStep.experiment_id == exp_id
+            )
+        )
         n_steps = await s.scalar(
-            select(func.count(OuterStep.id)).where(OuterStep.experiment_id == exp_id))
+            select(func.count(OuterStep.id)).where(
+                OuterStep.experiment_id == exp_id,
+                OuterStep.evaluation_protocol == protocol,
+            )
+        )
         accepted = await s.scalar(
-            select(func.count(OuterStep.id)).where(OuterStep.accepted, OuterStep.experiment_id == exp_id))
+            select(func.count(OuterStep.id)).where(
+                OuterStep.accepted,
+                OuterStep.experiment_id == exp_id,
+                OuterStep.evaluation_protocol == protocol,
+            )
+        )
         inc = await s.scalar(
             select(MinerVersion)
-            .where(MinerVersion.status == "incumbent", MinerVersion.experiment_id == exp_id)
+            .where(
+                MinerVersion.status == "incumbent",
+                MinerVersion.experiment_id == exp_id,
+                MinerVersion.evaluation_protocol == protocol,
+            )
             .order_by(MinerVersion.id.desc())
         )
     runtime = manager.status_for(exp_id)
@@ -259,9 +314,24 @@ async def engine_status():
         **runtime,
         "experiment": {"id": exp_id, "name": exp.name if exp else "?",
                        "status": exp.status if exp else "?"},
-        "counts": {"factors": n_factors, "nodes": n_nodes, "outer_steps": n_steps, "accepted": accepted},
+        "counts": {
+            "evaluation_protocol": protocol,
+            "factors": n_factors,
+            "factors_all": n_factors_all,
+            "nodes": n_nodes,
+            "nodes_all": n_nodes_all,
+            "outer_steps": n_steps,
+            "outer_steps_all": n_steps_all,
+            "accepted": accepted,
+        },
         "incumbent": {
-            "version_no": inc.version_no, "meta_score": inc.meta_score, "spec": inc.harness_spec,
+            "version_no": inc.version_no,
+            "meta_score": inc.meta_score,
+            "spec": inc.harness_spec,
+            "evaluation_protocol": inc.evaluation_protocol,
+            "feedback_summary": inc.feedback_summary,
+            "reflection": inc.reflection,
+            "context_fingerprint": inc.context_fingerprint,
         } if inc else None,
         "logs": runtime.get("logs", [])[-60:],
         "workers": manager.all_status(),
@@ -273,12 +343,25 @@ async def engine_progress(experiment_id: int | None = None):
     """外层 meta-score 步进序列 (可视化)."""
     exp_id = experiment_id or await get_active_experiment_id()
     async with SessionLocal() as s:
+        exp = await s.get(Experiment, exp_id)
+        protocol = (
+            (exp.research_config or {}).get("evaluation_protocol")
+            if exp
+            else EVALUATION_PROTOCOL_VERSION
+        ) or EVALUATION_PROTOCOL_VERSION
         rows = (await s.scalars(
-            select(OuterStep).where(OuterStep.experiment_id == exp_id).order_by(OuterStep.step_no))).all()
+            select(OuterStep).where(
+                OuterStep.experiment_id == exp_id,
+                OuterStep.evaluation_protocol == protocol,
+            ).order_by(OuterStep.step_no))).all()
     return {
+        "evaluation_protocol": protocol,
         "steps": [
             {"step": r.step_no, "candidate": r.candidate_score, "incumbent": r.incumbent_score,
-             "accepted": r.accepted, "note": r.detail.get("note", "")}
+             "accepted": r.accepted, "note": r.detail.get("note", ""),
+             "evaluation_protocol": r.evaluation_protocol,
+             "reflection": r.detail.get("outcome_reflection", {}),
+             "comparison": r.detail.get("comparison", {})}
             for r in rows
         ]
     }
@@ -299,15 +382,81 @@ async def research_tree(miner_version_id: int | None = None, experiment_id: int 
     return {
         "versions": [
             {"id": v.id, "version_no": v.version_no, "status": v.status, "meta_score": v.meta_score,
-             "note": v.proposal_note, "spec": v.harness_spec, "parent_id": v.parent_id}
+             "note": v.proposal_note, "spec": v.harness_spec, "parent_id": v.parent_id,
+             "evaluation_protocol": v.evaluation_protocol,
+             "feedback_summary": v.feedback_summary,
+             "reflection": v.reflection,
+             "context_fingerprint": v.context_fingerprint}
             for v in versions
         ],
         "nodes": [
             {"id": n.id, "parent_id": n.parent_id, "miner_version_id": n.miner_version_id,
-             "op": n.op, "expression": n.expression, "status": n.status,
+             "op": n.op, "expression": n.expression,
+             "hypothesis": n.hypothesis, "status": n.status,
+             "error": redact_text(n.error, 1200),
              "public_score": n.public_score, "source": n.source, "task": n.task_name,
-             "outer_step": n.outer_step_no, "created_at": str(n.created_at)}
+             "outer_step": n.outer_step_no, "created_at": str(n.created_at),
+             "evaluation_protocol": n.evaluation_protocol, "seed": n.seed,
+             "proposal_meta": n.proposal_meta,
+             "feedback_summary": n.feedback_summary}
             for n in nodes
+        ],
+    }
+
+
+@router.get("/llm/audits")
+async def llm_call_audits(
+    experiment_id: int | None = None,
+    role: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    include_content: bool = False,
+):
+    """Secret-safe prompt lineage for debugging the two-layer feedback loop."""
+    if not 1 <= limit <= 500:
+        raise HTTPException(400, "limit 必须在 1..500")
+    exp_id = experiment_id or await get_active_experiment_id()
+    query = select(LLMCallAudit).where(
+        LLMCallAudit.experiment_id == exp_id
+    )
+    if role:
+        query = query.where(LLMCallAudit.role == role)
+    if status:
+        query = query.where(LLMCallAudit.status == status)
+    async with SessionLocal() as session:
+        rows = (
+            await session.scalars(
+                query.order_by(LLMCallAudit.id.desc()).limit(limit)
+            )
+        ).all()
+    return {
+        "experiment_id": exp_id,
+        "include_content": include_content,
+        "calls": [
+            {
+                "id": row.id,
+                "role": row.role,
+                "phase": row.phase,
+                "status": row.status,
+                "provider_name": row.provider_name,
+                "model": row.model,
+                "evaluation_protocol": row.evaluation_protocol,
+                "miner_version_id": row.miner_version_id,
+                "outer_step_no": row.outer_step_no,
+                "task_name": row.task_name,
+                "prompt_hash": row.prompt_hash,
+                "feedback_fingerprint": row.feedback_fingerprint,
+                "latency_ms": row.latency_ms,
+                "error": redact_text(row.error, 1200),
+                "trace_meta": redact_value(row.trace_meta or {}),
+                "created_at": str(row.created_at),
+                **({
+                    "system_prompt": redact_text(row.system_prompt, 24_000),
+                    "user_prompt": redact_text(row.user_prompt, 32_000),
+                    "response": redact_text(row.response, 16_000),
+                } if include_content else {}),
+            }
+            for row in rows
         ],
     }
 
@@ -1633,6 +1782,8 @@ async def _database_observability() -> dict:
         "experiment_statuses": {},
         "factor_lifecycle": {},
         "event_levels_1h": {},
+        "protocol_lineage": {},
+        "llm_pipeline": {},
     }
     try:
         async with SessionLocal() as s:
@@ -1647,7 +1798,8 @@ async def _database_observability() -> dict:
                       (SELECT COUNT(*) FROM trials) AS trials,
                       (SELECT COUNT(*) FROM outer_steps) AS outer_steps,
                       (SELECT COUNT(*) FROM backtests) AS backtests,
-                      (SELECT COUNT(*) FROM engine_events) AS engine_events
+                      (SELECT COUNT(*) FROM engine_events) AS engine_events,
+                      (SELECT COUNT(*) FROM llm_call_audits) AS llm_call_audits
                     """
                 ))
             ).mappings().one()
@@ -1686,6 +1838,198 @@ async def _database_observability() -> dict:
                         "GROUP BY level"
                     ))
                 ).all()
+            }
+            protocol_lineage = {}
+            for table_name in (
+                "nodes",
+                "trials",
+                "miner_versions",
+                "outer_steps",
+                "factors",
+                "llm_call_audits",
+            ):
+                protocol_lineage[table_name] = {
+                    str(protocol): int(count)
+                    for protocol, count in (
+                        await s.execute(text(
+                            f"SELECT evaluation_protocol, COUNT(*) "
+                            f"FROM {table_name} "
+                            "GROUP BY evaluation_protocol "
+                            "ORDER BY COUNT(*) DESC"
+                        ))
+                    ).all()
+                }
+            result["protocol_lineage"] = {
+                "current_protocol": EVALUATION_PROTOCOL_VERSION,
+                "tables": protocol_lineage,
+                "policy": (
+                    "历史协议只读保留；当前 Miner 上下文、meta-score "
+                    "比较和外层决策仅使用同协议记录。"
+                ),
+            }
+
+            node_coverage = (
+                await s.execute(text(
+                    """
+                    SELECT COUNT(*) AS total,
+                           COUNT(*) FILTER (
+                             WHERE COALESCE(feedback_summary::jsonb, '{}'::jsonb)
+                                   <> '{}'::jsonb
+                           ) AS covered
+                    FROM nodes
+                    WHERE evaluation_protocol = :protocol
+                    """
+                ), {"protocol": EVALUATION_PROTOCOL_VERSION})
+            ).mappings().one()
+            version_coverage = (
+                await s.execute(text(
+                    """
+                    SELECT COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE meta_score IS NOT NULL)
+                             AS evaluated,
+                           COUNT(*) FILTER (
+                             WHERE meta_score IS NOT NULL
+                               AND COALESCE(feedback_summary::jsonb, '{}'::jsonb)
+                                   <> '{}'::jsonb
+                           ) AS reports,
+                           COUNT(*) FILTER (
+                             WHERE meta_score IS NOT NULL
+                               AND COALESCE(reflection::jsonb, '{}'::jsonb)
+                                   <> '{}'::jsonb
+                           ) AS reflections
+                    FROM miner_versions
+                    WHERE evaluation_protocol = :protocol
+                    """
+                ), {"protocol": EVALUATION_PROTOCOL_VERSION})
+            ).mappings().one()
+            llm_stats = (
+                await s.execute(text(
+                    """
+                    SELECT COUNT(*) AS total,
+                           COUNT(*) FILTER (
+                             WHERE created_at >= NOW() - INTERVAL '1 hour'
+                           ) AS calls_1h,
+                           COUNT(*) FILTER (
+                             WHERE status IN ('transport_error', 'rejected')
+                               AND created_at >= NOW() - INTERVAL '1 hour'
+                           ) AS errors_1h,
+                           AVG(latency_ms) FILTER (
+                             WHERE created_at >= NOW() - INTERVAL '1 hour'
+                           ) AS avg_latency_1h,
+                           percentile_cont(0.95) WITHIN GROUP (
+                             ORDER BY latency_ms
+                           ) FILTER (
+                             WHERE created_at >= NOW() - INTERVAL '1 hour'
+                           ) AS p95_latency_1h
+                    FROM llm_call_audits
+                    """
+                ))
+            ).mappings().one()
+            calls_by_role = {
+                str(role): int(count)
+                for role, count in (
+                    await s.execute(text(
+                        "SELECT role, COUNT(*) FROM llm_call_audits "
+                        "GROUP BY role ORDER BY COUNT(*) DESC"
+                    ))
+                ).all()
+            }
+            calls_by_status = {
+                str(status): int(count)
+                for status, count in (
+                    await s.execute(text(
+                        "SELECT status, COUNT(*) FROM llm_call_audits "
+                        "GROUP BY status ORDER BY COUNT(*) DESC"
+                    ))
+                ).all()
+            }
+            recent_llm_calls = (
+                await s.scalars(
+                    select(LLMCallAudit)
+                    .order_by(LLMCallAudit.id.desc())
+                    .limit(20)
+                )
+            ).all()
+
+            node_total = int(node_coverage["total"] or 0)
+            node_covered = int(node_coverage["covered"] or 0)
+            version_evaluated = int(version_coverage["evaluated"] or 0)
+            result["llm_pipeline"] = {
+                "feedback_schema": "factorfactory.evaluation-feedback/v1",
+                "outer_report_schema": "factorfactory.outer-feedback/v1",
+                "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                "isolation": {
+                    "training_feedback": "PUBLIC + META_TRAIN 保守聚合",
+                    "sealed_layers_in_prompts": False,
+                    "cross_protocol_context": False,
+                    "seed_context": "冻结共同历史 + 本种子独立增量",
+                },
+                "feedback_coverage": {
+                    "nodes_total": node_total,
+                    "nodes_with_feedback": node_covered,
+                    "nodes_ratio": round(
+                        node_covered / max(1, node_total),
+                        6,
+                    ) if node_total else None,
+                    "versions_total": int(
+                        version_coverage["total"] or 0
+                    ),
+                    "versions_evaluated": version_evaluated,
+                    "versions_with_report": int(
+                        version_coverage["reports"] or 0
+                    ),
+                    "versions_with_reflection": int(
+                        version_coverage["reflections"] or 0
+                    ),
+                    "reports_ratio": round(
+                        int(version_coverage["reports"] or 0)
+                        / max(1, version_evaluated),
+                        6,
+                    ) if version_evaluated else None,
+                    "reflections_ratio": round(
+                        int(version_coverage["reflections"] or 0)
+                        / max(1, version_evaluated),
+                        6,
+                    ) if version_evaluated else None,
+                },
+                "calls": {
+                    "total": int(llm_stats["total"] or 0),
+                    "calls_1h": int(llm_stats["calls_1h"] or 0),
+                    "errors_1h": int(llm_stats["errors_1h"] or 0),
+                    "avg_latency_ms_1h": (
+                        round(float(llm_stats["avg_latency_1h"]), 3)
+                        if llm_stats["avg_latency_1h"] is not None
+                        else None
+                    ),
+                    "p95_latency_ms_1h": (
+                        round(float(llm_stats["p95_latency_1h"]), 3)
+                        if llm_stats["p95_latency_1h"] is not None
+                        else None
+                    ),
+                    "by_role": calls_by_role,
+                    "by_status": calls_by_status,
+                },
+                "recent_calls": [
+                    {
+                        "id": row.id,
+                        "experiment_id": row.experiment_id,
+                        "role": row.role,
+                        "phase": row.phase,
+                        "status": row.status,
+                        "provider_name": row.provider_name,
+                        "model": row.model,
+                        "evaluation_protocol": row.evaluation_protocol,
+                        "miner_version_id": row.miner_version_id,
+                        "outer_step_no": row.outer_step_no,
+                        "task_name": row.task_name,
+                        "prompt_hash": row.prompt_hash,
+                        "feedback_fingerprint": row.feedback_fingerprint,
+                        "latency_ms": row.latency_ms,
+                        "error": redact_text(row.error, 500),
+                        "created_at": str(row.created_at),
+                    }
+                    for row in recent_llm_calls
+                ],
             }
         result["status"] = "ok"
         result["error"] = None
@@ -1963,12 +2307,14 @@ async def _collect_observability(
     requests = OBSERVABILITY.request_snapshot(window_seconds)
     service = OBSERVABILITY.service_snapshot()
     snapshot = {
-        "schema_version": "factorfactory.observability/v3",
+        "schema_version": "factorfactory.observability/v4",
         "generated_at": service["generated_at"],
         "service": service,
         "process": OBSERVABILITY.process_snapshot(),
         "requests": requests,
         "database": database,
+        "llm_pipeline": database.get("llm_pipeline", {}),
+        "protocol_lineage": database.get("protocol_lineage", {}),
         "data": data,
         "caches": {
             "panel": {
@@ -2103,6 +2449,9 @@ async def prometheus_metrics():
     pool = snapshot["database"]["pool"]
     data = snapshot["data"]
     screener_cache = snapshot["caches"]["screener"]
+    llm_pipeline = snapshot.get("llm_pipeline") or {}
+    llm_calls = llm_pipeline.get("calls") or {}
+    feedback_coverage = llm_pipeline.get("feedback_coverage") or {}
     lines = [
         "# HELP factorfactory_info Deployment identity.",
         "# TYPE factorfactory_info gauge",
@@ -2208,7 +2557,53 @@ async def prometheus_metrics():
             'factorfactory_slo_objectives{status="failed"} '
             f'{snapshot["slo"]["failed"]}'
         ),
+        "# TYPE factorfactory_llm_calls gauge",
+        (
+            'factorfactory_llm_calls{window="lifetime"} '
+            f'{llm_calls.get("total", 0)}'
+        ),
+        (
+            'factorfactory_llm_calls{window="1h"} '
+            f'{llm_calls.get("calls_1h", 0)}'
+        ),
+        "# TYPE factorfactory_llm_calls_by_status gauge",
+        "# TYPE factorfactory_llm_calls_by_role gauge",
+        "# TYPE factorfactory_llm_failures gauge",
+        (
+            'factorfactory_llm_failures{window="1h"} '
+            f'{llm_calls.get("errors_1h", 0)}'
+        ),
+        "# TYPE factorfactory_llm_latency_milliseconds gauge",
+        (
+            'factorfactory_llm_latency_milliseconds{window="1h",quantile="0.95"} '
+            f'{llm_calls.get("p95_latency_ms_1h") or 0}'
+        ),
+        "# TYPE factorfactory_feedback_coverage_ratio gauge",
+        (
+            'factorfactory_feedback_coverage_ratio{artifact="node"} '
+            f'{feedback_coverage.get("nodes_ratio", 0)}'
+        ),
+        (
+            'factorfactory_feedback_coverage_ratio{artifact="outer_report"} '
+            f'{feedback_coverage.get("reports_ratio", 0)}'
+        ),
+        (
+            'factorfactory_feedback_coverage_ratio{artifact="outer_reflection"} '
+            f'{feedback_coverage.get("reflections_ratio", 0)}'
+        ),
     ]
+    for status, count in (llm_calls.get("by_status") or {}).items():
+        lines.append(
+            'factorfactory_llm_calls_by_status{status="'
+            f'{_prometheus_escape(status)}'
+            f'"}} {count}'
+        )
+    for role, count in (llm_calls.get("by_role") or {}).items():
+        lines.append(
+            'factorfactory_llm_calls_by_role{role="'
+            f'{_prometheus_escape(role)}'
+            f'"}} {count}'
+        )
     for route in requests["routes"]:
         label = _prometheus_escape(route["route"])
         lines.extend([

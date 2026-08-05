@@ -1,8 +1,8 @@
 # USStockFactorFactory — 双层优化 LLM 因子挖掘工厂设计
 
-> 机构级设计蓝图 v0.4 · 2026-08-05（Evaluation Protocol V4）
+> 机构级设计蓝图 v0.5 · 2026-08-05（Evaluation Protocol V4 + 双层反馈契约）
 > 灵感来源：Weco AIDE²（bi-level autoresearch）× 机构因子投研全生命周期
-> 定位：**全新独立系统（greenfield）**，不依赖、不迁移任何既有因子平台
+> 定位：独立系统；历史已停任务与旧协议产物只读保留，当前协议另起可比较血缘
 
 ---
 
@@ -23,9 +23,9 @@
 ```mermaid
 flowchart TB
     subgraph OUTER["外层循环 Meta-Researcher（强模型，如 opus 级）"]
-        O1[读取内层 Miner 配置 + 历史评估报告] --> O2[提出 HarnessSpec 白名单内修改<br/>搜索策略/提示词/上下文/防过拟合参数]
+        O1[读取 MinerTemplate + 同协议历史报告/反思] --> O2[提出 MinerTemplate 白名单内修改<br/>搜索策略/提示词/上下文/DSL模板]
         O2 --> O3[在冻结协议下运行候选 Miner]
-        O3 --> O4{META_TRAIN meta-score<br/>显著优于在位者?}
+        O3 --> O4{多任务/多种子 meta-score<br/>单边统计门通过?}
         O4 -->|是| O5[候选成为新在位 Miner_k+1]
         O4 -->|否| O6[拒绝, 记录失败提案库]
     end
@@ -33,12 +33,12 @@ flowchart TB
     subgraph INNER["内层循环 Factor Miner（廉价快模型，如 flash 级）"]
         I1[假设生成<br/>经济直觉+文献先验+失败库] --> I2[因子代码实现<br/>受限算子 DSL]
         I2 --> I3[静态审计 + 沙箱执行]
-        I3 --> I4[评估 harness<br/>只返回 INNER_PUBLIC score]
+        I3 --> I4[评估 harness<br/>返回训练安全保守聚合反馈]
         I4 --> I5[树搜索: 起草/调试/改进]
         I5 --> I1
     end
 
-    OUTER -->|HarnessSpec 变更| INNER
+    OUTER -->|MinerTemplate 变更| INNER
     INNER -->|因子候选| EVAL[评估流水线 四级隔离]
     EVAL -->|meta-score 汇总| OUTER
     EVAL -->|通过全部关卡的因子| LIB[因子库 Factor Registry]
@@ -46,8 +46,9 @@ flowchart TB
     COMBINE --> PROD[模拟盘 → 实盘 → 监控 → 退役]
 ```
 
-- **内层循环（Factor Miner）**：一个 AIDE 式树搜索智能体，输入任务规格（universe、horizon、目标函数），输出因子候选（代码）。它只看得到 **public score**。
-- **外层循环（Meta-Researcher）**：优化的不是因子，而是 **Miner 本身**——但 P0–P2 阶段只允许修改声明式 `HarnessSpec` 白名单（§6），不允许自由重写任意代码。它的优化信号是 Miner 在异质任务篮子上的 **META_TRAIN meta-score**（诚实定性为自适应训练证据）；真实能力由从不参与选择的 **META_HOLDOUT** 与外部保留任务事后度量（二阶泛化）。
+- **内层循环（Factor Miner）**：一个 AIDE 式树搜索智能体，输入任务规格（universe、horizon、目标函数），输出因子候选（代码）。它读取 `INNER_PUBLIC + META_TRAIN` 的保守聚合评价信封：有效指标、评分组件、失败原因、改进目标和先前反思；不读取逐日明细、META_HOLDOUT 或 FACTOR_VAULT。
+- **外层循环（Meta-Researcher）**：优化的不是因子，而是 **Miner 本身**——当前只允许修改声明式 `MinerTemplate` 白名单（§6），不允许自由重写可执行代码。它读取同协议的跨任务/多种子聚合报告、候选/在位差异和历史结果反思；真实能力仍由从不参与选择的 **META_HOLDOUT** 与外部保留任务事后度量（二阶泛化）。
+- **反馈可证明**：每次 LLM 调用追加保存脱敏 prompt/response、prompt hash、反馈 fingerprint、协议、版本、任务、阶段、模型、延迟和错误。协议过滤与 prompt 安全检查双重阻止旧分数或封存层回灌。
 - 两层使用不同的模型经济学：内层跑量用廉价快模型，外层重写用最强模型（外层 token 成本相对整个评估是小头，与 AIDE² 结论一致）。
 
 ### 1.1 与 AIDE² 的关键差异（金融特有）
@@ -55,7 +56,7 @@ flowchart TB
 | 维度 | AIDE² (代码任务) | 本系统 (因子挖掘) | 应对 |
 |---|---|---|---|
 | 真值稳定性 | kernel 快慢是物理事实 | alpha 会衰减、机制切换 | era 化验证 + 协议世代更替 + 上线后监控 |
-| 噪声量级 | run-to-run ≈0.02–0.045 | 高一个数量级 | 更严接受门槛 + 配对检验 + 多 seed |
+| 噪声量级 | run-to-run ≈0.02–0.045 | 高一个数量级 | 更严接受门槛 + 单边 Student/Welch 检验 + 多 seed |
 | holdout 可再生性 | 可重新生成任务 | 历史数据不可再生 | 全局试验预算记账 + 四级隔离 + contaminated 标记 |
 | reward hacking 形态 | 骗过单元测试 | 前视偏差/幸存者偏差/成本忽略 | 因果 AsOfResearchView + 泄漏测试组 + 强制成本模型 |
 
@@ -178,8 +179,8 @@ fingerprint: {data_snapshot, protocol_generation, code, model, prompt, seed}  # 
 
 | 层 | 谁可见/可优化 | 用途 | 诚实定性 |
 |---|---|---|---|
-| **INNER_PUBLIC** | 内层 Miner 可见 | 因子挖掘的优化信号；约 6 个月一个 era，报告 era 分布 | 内层训练集 |
-| **META_TRAIN** | 外层可反复查询（仅分布摘要） | 外层接受/拒绝 Miner 版本的依据；因子 `public-gate-pass` 判定 | **外层的自适应训练证据**，不冒充 OOS |
+| **INNER_PUBLIC** | 内外层可见聚合反馈 | 因子挖掘的训练信号；约 6 个月一个 era，报告 era 分布 | 自适应训练证据 |
+| **META_TRAIN** | 内外层仅可见保守聚合，不见逐日明细 | discovery 的跨层保守门、外层接受/拒绝 Miner 版本的依据 | **双层循环的自适应训练证据**，不冒充 OOS |
 | **META_HOLDOUT** | Miner/外层不可见；研究员审计可见 | 生成冻结的实盘排序分，度量二阶泛化 | 外层的真样本外 |
 | **FACTOR_VAULT** | Miner/排序公式不可见 | 一次性晋级封印及“排序能否预测后续费后盈利”的校准目标 | 因子的终审样本外 |
 
@@ -224,13 +225,14 @@ F5 live_candidate_non_pit
 任一层发生方向反转、HAC 显著性不足、费后收益非正、成本压力失效、
 回撤/换手超限、多空市场 Beta 超限、单调性或 era 稳定性不足，均停止晋级并保存原因。
 
-**Public score（Miner 可见的优化信号）** — INNER_PUBLIC 层：
+**Discovery feedback（Miner/外层可见的优化信号）** — INNER_PUBLIC 与 META_TRAIN 的保守聚合：
 
-- RankIC 均值 / ICIR（按 era 聚合，报告 era 间分布）
-- 分位数组合多空收益（费前）
-- 换手率、半衰期（IC decay 曲线）
+- 两层中较差的方向调整 ICIR、费后组合 Sharpe、收益/Sharpe 下置信界、era 一致性、
+  盈利 era 比例、分位单调性、压力成本 Sharpe 和成本缓冲；
+- 两层中较差覆盖率、较高换手和较差 HAC 显著性；
+- 固定的 V4 组件分、硬失败原因与对应改进目标。原始分层逐日序列不进入 prompt。
 
-**Gate score（因子存活判定，Miner 不可见）** — META_TRAIN 层（`public-gate-pass` 判据；终审由 FACTOR_VAULT 一次性仲裁）：
+**原始层指标（只存库）** — PUBLIC/META_TRAIN 各自完整指标：
 
 ```
 gate_score = cost_adjusted_ICIR
@@ -243,14 +245,17 @@ gate_score = cost_adjusted_ICIR
 - 多空任务额外计入做空摩擦：借券费率分档代理（按流动性/市值）、shortable 代理（低价/微盘剔除）、locate 失败与 recall 的保守折减；无真实历史借券数据前取保守分位并在报告披露
 - 收益口径：§2.4 公司行动账本（未复权成交 + 股数调整 + 现金分红 + 前复权收益盯市交叉校验）
 
-**Meta-score（外层循环优化目标，基于 META_TRAIN）**：
+**Meta-score（外层循环优化目标）**：
 
 ```
-meta_score = Σ_task w_task · percentile(gate_score@META_TRAIN of top-k factors)
-           - λ · budget_overrun
+seed_score = mean_task(best_discovery_score_in_fixed_budget)
+meta_score = mean_seed(seed_score)
 ```
 
-即：一个 Miner 版本的好坏 = 固定预算下跨异质任务挖出的头部因子在 META_TRAIN 上的分数分布。该分数被外层反复优化，**定性为自适应训练证据**；Miner 的真实泛化由 META_HOLDOUT + 外部保留任务事后报告。
+候选与在位者使用同一个步前冻结历史反馈基线；每个 seed 只追加读取自己的新节点，不能从其他 seed
+继续学习。候选必须完整跑完预声明 seed 数、均值更高且单边检验 p 值低于阈值才接受。
+该分数被外层反复优化，**定性为自适应训练证据**；Miner 的真实泛化由
+META_HOLDOUT + 外部保留任务事后报告。
 
 ### 4.3 多重检验控制（机构级核心）
 
@@ -316,10 +321,13 @@ meta_score = Σ_task w_task · percentile(gate_score@META_TRAIN of top-k factors
 
 ## 6. 外层循环：Meta-Researcher（Layer 4）
 
-- **对象（P0–P2）**：声明式 `HarnessSpec` 白名单——搜索策略参数、操作算子开关与权重、提示词模板、上下文压缩策略、内部防过拟合参数。**评估器、数据接口、隐藏 broker、门禁与审计模块只读**（AST 扫描不是安全边界，白名单才是）。自由代码重写推迟到容器级隔离 + 行为测试套件成熟之后（P4）
-- **一步 = 一次 HarnessSpec 变更 + 一次冻结协议下的全任务篮子评估**；只有 meta-score 显著超过在位者（超出 noise band，多 seed 配对检验）才接受
+- **对象（当前）**：声明式 `MinerTemplate` 白名单——system/draft/improve/context/diversity 文本、
+  上下文样本数量、仅影响示例排序的权重和真实进入 prompt 的 DSL 结构模板。**评估器、权威分数、
+  数据接口、封存层、门禁与审计模块只读**。自由代码重写推迟到容器级隔离 + 行为测试套件成熟之后（P4）
+- **一步 = 一次 MinerTemplate 变更 + 一次冻结协议下的全任务篮子评估**；候选与在位使用共同冻结
+  历史上下文，多 seed 独立增量，只有完整预算、均值改善和单边统计门同时通过才接受
 - **评估协议**：
-  - 每个候选 Miner 跑 3 seeds × 4 任务，meta-score 取配对差
+  - 每个候选 Miner 跑预声明 seeds × 任务篮子；同时重测时用单边 Welch t，冻结在位分时用单样本 Student t
   - noise band 由在位 Miner 的重复运行方差估计（预算内定期重测）
 - **失败提案库**：所有被拒绝的重写连同其 meta-score 存档——既是外层的负样本上下文，也是研究资产（对应 AIDE² 2.5 节）
 - **点火测试（远期）**：当某个进化出的 Miner_k 表现稳定超过在位者，可实验性地把它装进外层席位，检验三阶泛化
@@ -328,7 +336,9 @@ meta_score = Σ_task w_task · percentile(gate_score@META_TRAIN of top-k factors
 
 - 外层的优化信号只来自 META_TRAIN 的聚合分布摘要（非逐日明细），且该层已诚实定性为外层训练集；META_HOLDOUT 与外部保留任务从不进入外层选择回路，只做事后报告（审计日志可证明）
 - 外层永远接触不到 FACTOR_VAULT
-- 外层提交的 HarnessSpec 变更经 schema 校验 + 静态审计；任何触碰只读模块的提案直接拒绝并记录
+- 外层提交的 MinerTemplate 变更经 schema 校验 + 静态审计；任何触碰只读模块的提案直接拒绝并记录
+- 每步决策后生成 `supported/refuted/inconclusive` 结果反思，保存证据、经验、避免模式、
+  下一项单变量实验与停止条件，下一轮只能读取同协议反思
 
 ---
 

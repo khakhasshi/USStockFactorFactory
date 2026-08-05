@@ -86,17 +86,17 @@ const Dashboard = {
     <div class="grid cols-4" style="margin-bottom:14px">
       <div class="card"><h3>引擎状态</h3>
         <div class="big-num" :style="{color: st.state==='running' ? 'var(--green)' : 'var(--red)'}">{{ st.state }}</div>
-        <div class="sub">实验: {{ st.experiment?.name ?? '—' }} · 外层步 {{ st.outer_step }} · 内层评估 {{ st.inner_evals }}</div>
+        <div class="sub">实验: {{ st.experiment?.name ?? '—' }} · {{ st.counts?.evaluation_protocol || '—' }} · 外层步 {{ st.outer_step }} · 内层评估 {{ st.inner_evals }}</div>
         <div style="margin-top:10px; display:flex; gap:8px">
           <button class="btn primary" @click="start" :disabled="st.state==='running'">启动 7×24</button>
           <button class="btn danger" @click="stop" :disabled="st.state!=='running'">停止</button>
         </div>
       </div>
-      <div class="card"><h3>因子库</h3><div class="big-num">{{ st.counts?.factors ?? '—' }}</div><div class="sub">已入库因子</div></div>
-      <div class="card"><h3>搜索树节点</h3><div class="big-num">{{ st.counts?.nodes ?? '—' }}</div><div class="sub">累计内层评估节点</div></div>
+      <div class="card"><h3>当前协议因子</h3><div class="big-num">{{ st.counts?.factors ?? '—' }}</div><div class="sub">全历史 {{ st.counts?.factors_all ?? '—' }} · 旧协议只读保留</div></div>
+      <div class="card"><h3>当前协议节点</h3><div class="big-num">{{ st.counts?.nodes ?? '—' }}</div><div class="sub">全历史 {{ st.counts?.nodes_all ?? '—' }} · 不混入当前上下文</div></div>
       <div class="card"><h3>外层接受率</h3>
         <div class="big-num">{{ acceptRate }}</div>
-        <div class="sub">{{ st.counts?.accepted ?? 0 }} / {{ st.counts?.outer_steps ?? 0 }} 步被接受</div>
+        <div class="sub">{{ st.counts?.accepted ?? 0 }} / {{ st.counts?.outer_steps ?? 0 }} 当前协议步 · 全历史 {{ st.counts?.outer_steps_all ?? '—' }}</div>
       </div>
     </div>
     <div class="card" style="margin-bottom:14px">
@@ -163,7 +163,7 @@ const Dashboard = {
         ],
       });
     }
-    async function start() { await api("/engine/start", { method: "POST" }); refresh(); }
+    async function start() { await api("/engine/start", { method: "POST", body: { mode: "v2" } }); refresh(); }
     async function stop() { await api("/engine/stop", { method: "POST" }); refresh(); }
     function startPolling() {
       refresh();
@@ -189,12 +189,14 @@ const ResearchTree = {
     <div class="card" style="margin-bottom:14px">
       <h3>Miner 版本演化 (外层)</h3>
       <table>
-        <tr><th>版本</th><th>状态</th><th>meta-score</th><th>提案</th></tr>
+        <tr><th>版本 / 协议</th><th>状态</th><th>meta-score</th><th>反馈报告</th><th>结果反思</th><th>提案</th></tr>
         <tr v-for="v in data.versions" :key="v.id" class="clickable" @click="selectVersion(v.id)"
             :style="{background: v.id===selected ? '#1c2733' : ''}">
-          <td>v{{ v.version_no }}</td>
+          <td>v{{ v.version_no }}<div class="sub">{{ v.evaluation_protocol || 'legacy' }}</div></td>
           <td><span class="tag" :class="{green: v.status==='incumbent', red: v.status==='rejected', amber: v.status==='superseded', blue: v.status==='candidate'}">{{ v.status }}</span></td>
           <td>{{ v.meta_score == null ? '—' : v.meta_score.toFixed(4) }}</td>
+          <td>{{ v.feedback_summary?.attempts ?? '—' }} attempts<div class="sub">pass {{ v.feedback_summary?.pass_rate == null ? '—' : (100*v.feedback_summary.pass_rate).toFixed(0)+'%' }}</div></td>
+          <td>{{ v.reflection?.outcome?.hypothesis_result || v.reflection?.proposal?.hypothesis || '—' }}<div class="sub">{{ v.reflection?.outcome?.source || '—' }}</div></td>
           <td style="color:var(--muted); max-width:500px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ v.note }}</td>
         </tr>
       </table>
@@ -204,7 +206,13 @@ const ResearchTree = {
       <div class="chart tall" ref="treeEl"></div>
       <div v-if="picked" style="margin-top:10px; padding:10px; border:1px solid var(--border); border-radius:6px">
         <div class="mono-expr">{{ picked.expression }}</div>
-        <div class="sub">op={{ picked.op }} · source={{ picked.source }} · task={{ picked.task }} · public_score={{ picked.public_score?.toFixed(4) }} · 状态: {{ picked.status }}</div>
+        <div class="sub">op={{ picked.op }} · source={{ picked.source }} · task={{ picked.task }} · seed={{ picked.seed ?? 'legacy' }} · protocol={{ picked.evaluation_protocol || 'legacy' }} · public_score={{ picked.public_score?.toFixed(4) }} · 状态: {{ picked.status }}</div>
+        <div v-if="picked.feedback_summary?.failure_reasons?.length" class="bad-text" style="margin-top:8px">评价反馈：{{ picked.feedback_summary.failure_reasons.join('；') }}</div>
+        <div v-if="picked.feedback_summary?.improvement_targets?.length" class="sub" style="margin-top:6px">下一步：{{ picked.feedback_summary.improvement_targets.join('；') }}</div>
+        <details v-if="picked.feedback_summary || picked.proposal_meta" class="ops-details">
+          <summary>查看本节点反馈信封与提案反思</summary>
+          <pre>{{ JSON.stringify({proposal:picked.proposal_meta, feedback:picked.feedback_summary}, null, 2) }}</pre>
+        </details>
       </div>
     </div>
   </div>`,
@@ -1207,6 +1215,12 @@ const ObservabilityView = {
           <small>running / tracked · {{ snapshot.process.supervised_tasks.failed }} failed</small>
           <small>journal {{ formatBytes(snapshot.service.journal.current_bytes) }} · {{ snapshot.service.journal.error || 'writable' }}</small>
         </article>
+        <article class="metric-card" :class="{danger: snapshot.llm_pipeline?.calls?.errors_1h}">
+          <span>双层 LLM 反馈闭环</span>
+          <b>{{ pct(snapshot.llm_pipeline?.feedback_coverage?.nodes_ratio) }}</b>
+          <small>节点反馈覆盖 · report {{ pct(snapshot.llm_pipeline?.feedback_coverage?.reports_ratio) }} · reflection {{ pct(snapshot.llm_pipeline?.feedback_coverage?.reflections_ratio) }}</small>
+          <small>{{ snapshot.llm_pipeline?.calls?.calls_1h ?? 0 }} calls / 1h · {{ snapshot.llm_pipeline?.calls?.errors_1h ?? 0 }} errors · P95 {{ n(snapshot.llm_pipeline?.calls?.p95_latency_ms_1h, 1) }} ms</small>
+        </article>
       </div>
 
       <div class="grid cols-2 ops-grid">
@@ -1341,6 +1355,44 @@ const ObservabilityView = {
         </div>
       </div>
 
+      <div class="grid cols-2 ops-grid">
+        <div class="card ops-table-card">
+          <div class="panel-title-row">
+            <div><h2>LLM 调用与反馈血缘</h2><p>仅显示脱敏元数据；prompt hash 与反馈 fingerprint 可逐次核对</p></div>
+            <a href="/api/llm/audits" target="_blank">打开审计 API</a>
+          </div>
+          <div class="ops-table-scroll">
+            <table>
+              <tr><th>ID / 时间</th><th>角色 / 阶段</th><th>任务 / 版本</th><th>状态 / 延迟</th><th>反馈指纹</th></tr>
+              <tr v-for="call in (snapshot.llm_pipeline?.recent_calls || [])" :key="call.id">
+                <td>#{{ call.id }}<div class="sub">{{ formatDate(call.created_at) }}</div></td>
+                <td>{{ call.role }}<div class="sub">{{ call.phase }}</div></td>
+                <td>#{{ call.experiment_id ?? '—' }} · {{ call.task_name || 'outer' }}<div class="sub">miner {{ call.miner_version_id ?? '—' }} · step {{ call.outer_step_no ?? '—' }}</div></td>
+                <td><span class="tag" :class="{green:call.status==='accepted',amber:call.status==='response_ok',red:call.status==='transport_error'||call.status==='rejected'}">{{ call.status }}</span><div class="sub">{{ n(call.latency_ms,1) }} ms · {{ call.model || '—' }}</div><div v-if="call.error" class="bad-text ops-wrap">{{ call.error }}</div></td>
+                <td><code>{{ call.feedback_fingerprint || 'no-context' }}</code><div class="sub">{{ call.evaluation_protocol }} · prompt {{ String(call.prompt_hash || '').slice(0,12) }}</div></td>
+              </tr>
+              <tr v-if="!(snapshot.llm_pipeline?.recent_calls || []).length"><td colspan="5" class="ops-empty">尚无新版 LLM 调用审计；随机回退不会伪装成 LLM 调用。</td></tr>
+            </table>
+          </div>
+        </div>
+        <div class="card ops-table-card">
+          <div class="panel-title-row"><div><h2>评价协议隔离</h2><p>{{ snapshot.protocol_lineage?.policy }}</p></div><span class="tag green">{{ snapshot.protocol_lineage?.current_protocol }}</span></div>
+          <div class="ops-table-scroll">
+            <table>
+              <tr><th>持久化表</th><th>协议计数</th></tr>
+              <tr v-for="[tableName,protocols] in entries(snapshot.protocol_lineage?.tables)" :key="tableName">
+                <td><code>{{ tableName }}</code></td>
+                <td><span v-for="[protocol,count] in entries(protocols)" :key="protocol" class="tag" :class="protocol===snapshot.protocol_lineage?.current_protocol?'green':'amber'">{{ protocol }} · {{ count }}</span></td>
+              </tr>
+            </table>
+          </div>
+          <details class="ops-details">
+            <summary>反馈隔离契约</summary>
+            <pre>{{ pretty(snapshot.llm_pipeline?.isolation || {}) }}</pre>
+          </details>
+        </div>
+      </div>
+
       <details class="card ops-raw">
         <summary>原始脱敏快照 / 运行日志 / 线程与 asyncio task 明细</summary>
         <pre>{{ pretty(snapshot) }}</pre>
@@ -1398,6 +1450,7 @@ const ObservabilityView = {
       return Number.isFinite(number) ? number.toFixed(digits) : "—";
     }
     function pct(value) {
+      if (value == null) return "—";
       const number = Number(value);
       return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : "—";
     }

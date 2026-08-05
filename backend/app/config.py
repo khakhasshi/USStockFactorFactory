@@ -357,9 +357,12 @@ DEFAULT_MINER_TEMPLATE = {
         "可用字段: {fields} (前复权价格与量额)\n"
         "可用算子:\n{ops}\n"
         "规则: 只能用以上字段与算子; 窗口为 1..250 整数; 表达式一行;\n"
-        "目标是最大化样本内 RankIC 的稳健性而非峰值;\n"
+        "目标是提高 V4 训练层保守 discovery score：费后收益与下置信界、"
+        "HAC 置信度、跨期稳定性、单调性、压力成本和可实施性必须共同改善；"
+        "禁止只追逐 RankIC/ICIR 峰值;\n"
         "禁止只对特定时段有效的取巧构造。{anti}\n"
-        "只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"一句话经济学假设\"}}"
+        "只回复 JSON: {{\"expression\": \"...\", \"hypothesis\": \"一句话经济学假设\", "
+        "\"reflection\": \"从评价反馈提炼的经验\", \"targeted_failures\": [\"本次针对的失败\"]}}"
     ),
     "anti_overfit_instruction": (
         "特别要求: 避免过拟合——偏好简单、有经济含义、跨行业普适的结构。"
@@ -377,12 +380,21 @@ DEFAULT_MINER_TEMPLATE = {
         "5) 方向翻转(若IC符号与假设相反)。"
     ),
     "context_strategy": (
-        "展示历史 top-{top_k} 高分因子(含 public score/ICIR/换手/表达式)。"
-        "若存在多次失败(score<0.3)的因子, 归纳其失败模式为一句话警告。"
+        "同时展示权威高分、模板关注、接近通过、明确失败与表达式错误样本；"
+        "必须依据评价组件和失败原因提出针对性改进。"
     ),
+    "context_policy": {
+        "top_k": 4,
+        "priority_k": 2,
+        "near_miss_k": 3,
+        "failure_k": 4,
+        "error_k": 2,
+        "max_context_chars": 12000,
+    },
     "diversity_instruction": (
         "新因子必须与历史高分因子有不同经济学机制。"
     ),
+    # 仅控制进入 LLM 上下文的示例优先级；不得改写权威 V4 评价分。
     "scoring_weights": {
         "icir_weight": 0.45,
         "consistency_weight": 0.25,
@@ -412,7 +424,7 @@ DEFAULT_MINER_TEMPLATE = {
 DEFAULT_ENGINE_CONFIG_V2 = {
     "inner_budget_per_outer_step": 20,    # 快速验证: 20 (完整实验: 50)
     "n_seeds_per_candidate": 2,            # 快速验证: 2 (完整实验: 3)
-    "outer_accept_p_value": 0.10,          # 配对 t 检验接受阈值
+    "outer_accept_p_value": 0.10,          # 单边 Student/Welch t 检验接受阈值
     "incumbent_remeasure_every": 3,        # 每 3 步重测在位者
     "incumbent_remeasure_budget": 30,      # 重测时用 30 次评估 (节省算力)
     "tasks": [
