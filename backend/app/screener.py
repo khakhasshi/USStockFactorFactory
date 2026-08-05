@@ -92,7 +92,7 @@ def _cache_key(
         "universe_n": universe_n,
         "top_n": top_n,
         "direction": direction,
-        "version": "single_pass_v2",
+        "version": "single_pass_v3_tail_rank",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -172,17 +172,58 @@ def screen_cross_section(
         lf.with_columns(score.alias("score"))
         .select(*select_columns, "score")
         .collect()
+        .with_columns(
+            pl.col("score")
+            .rank(method="ordinal", descending=True)
+            .cast(pl.Int64)
+            .alias("_head_rank"),
+            pl.col("score")
+            .rank(method="ordinal")
+            .cast(pl.Int64)
+            .alias("_tail_rank"),
+        )
     )
     eligible_count = ranked.height
     if direction == "bottom":
-        chosen = ranked.sort("score").head(top_n).with_columns(pl.lit("bottom").alias("_side"))
+        chosen = (
+            ranked.sort("_tail_rank")
+            .head(top_n)
+            .with_columns(
+                pl.lit("bottom").alias("_side"),
+                pl.col("_tail_rank").alias("_side_rank"),
+            )
+        )
     elif direction == "both":
-        each = max(1, top_n // 2)
-        high = ranked.sort("score", descending=True).head(each).with_columns(pl.lit("top").alias("_side"))
-        low = ranked.sort("score").head(top_n - each).with_columns(pl.lit("bottom").alias("_side"))
+        head_count = max(1, (top_n + 1) // 2)
+        tail_count = max(0, top_n - head_count)
+        high = (
+            ranked.sort("_head_rank")
+            .head(head_count)
+            .with_columns(
+                pl.lit("top").alias("_side"),
+                pl.col("_head_rank").alias("_side_rank"),
+            )
+        )
+        high_symbols = high["ts_code"].to_list()
+        low = (
+            ranked.filter(~pl.col("ts_code").is_in(high_symbols))
+            .sort("_tail_rank")
+            .head(tail_count)
+            .with_columns(
+                pl.lit("bottom").alias("_side"),
+                pl.col("_tail_rank").alias("_side_rank"),
+            )
+        )
         chosen = pl.concat([high, low])
     else:
-        chosen = ranked.sort("score", descending=True).head(top_n).with_columns(pl.lit("top").alias("_side"))
+        chosen = (
+            ranked.sort("_head_rank")
+            .head(top_n)
+            .with_columns(
+                pl.lit("top").alias("_side"),
+                pl.col("_head_rank").alias("_side_rank"),
+            )
+        )
 
     stocks = []
     for rank_no, row in enumerate(chosen.iter_rows(named=True), start=1):
@@ -201,6 +242,9 @@ def screen_cross_section(
         stocks.append({
             "rank": rank_no,
             "side": row["_side"],
+            "side_rank": int(row["_side_rank"]),
+            "head_rank": int(row["_head_rank"]),
+            "tail_rank": int(row["_tail_rank"]),
             "ts_code": row["ts_code"],
             "name": row.get("name") or "",
             "score": round(float(row["score"]), 4),
@@ -215,8 +259,14 @@ def screen_cross_section(
         "eligible_count": eligible_count,
         "history_start": str(history_start),
         "required_history": lookback,
+        "ranking_semantics": {
+            "head_rank": "1 表示方向调整后综合分最高",
+            "tail_rank": "1 表示方向调整后综合分最低",
+            "side_rank": "所选头部或尾部榜内名次",
+            "tail_usage": "A股纯多头任务中尾部仅表示回避/负向观察，不表示可做空",
+        },
         "performance": {
-            "engine": "polars_single_lazy_plan_v2",
+            "engine": "polars_single_lazy_plan_v3_tail_rank",
             "cache_hit": False,
             "elapsed_ms": round(elapsed, 2),
             "factor_count": len(factors),

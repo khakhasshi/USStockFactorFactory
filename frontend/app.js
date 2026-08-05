@@ -1635,8 +1635,8 @@ const ScreenerView = {
         </select>
       </div>
       <div class="selector-field selector-small">
-        <label>输出方向</label>
-        <select v-model="outputDirection"><option value="top">高分端</option><option value="bottom">低分端</option><option value="both">两端</option></select>
+        <label>排名榜单</label>
+        <select v-model="outputDirection"><option value="top">头部排名</option><option value="bottom">尾部排名</option><option value="both">头尾双榜</option></select>
       </div>
       <div class="selector-actions">
         <button class="btn" @click="loadFactors" :disabled="loading">刷新因子</button>
@@ -1697,27 +1697,27 @@ const ScreenerView = {
         </div>
         <template v-if="result && !loading">
           <div class="result-summary">
-            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · 综合排名</h2><small v-if="result.date_adjusted" class="sub">请求日 {{ result.requested_date }} 非交易日或超出面板，已回退到最近交易日</small></div><span class="tag blue">已完成</span></div>
+            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · {{ rankingTitle }}</h2><small v-if="result.date_adjusted" class="sub">请求日 {{ result.requested_date }} 非交易日或超出面板，已回退到最近交易日</small></div><span class="tag blue">已完成</span></div>
           <div class="metric-strip selector-metrics">
               <div class="metric-card"><span>股票池</span><b>Top {{ result.universe_n || univN }}</b><small>按 60 日成交额</small></div>
               <div class="metric-card"><span>启用因子</span><b>{{ result.factor_count }}</b><small>加权截面排名</small></div>
               <div class="metric-card"><span>输出数量</span><b>{{ result.stocks.length }}</b><small>候选清单</small></div>
-              <div class="metric-card accent"><span>{{ result.direction === 'bottom' ? '最低综合分' : '首位综合分' }}</span><b>{{ topScore }}</b><small>{{ result.expression_mode ? '单条 DSL 排名' : '相对排序分数' }}</small></div>
+              <div class="metric-card accent"><span>{{ result.direction === 'both' ? '头 / 尾首位分' : (result.direction === 'bottom' ? '尾部首位分' : '头部首位分') }}</span><b>{{ result.direction === 'both' ? topScore + ' / ' + tailScore : (result.direction === 'bottom' ? tailScore : topScore) }}</b><small>{{ result.expression_mode ? '单条 DSL 排名' : '方向调整后综合分' }}</small></div>
               <div class="metric-card"><span>有效截面</span><b>{{ result.eligible_count }}</b><small>完整因子交集</small></div>
               <div class="metric-card" :class="{accent:result.performance?.cache_hit}"><span>计算性能</span><b>{{ result.performance?.elapsed_ms }} ms</b><small>{{ result.performance?.cache_hit ? '命中缓存' : '单计划实时计算' }}</small></div>
             </div>
           </div>
           <div class="card result-table-card">
             <div class="panel-title-row"><div><h2>候选清单</h2><span class="sub">点击股票查看每个因子的原值、截面名次与分数贡献</span></div><span class="tag">{{ result.date }} · 历史起点 {{ result.history_start }}</span></div>
-            <table class="result-table"><thead><tr><th>排名</th><th>端</th><th>证券</th><th>名称</th><th>原始收盘</th><th>成交额</th><th>综合分</th><th>相对位置</th></tr></thead>
-              <tbody><tr v-for="s in result.stocks" :key="s.rank" class="clickable" :class="{'top-pick':s.rank<=10,'selected-stock':selectedStock?.ts_code===s.ts_code}" @click="selectedStock=s"><td><span class="rank-number">{{ String(s.rank).padStart(2,"0") }}</span></td><td><span class="tag" :class="s.side==='top'?'green':'red'">{{ s.side }}</span></td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td>{{ formatPrice(s.raw_close) }}</td><td>{{ compactAmount(s.amount) }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
+            <table class="result-table"><thead><tr><th>榜内名次</th><th>榜单</th><th>头部名次</th><th>尾部名次</th><th>证券</th><th>名称</th><th>原始收盘</th><th>成交额</th><th>综合分</th><th>极端程度</th></tr></thead>
+              <tbody><tr v-for="s in result.stocks" :key="s.side + ':' + s.ts_code" class="clickable" :class="{'top-pick':s.side_rank<=10,'selected-stock':selectedStock?.ts_code===s.ts_code}" @click="selectedStock=s"><td><span class="rank-number">{{ String(s.side_rank).padStart(2,"0") }}</span></td><td><span class="tag" :class="s.side==='top'?'green':'red'">{{ s.side==='top'?'头部':'尾部' }}</span></td><td>{{ s.head_rank }}</td><td>{{ s.tail_rank }}</td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td>{{ formatPrice(s.raw_close) }}</td><td>{{ compactAmount(s.amount) }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
             </table>
           </div>
           <div class="card contribution-card" v-if="selectedStock">
             <div class="panel-title-row"><div><h2>{{ selectedStock.ts_code }} · 排名归因</h2><span class="sub">{{ selectedStock.name }} · 综合分 {{ formatScore(selectedStock.score) }}</span></div><button class="btn" @click="selectedStock=null">关闭</button></div>
             <table><tr><th>因子表达式</th><th>方向</th><th>权重</th><th>因子原值</th><th>截面分</th><th>贡献</th></tr><tr v-for="row in selectedStock.components" :key="row.expression"><td class="mono-expr">{{ row.expression }}</td><td>{{ row.direction===1?'正向':'反向' }}</td><td>{{ (row.weight*100).toFixed(1) }}%</td><td>{{ formatScore(row.value) }}</td><td>{{ formatScore(row.rank_score) }}</td><td><b>{{ formatScore(row.contribution) }}</b></td></tr></table>
           </div>
-          <div class="selector-disclaimer"><span>ⓘ</span> 这是基于当前研究面板的横截面排序。数据为 non-PIT 当前成分股回看历史，结果不等同于可交易信号。</div>
+          <div class="selector-disclaimer"><span>ⓘ</span> 这是基于当前研究面板的横截面排序。尾部榜代表方向调整后综合分最低；A 股纯多头任务中仅用于回避/负向观察，不代表允许做空。数据为 non-PIT 当前成分股回看历史，结果不等同于可交易信号。</div>
         </template>
       </main>
     </div>
@@ -1739,7 +1739,21 @@ const ScreenerView = {
     const enabledCount = computed(() => factors.value.filter(f=>f.enabled).length);
     const canRun = computed(() => Boolean(directExpr.value.trim()) || enabledCount.value > 0);
     const totalWeight = computed(() => factors.value.filter(f=>f.enabled).reduce((sum, f) => sum + (Number(f.weight) || 0), 0));
-    const topScore = computed(() => result.value?.stocks?.length ? formatScore(result.value.stocks[0].score) : "—");
+    const topScore = computed(() => {
+      const row = result.value?.stocks?.find(stock => stock.side === "top");
+      return row ? formatScore(row.score) : "—";
+    });
+    const tailScore = computed(() => {
+      const row = result.value?.stocks?.find(stock => stock.side === "bottom");
+      return row ? formatScore(row.score) : "—";
+    });
+    const rankingTitle = computed(() => (
+      result.value?.direction === "bottom"
+        ? "尾部排名"
+        : result.value?.direction === "both"
+          ? "头尾双榜"
+          : "头部排名"
+    ));
     const filteredFactors = computed(() => {
       const query = factorSearch.value.trim().toLowerCase();
       return factors.value.filter(f => {
@@ -1763,8 +1777,10 @@ const ScreenerView = {
       return amount.toFixed(0);
     }
     function rankWidth(stock) {
-      if (!result.value?.stocks?.length) return "0%";
-      return `${((result.value.stocks.length - stock.rank + 1) / result.value.stocks.length) * 100}%`;
+      const eligible = Number(result.value?.eligible_count || 0);
+      if (!eligible) return "0%";
+      const sideRank = Number(stock.side === "bottom" ? stock.tail_rank : stock.head_rank);
+      return `${Math.max(0, Math.min(100, (eligible - sideRank + 1) / eligible * 100))}%`;
     }
 
     async function loadFactors() {
@@ -1854,7 +1870,7 @@ const ScreenerView = {
       date, univN, topN, directExpr, directDirection, dslInfo, outputDirection,
       factors, groups, factorSearch, factorGroup, filteredFactors,
       result, selectedStock, error, loading, enabledCount, canRun,
-      totalWeight, topScore, formatScore, formatPrice, compactAmount,
+      totalWeight, topScore, tailScore, rankingTitle, formatScore, formatPrice, compactAmount,
       rankWidth, selectAll, clearAll, inspectDsl, run, loadFactors,
     };
   },

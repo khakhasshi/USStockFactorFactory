@@ -86,6 +86,55 @@ class ScreenerEngineTests(unittest.TestCase):
             -1,
         )
 
+    def test_tail_ranking_has_independent_side_rank(self):
+        frame, dates = _panel()
+        common = {
+            "df": frame,
+            "trading_dates": dates,
+            "target_date": dates[-1],
+            "factors": [
+                {
+                    "expression": "close",
+                    "weight": 1,
+                    "direction": 1,
+                },
+            ],
+            "fields": ["open", "high", "low", "close", "vol", "amount"],
+            "universe_n": 100,
+            "top_n": 10,
+        }
+        tail = screen_cross_section(
+            **common,
+            panel_identity="synthetic-screen-tail-v1",
+            direction="bottom",
+        )
+        first_tail = tail["stocks"][0]
+        self.assertEqual(first_tail["ts_code"], "S000")
+        self.assertEqual(first_tail["side"], "bottom")
+        self.assertEqual(first_tail["side_rank"], 1)
+        self.assertEqual(first_tail["tail_rank"], 1)
+        self.assertEqual(first_tail["head_rank"], 100)
+
+        both = screen_cross_section(
+            **common,
+            panel_identity="synthetic-screen-both-v1",
+            direction="both",
+        )
+        self.assertEqual(len(both["stocks"]), 10)
+        self.assertEqual(
+            {row["side"] for row in both["stocks"]},
+            {"top", "bottom"},
+        )
+        self.assertEqual(len({row["ts_code"] for row in both["stocks"]}), 10)
+        self.assertEqual(
+            [row["side_rank"] for row in both["stocks"] if row["side"] == "top"],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            [row["side_rank"] for row in both["stocks"] if row["side"] == "bottom"],
+            [1, 2, 3, 4, 5],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
