@@ -1101,9 +1101,308 @@ const ExperimentsView = {
   },
 };
 
+/* ============ Engineering observability ============ */
+const ObservabilityView = {
+  template: `
+  <section class="ops-page">
+    <div class="ops-heading">
+      <div>
+        <div class="eyebrow">RUNTIME / DATA / DATABASE / WORKERS</div>
+        <h1>工程诊断台</h1>
+        <p>面向排障的只读快照。请求体与密钥不采集；复制出的快照已经过后端脱敏。</p>
+      </div>
+      <div class="ops-actions">
+        <span v-if="snapshot" class="ops-health" :class="'health-' + snapshot.health">
+          ● {{ healthLabel(snapshot.health) }}
+        </span>
+        <button class="btn" @click="togglePause">{{ paused ? '继续自动刷新' : '暂停自动刷新' }}</button>
+        <button class="btn primary" @click="load" :disabled="loading">{{ loading ? '刷新中…' : '立即刷新' }}</button>
+        <button class="btn" @click="copySnapshot" :disabled="!snapshot">{{ copied || '复制脱敏快照' }}</button>
+      </div>
+    </div>
+
+    <div v-if="error" class="selector-error">{{ error }}</div>
+    <div v-if="!snapshot && loading" class="card ops-loading"><div class="loading-ring"></div>正在采集工程快照</div>
+
+    <template v-if="snapshot">
+      <div class="ops-meta">
+        <span>schema {{ snapshot.schema_version }}</span>
+        <span>生成 {{ formatDate(snapshot.generated_at) }}</span>
+        <span>自动刷新 {{ paused ? '已暂停' : '3 秒' }}</span>
+        <a href="/api/health/live" target="_blank">liveness</a>
+        <a href="/api/health/ready" target="_blank">readiness</a>
+        <a href="/api/metrics" target="_blank">Prometheus</a>
+      </div>
+
+      <div class="ops-findings">
+        <article v-for="finding in snapshot.findings" :key="finding.code"
+          class="ops-finding" :class="'finding-' + finding.severity">
+          <div><span>{{ finding.severity.toUpperCase() }}</span><b>{{ finding.title }}</b></div>
+          <p>{{ finding.detail }}</p>
+          <small>{{ finding.action }}</small>
+        </article>
+      </div>
+
+      <div class="ops-metrics">
+        <article class="metric-card">
+          <span>服务 / 部署</span>
+          <b>PID {{ snapshot.service.pid }}</b>
+          <small>{{ formatDuration(snapshot.service.uptime_seconds) }} · {{ snapshot.service.deployment.commit_short }}</small>
+          <small>{{ snapshot.service.deployment.branch }}<template v-if="snapshot.service.deployment.dirty_at_start"> · dirty-at-start</template></small>
+        </article>
+        <article class="metric-card" :class="{danger: snapshot.requests.window.server_errors}">
+          <span>HTTP · {{ snapshot.requests.window.seconds }} 秒窗口</span>
+          <b>{{ snapshot.requests.lifetime.latency_ms.p95 }} ms</b>
+          <small>P95 · {{ snapshot.requests.window.requests }} 请求 · {{ snapshot.requests.window.server_errors }} 个 5xx</small>
+          <small>{{ snapshot.requests.in_flight }} in-flight · 生命周期 {{ snapshot.requests.lifetime.requests }}</small>
+        </article>
+        <article class="metric-card">
+          <span>进程 / 事件循环</span>
+          <b>{{ formatBytes(snapshot.process.rss_bytes) }}</b>
+          <small>RSS · CPU {{ n(snapshot.process.cpu_percent, 1) }}% · {{ snapshot.process.native_threads ?? snapshot.process.thread_count }} threads</small>
+          <small>loop P95 {{ n(snapshot.requests.event_loop.p95_lag_ms, 2) }} ms · {{ snapshot.process.asyncio_tasks.active }} tasks</small>
+        </article>
+        <article class="metric-card" :class="{danger: snapshot.database.status!=='ok'}">
+          <span>PostgreSQL / 连接池</span>
+          <b>{{ snapshot.database.status }} · {{ n(snapshot.database.latency_ms, 1) }} ms</b>
+          <small>{{ snapshot.database.pool.checked_out }}/{{ snapshot.database.pool.capacity }} checked out · {{ pct(snapshot.database.pool.utilization) }}</small>
+          <small>{{ snapshot.database.driver }} · {{ snapshot.database.pool.class }}</small>
+        </article>
+        <article class="metric-card">
+          <span>数据面板</span>
+          <b>{{ snapshot.data.loaded }}/{{ snapshot.data.instances }} loaded</b>
+          <small>{{ snapshot.data.errors }} error · {{ formatBytes(snapshot.data.estimated_size_bytes) }} memory</small>
+          <small>{{ totalPanelFiles }} files registered</small>
+        </article>
+        <article class="metric-card">
+          <span>计算缓存</span>
+          <b>{{ pct(snapshot.caches.screener.hit_rate) }}</b>
+          <small>选股命中 · {{ snapshot.caches.screener.entries }}/{{ snapshot.caches.screener.capacity }} entries</small>
+          <small>相似度 {{ pct(snapshot.caches.factor_similarity.hit_rate) }} · 前端 {{ clientTelemetry.cacheEntries }} entries</small>
+        </article>
+      </div>
+
+      <div class="grid cols-2 ops-grid">
+        <div class="card ops-table-card">
+          <div class="panel-title-row"><div><h2>研究 worker</h2><p>{{ snapshot.engine.running_count }} running / {{ snapshot.engine.worker_count }} registered</p></div></div>
+          <div class="ops-table-scroll">
+            <table>
+              <tr><th>任务</th><th>状态 / 阶段</th><th>当前工作</th><th>进度</th><th>心跳</th></tr>
+              <tr v-for="worker in snapshot.workers" :key="worker.experiment_id">
+                <td>#{{ worker.experiment_id }}<div class="sub">{{ worker.mode || '—' }}</div></td>
+                <td><span class="tag" :class="{green:worker.running, red:worker.task_exception, amber:worker.heartbeat_stale}">{{ worker.state }}</span><div class="sub">{{ worker.phase }}</div></td>
+                <td>{{ worker.current_task || '—' }}<div class="sub">{{ worker.current_operation || '—' }}</div></td>
+                <td>{{ worker.current_budget_index ?? '—' }}/{{ worker.current_budget_total ?? '—' }}<div class="sub">outer {{ worker.outer_step }} · eval {{ worker.inner_evals }}</div></td>
+                <td :class="{'bad-text':worker.heartbeat_stale}">{{ age(worker.heartbeat_age_seconds) }}<div class="sub">{{ formatDate(worker.last_heartbeat_at) }}</div></td>
+              </tr>
+              <tr v-if="!snapshot.workers.length"><td colspan="5" class="ops-empty">本进程还没有注册 worker</td></tr>
+            </table>
+          </div>
+        </div>
+
+        <div class="card ops-table-card">
+          <div class="panel-title-row"><div><h2>面板身份与加载状态</h2><p>文件清单、mtime、内存与加载耗时</p></div></div>
+          <div class="ops-table-scroll">
+            <table>
+              <tr><th>市场 / ID</th><th>状态</th><th>文件</th><th>样本</th><th>加载</th></tr>
+              <tr v-for="panel in snapshot.data.panels" :key="panel.id">
+                <td><span class="tag blue">{{ panel.market }}</span><div class="sub">{{ panel.identity || panel.id }}</div></td>
+                <td><span class="tag" :class="{green:panel.state==='ready', red:panel.state==='error', amber:panel.state==='loading'}">{{ panel.state }}</span><div v-if="panel.source_error || panel.load_error" class="bad-text ops-wrap">{{ panel.source_error || panel.load_error }}</div></td>
+                <td>{{ panel.file_count }} · {{ formatBytes(panel.total_bytes) }}<div class="sub">{{ formatDate(panel.latest_mtime) }}</div></td>
+                <td>{{ panel.rows ?? '—' }} rows<div class="sub">{{ panel.securities ?? '—' }} securities · {{ panel.date_min || '—' }} → {{ panel.date_max || '—' }}</div></td>
+                <td>{{ panel.load_duration_ms == null ? '—' : n(panel.load_duration_ms,1)+' ms' }}<div class="sub">{{ panel.load_attempts }} attempt(s)</div></td>
+              </tr>
+            </table>
+          </div>
+          <details class="ops-details"><summary>显示面板路径</summary><code v-for="panel in snapshot.data.panels" :key="'path'+panel.id">{{ panel.source }}</code></details>
+        </div>
+      </div>
+
+      <div class="card ops-table-card">
+        <div class="panel-title-row"><div><h2>API 路由延迟与错误</h2><p>按 P95 排序；路由参数已归一化，避免指标基数爆炸</p></div><span class="count-badge">{{ snapshot.requests.routes.length }} routes</span></div>
+        <div class="ops-table-scroll route-table">
+          <table>
+            <tr><th>路由</th><th>请求</th><th>5xx</th><th>4xx</th><th>平均</th><th>P50</th><th>P95</th><th>P99</th><th>最大</th><th>最后请求 ID</th></tr>
+            <tr v-for="route in snapshot.requests.routes.slice(0,30)" :key="route.route">
+              <td><code>{{ route.route }}</code></td><td>{{ route.count }}</td>
+              <td :class="{'bad-text':route.errors}">{{ route.errors }}</td><td>{{ route.client_errors }}</td>
+              <td>{{ n(route.avg_ms,2) }}</td><td>{{ n(route.p50_ms,2) }}</td>
+              <td :class="{'bad-text':route.p95_ms>=1000}">{{ n(route.p95_ms,2) }}</td>
+              <td>{{ n(route.p99_ms,2) }}</td><td>{{ n(route.max_ms,2) }}</td><td><code>{{ route.last_request_id }}</code></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="grid cols-2 ops-grid">
+        <div class="card ops-list-card">
+          <div class="panel-title-row"><div><h2>最近异常与请求 ID</h2><p>HTTP 5xx、未捕获异常和 error 日志</p></div></div>
+          <div class="ops-event-list">
+            <article v-for="incident in snapshot.requests.incidents.slice(0,30)" :key="incident.at + incident.request_id + incident.message">
+              <span class="tag red">{{ incident.kind || incident.level }}</span>
+              <time>{{ formatDate(incident.at) }}</time>
+              <code v-if="incident.request_id">{{ incident.request_id }} · {{ incident.route }}</code>
+              <p>{{ incident.error || incident.message || ('HTTP ' + incident.status) }}</p>
+            </article>
+            <div v-if="!snapshot.requests.incidents.length" class="ops-empty">当前进程没有记录到异常</div>
+          </div>
+        </div>
+        <div class="card ops-list-card">
+          <div class="panel-title-row"><div><h2>持久化引擎事件</h2><p>数据库中的最近事件；可按 experiment_id 交叉排查</p></div></div>
+          <div class="ops-event-list">
+            <article v-for="event in snapshot.recent_events" :key="event.id">
+              <span class="tag" :class="{red:event.level==='error', amber:event.level==='warning'}">{{ event.level }}</span>
+              <time>{{ formatDate(event.created_at) }}</time>
+              <code>#{{ event.experiment_id ?? '—' }} · event {{ event.id }} · {{ event.payload?.phase || 'legacy' }}</code>
+              <p>{{ event.message }}</p>
+            </article>
+            <div v-if="!snapshot.recent_events.length" class="ops-empty">{{ snapshot.recent_events_error || '没有事件' }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid cols-3 ops-grid">
+        <div class="card ops-kv">
+          <h3>活动研究配置</h3>
+          <dl>
+            <template v-for="[key,value] in entries({
+              id:snapshot.active_task.experiment_id,
+              name:snapshot.active_task.name,
+              task_status:snapshot.active_task.status,
+              worker_state:snapshot.active_task.worker_state,
+              worker_phase:snapshot.active_task.worker_phase,
+              market:snapshot.active_task.market,
+              portfolio_mode:snapshot.active_task.portfolio_mode,
+              direction:snapshot.active_task.direction,
+              protocol:snapshot.active_task.evaluation_protocol,
+              config_fingerprint:snapshot.active_task.config_fingerprint,
+              panel_id:snapshot.active_task.panel_id
+            })" :key="key"><dt>{{ key }}</dt><dd>{{ value ?? '—' }}</dd></template>
+          </dl>
+        </div>
+        <div class="card ops-kv">
+          <h3>LLM 路由（不含密钥）</h3>
+          <dl>
+            <dt>inner</dt><dd>{{ snapshot.providers.inner_provider || 'fallback' }} · {{ snapshot.providers.inner_provider_configured ? 'configured' : 'not configured' }}</dd>
+            <dt>outer</dt><dd>{{ snapshot.providers.outer_provider || 'fallback' }} · {{ snapshot.providers.outer_provider_configured ? 'configured' : 'not configured' }}</dd>
+          </dl>
+          <div class="ops-provider" v-for="provider in snapshot.providers.providers" :key="provider.name">
+            <b>{{ provider.name }}</b><span>{{ provider.model || '—' }}</span><small>{{ provider.endpoint_host || '—' }} · key {{ provider.api_key_present ? 'present' : 'absent' }}</small>
+          </div>
+        </div>
+        <div class="card ops-kv">
+          <h3>持久化与数据量</h3>
+          <dl>
+            <template v-for="[key,value] in entries(snapshot.database.counts)" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></template>
+            <dt>artifact_runs</dt><dd>{{ snapshot.artifacts.runs }}</dd>
+            <dt>artifact_files</dt><dd>{{ snapshot.artifacts.files }}</dd>
+            <dt>artifact_bytes</dt><dd>{{ formatBytes(snapshot.artifacts.total_bytes) }}</dd>
+            <dt>artifact_latest</dt><dd>{{ formatDate(snapshot.artifacts.latest_mtime) }}</dd>
+          </dl>
+        </div>
+      </div>
+
+      <details class="card ops-raw">
+        <summary>原始脱敏快照 / 运行日志 / 线程与 asyncio task 明细</summary>
+        <pre>{{ pretty(snapshot) }}</pre>
+      </details>
+    </template>
+  </section>`,
+  setup() {
+    const snapshot = ref(null), error = ref(""), loading = ref(false);
+    const paused = ref(false), copied = ref("");
+    let timer = null, active = true;
+    const clientTelemetry = computed(() => ({
+      cacheEntries: responseCache.size,
+      inflightGets: inflightGets.size,
+      generation: apiCacheGeneration,
+    }));
+    const totalPanelFiles = computed(() =>
+      (snapshot.value?.data?.panels || []).reduce((sum, panel) => sum + Number(panel.file_count || 0), 0)
+    );
+    async function load() {
+      if (loading.value) return;
+      loading.value = true; error.value = "";
+      try {
+        snapshot.value = await api("/observability?events_limit=80&window_seconds=300");
+      } catch (e) {
+        error.value = `诊断快照加载失败：${e.message}`;
+      } finally {
+        loading.value = false;
+      }
+    }
+    function startPolling() {
+      active = true;
+      if (!timer) timer = setInterval(() => {
+        if (active && !paused.value) load();
+      }, 3000);
+      load();
+    }
+    function stopPolling() {
+      active = false;
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+    function togglePause() { paused.value = !paused.value; if (!paused.value) load(); }
+    async function copySnapshot() {
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(snapshot.value, null, 2));
+        copied.value = "已复制";
+      } catch (e) {
+        copied.value = "复制失败";
+      }
+      setTimeout(() => { copied.value = ""; }, 1600);
+    }
+    function n(value, digits = 0) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(digits) : "—";
+    }
+    function pct(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : "—";
+    }
+    function formatBytes(value) {
+      let number = Number(value);
+      if (!Number.isFinite(number)) return "—";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let index = 0;
+      while (number >= 1024 && index < units.length - 1) { number /= 1024; index += 1; }
+      return `${number.toFixed(index ? 1 : 0)} ${units[index]}`;
+    }
+    function formatDuration(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value)) return "—";
+      if (value < 60) return `${value.toFixed(0)}s`;
+      if (value < 3600) return `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
+      return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
+    }
+    function age(seconds) {
+      return seconds == null ? "—" : `${formatDuration(seconds)} ago`;
+    }
+    function formatDate(value) {
+      if (!value) return "—";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+    }
+    function healthLabel(value) {
+      return ({ healthy: "健康", degraded: "降级", unhealthy: "故障" })[value] || value;
+    }
+    function entries(value) { return Object.entries(value || {}); }
+    function pretty(value) { return JSON.stringify(value, null, 2); }
+    onMounted(startPolling);
+    onActivated(startPolling);
+    onDeactivated(() => { active = false; });
+    onUnmounted(stopPolling);
+    return {
+      snapshot, error, loading, paused, copied, clientTelemetry, totalPanelFiles,
+      load, togglePause, copySnapshot, n, pct, formatBytes, formatDuration,
+      age, formatDate, healthLabel, entries, pretty,
+    };
+  },
+};
+
 /* ============ App ============ */
 const App = {
-  components: { Dashboard, ResearchTree, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView },
+  components: { Dashboard, ResearchTree, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView, ObservabilityView },
   template: `
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
@@ -1121,7 +1420,7 @@ const App = {
   </div>
   <div class="main">
     <div v-if="appState.switching" class="task-switch-overlay"><div class="loading-ring"></div><span>正在切换任务上下文</span></div>
-    <KeepAlive :max="7"><component :is="activeComponent" :key="tab" /></KeepAlive>
+    <KeepAlive :max="8"><component :is="activeComponent" :key="tab" /></KeepAlive>
   </div>`,
   setup() {
     const savedTab = localStorage.getItem("factorfactory.tab");
@@ -1130,7 +1429,7 @@ const App = {
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
       { id: "factors", label: "因子库" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
-      { id: "exps", label: "实验" }, { id: "settings", label: "设置" },
+      { id: "exps", label: "实验" }, { id: "diagnostics", label: "诊断" }, { id: "settings", label: "设置" },
     ];
     const engState = ref("…");
     const exps = ref([]), selExp = ref(null);
@@ -1138,7 +1437,7 @@ const App = {
     const activeComponent = computed(() => ({
       dash: Dashboard, tree: ResearchTree, factors: FactorLibraryWorkbench,
       screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
-      settings: SettingsView,
+      diagnostics: ObservabilityView, settings: SettingsView,
     })[tab.value] || Dashboard);
     async function poll() {
       if (polling) return;

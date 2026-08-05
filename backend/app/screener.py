@@ -20,25 +20,50 @@ class _ScreenerCache:
         self.maxsize = maxsize
         self._values: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.Lock()
+        self._started_at = time.time()
+        self._hits = 0
+        self._misses = 0
+        self._puts = 0
+        self._evictions = 0
+        self._last_hit_at: float | None = None
+        self._last_put_at: float | None = None
 
     def get(self, key: str) -> dict | None:
         with self._lock:
             value = self._values.get(key)
             if value is None:
+                self._misses += 1
                 return None
+            self._hits += 1
+            self._last_hit_at = time.time()
             self._values.move_to_end(key)
             return copy.deepcopy(value)
 
     def put(self, key: str, value: dict) -> None:
         with self._lock:
+            self._puts += 1
+            self._last_put_at = time.time()
             self._values[key] = copy.deepcopy(value)
             self._values.move_to_end(key)
             while len(self._values) > self.maxsize:
                 self._values.popitem(last=False)
+                self._evictions += 1
 
     def stats(self) -> dict:
         with self._lock:
-            return {"entries": len(self._values), "capacity": self.maxsize}
+            attempts = self._hits + self._misses
+            return {
+                "entries": len(self._values),
+                "capacity": self.maxsize,
+                "hits": self._hits,
+                "misses": self._misses,
+                "puts": self._puts,
+                "evictions": self._evictions,
+                "hit_rate": round(self._hits / max(1, attempts), 6),
+                "started_at_epoch": self._started_at,
+                "last_hit_at_epoch": self._last_hit_at,
+                "last_put_at_epoch": self._last_put_at,
+            }
 
 
 SCREEN_CACHE = _ScreenerCache()

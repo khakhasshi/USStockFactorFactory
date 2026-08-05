@@ -390,3 +390,122 @@ tr.clickable:hover { background: #1c2129; }
   .selector-metrics, .backtest-metrics, .step-state-grid, .backtest-form-grid { grid-template-columns: 1fr; }
   .fee-disclosure, .run-row { align-items: stretch; flex-direction: column; }
 }
+
+/* ============ Engineering observability workbench ============ */
+.ops-page { max-width: 1680px; margin: 0 auto; }
+.ops-heading {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 18px; margin: 4px 0 10px;
+}
+.ops-heading h1 { margin: 5px 0 6px; font-size: 22px; letter-spacing: -.02em; }
+.ops-heading p { color: var(--muted); font-size: 11px; line-height: 1.55; }
+.ops-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.ops-health {
+  border: 1px solid var(--border); border-radius: 12px; padding: 4px 10px;
+  font-size: 11px; white-space: nowrap;
+}
+.ops-health.health-healthy { color: var(--green); border-color: #1f5138; background: #12261e; }
+.ops-health.health-degraded { color: var(--amber); border-color: #6e5619; background: #2d2308; }
+.ops-health.health-unhealthy { color: var(--red); border-color: #6e2429; background: #2d1517; }
+.ops-meta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px;
+  margin-bottom: 12px; color: var(--muted); font-size: 10px;
+}
+.ops-meta a { color: var(--accent); text-decoration: none; }
+.ops-meta a:hover { text-decoration: underline; }
+.ops-findings { display: grid; gap: 7px; margin-bottom: 12px; }
+.ops-finding {
+  display: grid; grid-template-columns: 250px minmax(220px, 1fr) minmax(280px, 1fr);
+  align-items: center; gap: 12px; border: 1px solid var(--border);
+  border-left-width: 3px; border-radius: 7px; padding: 9px 12px; background: var(--panel);
+}
+.ops-finding > div { display: flex; align-items: center; gap: 8px; }
+.ops-finding span { color: var(--muted); font-size: 9px; letter-spacing: .08em; }
+.ops-finding b { font-size: 12px; }
+.ops-finding p, .ops-finding small { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.ops-finding.finding-critical { border-left-color: var(--red); }
+.ops-finding.finding-warning { border-left-color: var(--amber); }
+.ops-finding.finding-info { border-left-color: var(--accent); }
+.ops-finding.finding-ok { border-left-color: var(--green); }
+.ops-metrics {
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px; margin-bottom: 12px;
+}
+.ops-metrics .metric-card { min-width: 0; }
+.ops-metrics .metric-card b {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px;
+}
+.ops-metrics .metric-card small {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.55;
+}
+.metric-card.danger { border-color: #6e2429; background: rgba(248,81,73,.055); }
+.metric-card.danger b { color: var(--red); }
+.ops-grid { margin-bottom: 12px; align-items: start; }
+.ops-table-card { padding: 14px 0 0; min-width: 0; overflow: hidden; }
+.ops-table-card .panel-title-row { padding: 0 14px 10px; }
+.ops-table-card .panel-title-row h2, .ops-list-card h2 { font-size: 13px; margin-bottom: 3px; }
+.ops-table-card .panel-title-row p, .ops-list-card .panel-title-row p {
+  color: var(--muted); font-size: 10px;
+}
+.ops-table-scroll { overflow: auto; border-top: 1px solid var(--border); }
+.ops-table-scroll table { min-width: 720px; }
+.ops-table-scroll th { position: sticky; top: 0; z-index: 1; background: var(--panel); }
+.ops-table-scroll td { vertical-align: top; }
+.ops-table-scroll code { color: #79c0ff; font-size: 10px; }
+.route-table { max-height: 520px; }
+.route-table table { min-width: 1050px; }
+.ops-wrap { max-width: 280px; margin-top: 5px; white-space: normal; word-break: break-word; font-size: 10px; }
+.ops-details { padding: 10px 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 10px; }
+.ops-details summary, .ops-raw summary { cursor: pointer; color: var(--accent); }
+.ops-details code { display: block; margin-top: 8px; color: var(--muted); word-break: break-all; }
+.ops-list-card { min-width: 0; padding: 14px 0 0; overflow: hidden; }
+.ops-list-card .panel-title-row { padding: 0 14px 10px; }
+.ops-event-list { max-height: 390px; overflow: auto; border-top: 1px solid var(--border); }
+.ops-event-list article {
+  display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 7px 10px;
+  align-items: center; padding: 9px 14px; border-bottom: 1px solid rgba(48,54,61,.65);
+}
+.ops-event-list time { color: var(--muted); font-size: 9px; }
+.ops-event-list code {
+  color: #79c0ff; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 9px;
+}
+.ops-event-list p {
+  grid-column: 1 / -1; color: var(--muted); font-size: 10px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ops-empty { padding: 22px !important; color: var(--muted); text-align: center; font-size: 11px; }
+.ops-kv { min-width: 0; }
+.ops-kv dl { display: grid; grid-template-columns: minmax(110px, .8fr) minmax(0, 1.5fr); gap: 0; }
+.ops-kv dt, .ops-kv dd { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,.6); font-size: 10px; }
+.ops-kv dt { color: var(--muted); }
+.ops-kv dd { color: var(--text); text-align: right; overflow-wrap: anywhere; }
+.ops-provider {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 3px 8px;
+  margin-top: 10px; padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+}
+.ops-provider b, .ops-provider span { font-size: 10px; }
+.ops-provider span { text-align: right; color: var(--accent); }
+.ops-provider small { grid-column: 1 / -1; color: var(--muted); font-size: 9px; }
+.ops-raw { margin-bottom: 12px; }
+.ops-raw pre {
+  max-height: 720px; overflow: auto; margin-top: 12px; padding: 12px;
+  border: 1px solid var(--border); border-radius: 6px; background: #090d12;
+  color: var(--muted); font: 10px/1.55 "SF Mono", ui-monospace, monospace;
+}
+.ops-loading {
+  min-height: 260px; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; color: var(--muted);
+}
+@media (max-width: 1380px) {
+  .ops-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 1050px) {
+  .ops-heading { flex-direction: column; }
+  .ops-actions { justify-content: flex-start; }
+  .ops-finding { grid-template-columns: 1fr; gap: 5px; }
+  .ops-grid.cols-2, .ops-grid.cols-3 { grid-template-columns: 1fr; }
+}
+@media (max-width: 680px) {
+  .ops-metrics { grid-template-columns: 1fr; }
+  .ops-actions .btn { flex: 1 1 45%; }
+}

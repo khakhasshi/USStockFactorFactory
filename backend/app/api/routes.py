@@ -1,16 +1,22 @@
 import asyncio
-from datetime import datetime
+import os
+import time
+from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import polars as pl
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.engine import make_url
 
 from ..backtest.engine import run_backtest
 from ..config import (
     BACKTEST_ARTIFACT_ROOT,
+    DATABASE_URL,
     DEFAULT_ENGINE_CONFIG,
     DEFAULT_EVALUATION_CONFIG,
     DEFAULT_PORTFOLIO_MODE,
@@ -22,7 +28,7 @@ from ..config import (
     resolve_engine_tasks,
 )
 from ..data.panel import PanelStore
-from ..db import SessionLocal, get_active_experiment_id
+from ..db import SessionLocal, engine as db_engine, get_active_experiment_id
 from ..dsl.engine import (
     OPERATORS_DOC,
     expression_profile,
@@ -37,11 +43,28 @@ from ..factors.similarity import (
     nearest_factors,
 )
 from ..models import Backtest, EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
+from ..observability import (
+    OBSERVABILITY,
+    build_findings,
+    fingerprint_payload,
+    overall_health,
+    redact_text,
+    redact_value,
+)
 from ..orchestrator import EngineManager
 from ..screener import SCREEN_CACHE, screen_cross_section
 
 router = APIRouter(prefix="/api")
-_similarity_cache: dict[tuple[int, int, int, float], dict] = {}
+_similarity_cache: OrderedDict[tuple[int, int, int, float], dict] = OrderedDict()
+_similarity_cache_lock = asyncio.Lock()
+_similarity_cache_stats = {
+    "hits": 0,
+    "misses": 0,
+    "builds": 0,
+    "evictions": 0,
+    "last_build_ms": None,
+    "last_build_at": None,
+}
 
 
 async def _experiment_context(experiment_id: int | None = None) -> tuple[int, dict]:
@@ -415,10 +438,32 @@ async def _factor_similarity_index(
         round(threshold, 4),
     )
     index = _similarity_cache.get(key)
-    if index is None:
+    if index is not None:
+        _similarity_cache_stats["hits"] += 1
+        _similarity_cache.move_to_end(key)
+        return index, items
+    _similarity_cache_stats["misses"] += 1
+    async with _similarity_cache_lock:
+        index = _similarity_cache.get(key)
+        if index is not None:
+            _similarity_cache_stats["hits"] += 1
+            _similarity_cache.move_to_end(key)
+            return index, items
+        started = time.perf_counter()
         index = await asyncio.to_thread(build_similarity_index, items, threshold)
-        _similarity_cache.clear()
+        _similarity_cache_stats["builds"] += 1
+        _similarity_cache_stats["last_build_ms"] = round(
+            (time.perf_counter() - started) * 1000.0,
+            3,
+        )
+        _similarity_cache_stats["last_build_at"] = datetime.now(
+            timezone.utc
+        ).isoformat(timespec="milliseconds")
         _similarity_cache[key] = index
+        _similarity_cache.move_to_end(key)
+        while len(_similarity_cache) > 24:
+            _similarity_cache.popitem(last=False)
+            _similarity_cache_stats["evictions"] += 1
     return index, items
 
 
@@ -1527,42 +1572,554 @@ async def meta(experiment_id: int | None = None, load_panel: bool = False):
     }
 
 
-@router.get("/observability")
-async def observability():
-    """平台运行态、数据身份、任务 worker 和资源信息的统一只读快照。"""
-    import os
-    import time
-    manager = EngineManager.get()
-    _, cfg = await _experiment_context()
-    market = cfg.get("market", "us")
-    panel = PanelStore.get(cfg.get("panel_glob"), market)
-    summary = await asyncio.to_thread(panel.summary, False)
-    async with SessionLocal() as s:
-        events = (await s.scalars(select(EngineEvent).order_by(EngineEvent.id.desc()).limit(100))).all()
+def _database_pool_snapshot() -> dict:
+    pool = db_engine.sync_engine.pool
+
+    def read(name: str, default=None):
+        value = getattr(pool, name, default)
+        try:
+            return value() if callable(value) else value
+        except Exception:  # noqa: BLE001 - diagnostics must not break health checks
+            return default
+
+    size = int(read("size", 0) or 0)
+    checked_out = int(read("checkedout", 0) or 0)
+    checked_in = int(read("checkedin", 0) or 0)
+    overflow = int(read("overflow", 0) or 0)
+    max_overflow = int(getattr(pool, "_max_overflow", 0) or 0)
+    capacity = max(1, size + max(0, max_overflow))
     return {
-        "service": {"port": int(os.environ.get("FF_PORT", "10010")), "pid": os.getpid(), "epoch": time.time()},
-        "data": summary,
-        "active_task": {
-            "market": market,
-            "portfolio_mode": cfg.get("portfolio_mode"),
-            "direction": int(cfg.get("direction", 1)),
-            "evaluation_protocol": cfg.get("evaluation_protocol", "legacy"),
-        },
-        "panel_cache": {
-            "instances": len(PanelStore._instances),
-            "loaded": sum(store.df is not None for store in PanelStore._instances.values()),
-        },
-        "screener_cache": SCREEN_CACHE.stats(),
-        "backtest_artifacts": {
-            "root": str(BACKTEST_ARTIFACT_ROOT),
-            "runs": len(list(BACKTEST_ARTIFACT_ROOT.glob("*/manifest.json")))
-            if BACKTEST_ARTIFACT_ROOT.exists() else 0,
-        },
-        "workers": manager.all_status(),
-        "engine": {"worker_count": len(manager.workers), "running_count": sum(w.running for w in manager.workers.values())},
-        "recent_events": [
-            {"id": e.id, "experiment_id": e.experiment_id, "level": e.level,
-             "message": e.message, "created_at": str(e.created_at), "payload": e.payload}
-            for e in events
-        ],
+        "class": type(pool).__name__,
+        "size": size,
+        "max_overflow": max_overflow,
+        "capacity": capacity,
+        "checked_in": checked_in,
+        "checked_out": checked_out,
+        "overflow": overflow,
+        "utilization": round(checked_out / capacity, 6),
+        "timeout_seconds": read("timeout"),
+        "status_text": redact_text(read("status", "unavailable"), 400),
     }
+
+
+async def _database_observability() -> dict:
+    started = time.perf_counter()
+    result = {
+        "status": "unknown",
+        "url": make_url(DATABASE_URL).render_as_string(hide_password=True),
+        "driver": make_url(DATABASE_URL).drivername,
+        "pool": _database_pool_snapshot(),
+        "counts": {},
+        "backtest_statuses": {},
+        "experiment_statuses": {},
+        "factor_lifecycle": {},
+        "event_levels_1h": {},
+    }
+    try:
+        async with SessionLocal() as s:
+            await s.execute(text("SELECT 1"))
+            counts = (
+                await s.execute(text(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM experiments) AS experiments,
+                      (SELECT COUNT(*) FROM factors) AS factors,
+                      (SELECT COUNT(*) FROM nodes) AS nodes,
+                      (SELECT COUNT(*) FROM trials) AS trials,
+                      (SELECT COUNT(*) FROM outer_steps) AS outer_steps,
+                      (SELECT COUNT(*) FROM backtests) AS backtests,
+                      (SELECT COUNT(*) FROM engine_events) AS engine_events
+                    """
+                ))
+            ).mappings().one()
+            result["counts"] = {key: int(value or 0) for key, value in counts.items()}
+            result["backtest_statuses"] = {
+                str(status): int(count)
+                for status, count in (
+                    await s.execute(text(
+                        "SELECT status, COUNT(*) FROM backtests GROUP BY status"
+                    ))
+                ).all()
+            }
+            result["experiment_statuses"] = {
+                str(status): int(count)
+                for status, count in (
+                    await s.execute(text(
+                        "SELECT status, COUNT(*) FROM experiments GROUP BY status"
+                    ))
+                ).all()
+            }
+            result["factor_lifecycle"] = {
+                str(status): int(count)
+                for status, count in (
+                    await s.execute(text(
+                        "SELECT lifecycle_stage, COUNT(*) FROM factors "
+                        "GROUP BY lifecycle_stage ORDER BY COUNT(*) DESC"
+                    ))
+                ).all()
+            }
+            result["event_levels_1h"] = {
+                str(level): int(count)
+                for level, count in (
+                    await s.execute(text(
+                        "SELECT level, COUNT(*) FROM engine_events "
+                        "WHERE created_at >= NOW() - INTERVAL '1 hour' "
+                        "GROUP BY level"
+                    ))
+                ).all()
+            }
+        result["status"] = "ok"
+        result["error"] = None
+    except Exception as exc:  # noqa: BLE001
+        result["status"] = "error"
+        result["error"] = redact_text(exc, 1200)
+    result["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+    result["pool"] = _database_pool_snapshot()
+    return result
+
+
+def _provider_observability(value: dict | None) -> dict:
+    value = value or {}
+    inner_name = value.get("inner_provider") or ""
+    outer_name = value.get("outer_provider") or ""
+    providers = []
+    configured_names = set()
+    for provider in (value.get("providers") or [])[:50]:
+        name = str(provider.get("name") or "")
+        has_key = bool(provider.get("api_key"))
+        if has_key:
+            configured_names.add(name)
+        base_url = str(provider.get("base_url") or provider.get("url") or "")
+        parsed = urlparse(base_url)
+        providers.append({
+            "name": name,
+            "format": provider.get("format") or provider.get("provider"),
+            "model": provider.get("model"),
+            "endpoint_host": parsed.netloc or parsed.path.split("/")[0] or None,
+            "api_key_present": has_key,
+            "selected_for": [
+                role
+                for role, selected in (
+                    ("inner", inner_name),
+                    ("outer", outer_name),
+                )
+                if selected == name
+            ],
+        })
+    return {
+        "inner_provider": inner_name or None,
+        "outer_provider": outer_name or None,
+        "inner_provider_configured": inner_name in configured_names,
+        "outer_provider_configured": outer_name in configured_names,
+        "provider_count": len(providers),
+        "providers": providers,
+        "note": "仅显示配置状态、模型和主机；凭据不会进入诊断快照。",
+    }
+
+
+async def _active_configuration_snapshot() -> tuple[dict, dict]:
+    active = {
+        "experiment_id": None,
+        "name": None,
+        "status": "unknown",
+        "config_error": None,
+    }
+    provider_value: dict = {}
+    try:
+        experiment_id = await get_active_experiment_id()
+        async with SessionLocal() as s:
+            experiment = await s.get(Experiment, experiment_id)
+            providers = await s.get(Setting, "llm_providers")
+        provider_value = dict(providers.value or {}) if providers else {}
+        if experiment is None:
+            raise RuntimeError(f"活动研究任务 {experiment_id} 不存在")
+        config = dict(experiment.research_config or {})
+        market = config.get("market", "us")
+        panel_glob = config.get("panel_glob") or default_panel_glob(market)
+        PanelStore.get(panel_glob, market)
+        active.update({
+            "experiment_id": experiment.id,
+            "name": experiment.name,
+            "status": experiment.status,
+            "created_at": str(experiment.created_at),
+            "market": market,
+            "portfolio_mode": config.get(
+                "portfolio_mode",
+                "long_only" if market == "ashare" else "long_short",
+            ),
+            "direction": int(config.get("direction", 1)),
+            "evaluation_protocol": config.get(
+                "evaluation_protocol",
+                "legacy",
+            ),
+            "panel_glob": panel_glob,
+            "panel_id": fingerprint_payload((market, panel_glob)),
+            "config_fingerprint": fingerprint_payload(config),
+            "config": redact_value(config),
+        })
+    except Exception as exc:  # noqa: BLE001
+        active["config_error"] = redact_text(exc, 1200)
+    return active, _provider_observability(provider_value)
+
+
+def _artifact_observability() -> dict:
+    root = BACKTEST_ARTIFACT_ROOT
+    if not root.exists():
+        return {
+            "root": str(root),
+            "exists": False,
+            "runs": 0,
+            "files": 0,
+            "total_bytes": 0,
+            "latest_mtime": None,
+            "inventory_truncated": False,
+        }
+    manifests = list(root.glob("*/manifest.json"))
+    files = []
+    for path in root.rglob("*"):
+        if path.is_file():
+            files.append(path)
+            if len(files) >= 10000:
+                break
+    total_bytes = 0
+    latest_mtime = 0.0
+    stat_errors = 0
+    for path in files:
+        try:
+            stat = path.stat()
+            total_bytes += stat.st_size
+            latest_mtime = max(latest_mtime, stat.st_mtime)
+        except OSError:
+            stat_errors += 1
+    return {
+        "root": str(root),
+        "exists": True,
+        "runs": len(manifests),
+        "files": len(files),
+        "total_bytes": total_bytes,
+        "latest_mtime": (
+            datetime.fromtimestamp(latest_mtime, timezone.utc).isoformat(
+                timespec="seconds"
+            )
+            if latest_mtime
+            else None
+        ),
+        "stat_errors": stat_errors,
+        "inventory_truncated": len(files) >= 10000,
+    }
+
+
+def _similarity_cache_observability() -> dict:
+    stats = dict(_similarity_cache_stats)
+    attempts = int(stats["hits"]) + int(stats["misses"])
+    stats.update({
+        "entries": len(_similarity_cache),
+        "capacity": 24,
+        "hit_rate": round(int(stats["hits"]) / max(1, attempts), 6),
+    })
+    return stats
+
+
+async def _recent_engine_events(
+    *,
+    limit: int,
+    level: str | None,
+    experiment_id: int | None,
+) -> tuple[list[dict], str | None]:
+    if limit <= 0:
+        return [], None
+    try:
+        stmt = select(EngineEvent)
+        if level:
+            stmt = stmt.where(EngineEvent.level == level)
+        if experiment_id is not None:
+            stmt = stmt.where(EngineEvent.experiment_id == experiment_id)
+        async with SessionLocal() as s:
+            rows = (
+                await s.scalars(
+                    stmt.order_by(EngineEvent.id.desc()).limit(limit)
+                )
+            ).all()
+        return [
+            {
+                "id": event.id,
+                "experiment_id": event.experiment_id,
+                "level": event.level,
+                "message": redact_text(event.message, 1600),
+                "created_at": str(event.created_at),
+                "payload": redact_value(event.payload or {}),
+            }
+            for event in rows
+        ], None
+    except Exception as exc:  # noqa: BLE001
+        return [], redact_text(exc, 1200)
+
+
+async def _collect_observability(
+    *,
+    events_limit: int = 50,
+    event_level: str | None = None,
+    event_experiment_id: int | None = None,
+    window_seconds: int = 300,
+) -> dict:
+    manager = EngineManager.get()
+    database, active_and_providers = await asyncio.gather(
+        _database_observability(),
+        _active_configuration_snapshot(),
+    )
+    active_task, providers = active_and_providers
+    workers = manager.all_status(include_logs=False)
+    required_panel_sources = {
+        active_task.get("panel_glob")
+    } if active_task.get("panel_glob") else set()
+    for worker in manager.workers.values():
+        if not worker.running:
+            continue
+        market = worker.task_config.get("market", "us")
+        required_panel_sources.add(
+            worker.task_config.get("panel_glob") or default_panel_glob(market)
+        )
+    data, artifacts = await asyncio.gather(
+        asyncio.to_thread(PanelStore.registry_snapshot),
+        asyncio.to_thread(_artifact_observability),
+    )
+    for panel in data["panels"]:
+        panel["required"] = panel.get("source") in required_panel_sources
+        if panel.get("source") == active_task.get("panel_glob"):
+            active_task["panel_id"] = panel.get("id")
+            active_task["panel_identity"] = panel.get("identity")
+    events, events_error = await _recent_engine_events(
+        limit=events_limit,
+        level=event_level,
+        experiment_id=event_experiment_id,
+    )
+    active_id = active_task.get("experiment_id")
+    active_worker = (
+        manager.status_for(active_id, include_logs=False)
+        if active_id is not None
+        else None
+    )
+    if active_worker:
+        active_task["worker_state"] = active_worker.get("state")
+        active_task["worker_phase"] = active_worker.get("phase")
+    requests = OBSERVABILITY.request_snapshot(window_seconds)
+    service = OBSERVABILITY.service_snapshot()
+    snapshot = {
+        "schema_version": "factorfactory.observability/v2",
+        "generated_at": service["generated_at"],
+        "service": service,
+        "process": OBSERVABILITY.process_snapshot(),
+        "requests": requests,
+        "database": database,
+        "data": data,
+        "caches": {
+            "panel": {
+                key: value for key, value in data.items() if key != "panels"
+            },
+            "screener": SCREEN_CACHE.stats(),
+            "factor_similarity": _similarity_cache_observability(),
+        },
+        "artifacts": artifacts,
+        "active_task": active_task,
+        "providers": providers,
+        "engine": {
+            "worker_count": len(manager.workers),
+            "running_count": sum(worker.running for worker in manager.workers.values()),
+            "stale_heartbeat_count": sum(
+                bool(worker.get("heartbeat_stale")) for worker in workers
+            ),
+        },
+        "workers": workers,
+        "recent_events": events,
+        "recent_events_error": events_error,
+    }
+    findings = build_findings(snapshot)
+    snapshot["findings"] = findings
+    snapshot["health"] = overall_health(findings)
+    # Compatibility aliases for existing local clients.
+    snapshot["panel_cache"] = snapshot["caches"]["panel"]
+    snapshot["screener_cache"] = snapshot["caches"]["screener"]
+    snapshot["backtest_artifacts"] = artifacts
+    return snapshot
+
+
+@router.get("/observability")
+async def observability(
+    events_limit: int = 50,
+    event_level: str | None = None,
+    event_experiment_id: int | None = None,
+    window_seconds: int = 300,
+):
+    """Secret-safe engineering snapshot for diagnosis and incident hand-off."""
+    if not 0 <= events_limit <= 200:
+        raise HTTPException(400, "events_limit 必须在 0..200")
+    if not 60 <= window_seconds <= 3600:
+        raise HTTPException(400, "window_seconds 必须在 60..3600")
+    return await _collect_observability(
+        events_limit=events_limit,
+        event_level=event_level,
+        event_experiment_id=event_experiment_id,
+        window_seconds=window_seconds,
+    )
+
+
+@router.get("/health/live")
+async def health_live():
+    """Liveness only: proves the event loop can still serve a request."""
+    service = OBSERVABILITY.service_snapshot()
+    return {
+        "status": "alive",
+        "service": service["name"],
+        "pid": service["pid"],
+        "started_at": service["started_at"],
+        "uptime_seconds": service["uptime_seconds"],
+        "generated_at": service["generated_at"],
+    }
+
+
+@router.get("/health/ready")
+async def health_ready():
+    """Readiness: database and configured panel source must be reachable."""
+    snapshot = await _collect_observability(events_limit=0, window_seconds=300)
+    panel_errors = [
+        panel
+        for panel in snapshot["data"]["panels"]
+        if panel.get("required")
+        and (panel.get("state") == "error" or panel.get("source_error"))
+    ]
+    ready = snapshot["database"]["status"] == "ok" and not panel_errors
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "health": snapshot["health"],
+        "database": {
+            "status": snapshot["database"]["status"],
+            "latency_ms": snapshot["database"]["latency_ms"],
+            "error": snapshot["database"].get("error"),
+        },
+        "panels": {
+            "instances": snapshot["data"]["instances"],
+            "loaded": snapshot["data"]["loaded"],
+            "errors": len(panel_errors),
+        },
+        "findings": snapshot["findings"],
+        "generated_at": snapshot["generated_at"],
+    }
+    return JSONResponse(payload, status_code=200 if ready else 503)
+
+
+def _prometheus_escape(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+@router.get("/metrics")
+async def prometheus_metrics():
+    """Small Prometheus-compatible surface; labels are deliberately bounded."""
+    snapshot = await _collect_observability(events_limit=0, window_seconds=300)
+    requests = snapshot["requests"]
+    lifetime = requests["lifetime"]
+    process = snapshot["process"]
+    pool = snapshot["database"]["pool"]
+    data = snapshot["data"]
+    screener_cache = snapshot["caches"]["screener"]
+    lines = [
+        "# HELP factorfactory_info Deployment identity.",
+        "# TYPE factorfactory_info gauge",
+        (
+            'factorfactory_info{commit="'
+            f'{_prometheus_escape(snapshot["service"]["deployment"]["commit_short"])}",'
+            f'branch="{_prometheus_escape(snapshot["service"]["deployment"]["branch"])}"'
+            "} 1"
+        ),
+        "# TYPE factorfactory_health_status gauge",
+        (
+            'factorfactory_health_status{status="'
+            f'{_prometheus_escape(snapshot["health"])}'
+            '"} 1'
+        ),
+        "# TYPE factorfactory_http_requests_total counter",
+        f'factorfactory_http_requests_total {lifetime["requests"]}',
+        "# TYPE factorfactory_http_server_errors_total counter",
+        f'factorfactory_http_server_errors_total {lifetime["server_errors"]}',
+        "# TYPE factorfactory_http_client_errors_total counter",
+        f'factorfactory_http_client_errors_total {lifetime["client_errors"]}',
+        "# TYPE factorfactory_http_in_flight gauge",
+        f'factorfactory_http_in_flight {requests["in_flight"]}',
+        "# TYPE factorfactory_http_latency_milliseconds gauge",
+        (
+            'factorfactory_http_latency_milliseconds{quantile="0.50"} '
+            f'{lifetime["latency_ms"]["p50"]}'
+        ),
+        (
+            'factorfactory_http_latency_milliseconds{quantile="0.95"} '
+            f'{lifetime["latency_ms"]["p95"]}'
+        ),
+        (
+            'factorfactory_http_latency_milliseconds{quantile="0.99"} '
+            f'{lifetime["latency_ms"]["p99"]}'
+        ),
+        "# TYPE factorfactory_process_resident_memory_bytes gauge",
+        f'factorfactory_process_resident_memory_bytes {process.get("rss_bytes", 0)}',
+        "# TYPE factorfactory_process_cpu_percent gauge",
+        f'factorfactory_process_cpu_percent {process.get("cpu_percent", 0)}',
+        "# TYPE factorfactory_event_loop_lag_milliseconds gauge",
+        (
+            "factorfactory_event_loop_lag_milliseconds "
+            f'{requests["event_loop"].get("p95_lag_ms", 0)}'
+        ),
+        "# TYPE factorfactory_database_pool_checked_out gauge",
+        f'factorfactory_database_pool_checked_out {pool.get("checked_out", 0)}',
+        "# TYPE factorfactory_database_up gauge",
+        (
+            "factorfactory_database_up "
+            f'{1 if snapshot["database"]["status"] == "ok" else 0}'
+        ),
+        "# TYPE factorfactory_database_pool_utilization_ratio gauge",
+        f'factorfactory_database_pool_utilization_ratio {pool.get("utilization", 0)}',
+        "# TYPE factorfactory_research_workers gauge",
+        (
+            'factorfactory_research_workers{state="running"} '
+            f'{snapshot["engine"]["running_count"]}'
+        ),
+        (
+            'factorfactory_research_workers{state="registered"} '
+            f'{snapshot["engine"]["worker_count"]}'
+        ),
+        "# TYPE factorfactory_panel_instances gauge",
+        f'factorfactory_panel_instances {data["instances"]}',
+        "# TYPE factorfactory_panel_loaded gauge",
+        f'factorfactory_panel_loaded {data["loaded"]}',
+        "# TYPE factorfactory_panel_errors gauge",
+        f'factorfactory_panel_errors {data["errors"]}',
+        "# TYPE factorfactory_panel_memory_bytes gauge",
+        f'factorfactory_panel_memory_bytes {data["estimated_size_bytes"]}',
+        "# TYPE factorfactory_screener_cache_requests_total counter",
+        (
+            'factorfactory_screener_cache_requests_total{result="hit"} '
+            f'{screener_cache["hits"]}'
+        ),
+        (
+            'factorfactory_screener_cache_requests_total{result="miss"} '
+            f'{screener_cache["misses"]}'
+        ),
+        "# TYPE factorfactory_worker_stale_heartbeats gauge",
+        (
+            "factorfactory_worker_stale_heartbeats "
+            f'{snapshot["engine"]["stale_heartbeat_count"]}'
+        ),
+        "# TYPE factorfactory_backtest_artifact_bytes gauge",
+        (
+            "factorfactory_backtest_artifact_bytes "
+            f'{snapshot["artifacts"]["total_bytes"]}'
+        ),
+    ]
+    for route in requests["routes"]:
+        label = _prometheus_escape(route["route"])
+        lines.extend([
+            f'factorfactory_http_route_requests_total{{route="{label}"}} {route["count"]}',
+            f'factorfactory_http_route_server_errors_total{{route="{label}"}} {route["errors"]}',
+            f'factorfactory_http_route_p95_milliseconds{{route="{label}"}} {route["p95_ms"]}',
+        ])
+    return PlainTextResponse(
+        "\n".join(lines) + "\n",
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )

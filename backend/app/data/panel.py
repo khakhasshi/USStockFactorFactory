@@ -3,9 +3,12 @@
 诚实标记: 本数据源为当前成分股回看历史 (non-PIT), production_eligible=False.
 """
 
+import glob
+import hashlib
 import os
 import threading
-from datetime import date
+import time
+from datetime import date, datetime, timezone
 
 import polars as pl
 
@@ -32,6 +35,16 @@ class PanelStore:
         self.market = market or os.environ.get("FF_MARKET", "us")
         self.layer_bounds = get_layer_bounds(self.market)
         self._load_lock = threading.Lock()
+        self._diagnostic_lock = threading.Lock()
+        self.load_state = "cold"
+        self.load_attempts = 0
+        self.load_started_at: str | None = None
+        self.loaded_at: str | None = None
+        self.load_duration_ms: float | None = None
+        self.last_accessed_at: str | None = None
+        self._loaded_summary: dict = {}
+        self._inventory_cache: dict = {}
+        self._inventory_cached_at = 0.0
 
     @classmethod
     def get(cls, panel_glob: str | None = None, market: str | None = None) -> "PanelStore":
@@ -44,6 +57,9 @@ class PanelStore:
             return cls._instances[key]
 
     def ensure_loaded(self) -> pl.DataFrame:
+        self.last_accessed_at = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
         if self.df is not None:
             return self.df
         # Different market panels may load concurrently; only duplicate loads
@@ -51,7 +67,40 @@ class PanelStore:
         with self._load_lock:
             if self.df is not None:
                 return self.df
-            self.df = self._load()
+            self.load_attempts += 1
+            self.load_state = "loading"
+            self.load_error = ""
+            self.load_started_at = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            started = time.perf_counter()
+            try:
+                frame = self._load()
+            except Exception as exc:
+                self.load_state = "error"
+                self.load_error = str(exc)[:1200]
+                self.load_duration_ms = round(
+                    (time.perf_counter() - started) * 1000.0,
+                    3,
+                )
+                raise
+            self.df = frame
+            self.load_state = "ready"
+            self.loaded_at = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            self.load_duration_ms = round(
+                (time.perf_counter() - started) * 1000.0,
+                3,
+            )
+            self._loaded_summary = {
+                "rows": frame.height,
+                "securities": frame["ts_code"].n_unique(),
+                "date_min": str(frame["trade_date"].min()),
+                "date_max": str(frame["trade_date"].max()),
+                "columns": len(frame.columns),
+                "estimated_size_bytes": frame.estimated_size("b"),
+            }
             return self.df
 
     def _load(self) -> pl.DataFrame:
@@ -166,14 +215,119 @@ class PanelStore:
             df = self.ensure_loaded()
         except Exception as e:  # noqa: BLE001
             return {"loaded": False, "error": str(e), **PANEL_META}
-        return {
-            "loaded": True,
+        loaded = self._loaded_summary or {
             "rows": df.height,
             "securities": df["ts_code"].n_unique(),
             "date_min": str(df["trade_date"].min()),
             "date_max": str(df["trade_date"].max()),
+        }
+        return {
+            "loaded": True,
+            "state": self.load_state,
+            **loaded,
             "market": self.market,
             "layers": {k: list(v) for k, v in self.layer_bounds.items()},
             **PANEL_META,
             "panel_glob": self.panel_glob or PANEL_GLOB,
+        }
+
+    def _source_inventory(self) -> dict:
+        """Cheap cached file identity; never loads the Polars panel."""
+        now = time.monotonic()
+        with self._diagnostic_lock:
+            if self._inventory_cache and now - self._inventory_cached_at < 30.0:
+                return dict(self._inventory_cache)
+            source = self.panel_glob or PANEL_GLOB
+            try:
+                paths = sorted(glob.glob(source))
+                sampled = paths[:5000]
+                total_bytes = 0
+                latest_mtime = 0.0
+                identity_rows = []
+                stat_errors = 0
+                for path in sampled:
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        stat_errors += 1
+                        continue
+                    total_bytes += stat.st_size
+                    latest_mtime = max(latest_mtime, stat.st_mtime)
+                    identity_rows.append(
+                        f"{path}|{stat.st_size}|{stat.st_mtime_ns}"
+                    )
+                identity = hashlib.sha256(
+                    "\n".join(identity_rows).encode("utf-8")
+                ).hexdigest()[:16]
+                result = {
+                    "source": source,
+                    "file_count": len(paths),
+                    "sampled_files": len(sampled),
+                    "inventory_truncated": len(paths) > len(sampled),
+                    "stat_errors": stat_errors,
+                    "total_bytes": total_bytes,
+                    "latest_mtime": (
+                        datetime.fromtimestamp(
+                            latest_mtime,
+                            timezone.utc,
+                        ).isoformat(timespec="seconds")
+                        if latest_mtime
+                        else None
+                    ),
+                    "identity": identity,
+                    "source_error": None if paths else "panel glob 未匹配任何文件",
+                }
+            except (OSError, ValueError) as exc:
+                result = {
+                    "source": source,
+                    "file_count": 0,
+                    "sampled_files": 0,
+                    "total_bytes": 0,
+                    "latest_mtime": None,
+                    "identity": None,
+                    "source_error": str(exc)[:1200],
+                }
+            self._inventory_cache = result
+            self._inventory_cached_at = now
+            return dict(result)
+
+    def diagnostics(self) -> dict:
+        inventory = self._source_inventory()
+        loaded = dict(self._loaded_summary)
+        state = self.load_state
+        if state == "cold" and inventory.get("source_error"):
+            state = "error"
+        return {
+            "id": hashlib.sha256(
+                f"{self.market}::{inventory.get('source')}".encode("utf-8")
+            ).hexdigest()[:12],
+            "market": self.market,
+            "state": state,
+            "loaded": self.df is not None,
+            "load_attempts": self.load_attempts,
+            "load_started_at": self.load_started_at,
+            "loaded_at": self.loaded_at,
+            "load_duration_ms": self.load_duration_ms,
+            "last_accessed_at": self.last_accessed_at,
+            "load_error": self.load_error or None,
+            "layer_bounds": {k: list(v) for k, v in self.layer_bounds.items()},
+            **PANEL_META,
+            **inventory,
+            **loaded,
+        }
+
+    @classmethod
+    def registry_snapshot(cls) -> dict:
+        with cls._registry_lock:
+            stores = list(cls._instances.values())
+        panels = [store.diagnostics() for store in stores]
+        return {
+            "instances": len(panels),
+            "loaded": sum(bool(row.get("loaded")) for row in panels),
+            "loading": sum(row.get("state") == "loading" for row in panels),
+            "errors": sum(row.get("state") == "error" for row in panels),
+            "estimated_size_bytes": sum(
+                int(row.get("estimated_size_bytes") or 0) for row in panels
+            ),
+            "panels": panels,
         }

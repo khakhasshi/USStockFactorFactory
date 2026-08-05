@@ -15,8 +15,9 @@ import math
 import os
 import random
 import statistics as st
+import time
 import traceback
-from collections import deque
+from collections import Counter, deque
 from copy import deepcopy
 from datetime import datetime
 
@@ -40,6 +41,7 @@ from .factors.similarity import expression_fingerprint
 from .meta.agent import propose_spec, propose_template, validate_template
 from .miner.agent import propose
 from .models import EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
+from .observability import redact_text, redact_value, utc_now
 
 
 class Engine:
@@ -49,7 +51,28 @@ class Engine:
         self.running = False
         self.task: asyncio.Task | None = None
         self.exp_id: int = 1
-        self.status: dict = {"state": "stopped", "outer_step": 0, "inner_evals": 0, "experiment_id": None}
+        now = utc_now()
+        self.status: dict = {
+            "state": "stopped",
+            "phase": "idle",
+            "phase_started_at": now,
+            "outer_step": 0,
+            "inner_evals": 0,
+            "experiment_id": None,
+            "started_at": None,
+            "stopped_at": now,
+            "last_heartbeat_at": now,
+            "last_progress_at": None,
+            "last_log_at": None,
+            "last_error": None,
+            "current_task": None,
+            "current_operation": None,
+            "current_seed": None,
+            "current_budget_index": None,
+            "current_budget_total": None,
+        }
+        self._started_monotonic: float | None = None
+        self._last_heartbeat_monotonic = time.monotonic()
         self.logbuf: deque[dict] = deque(maxlen=300)
         self._mode: str = "v1"  # "v1" 或 "v2"
         self.task_config: dict = {}
@@ -60,11 +83,50 @@ class Engine:
             cls._instance = cls()
         return cls._instance
 
+    def _set_phase(self, phase: str, *, progress: bool = False, **detail) -> None:
+        now = utc_now()
+        if self.status.get("phase") != phase:
+            self.status["phase_started_at"] = now
+        self.status["phase"] = phase
+        self.status["last_heartbeat_at"] = now
+        if progress:
+            self.status["last_progress_at"] = now
+        self._last_heartbeat_monotonic = time.monotonic()
+        self.status.update(detail)
+
+    def _touch_progress(self, **detail) -> None:
+        self._set_phase(self.status.get("phase") or "running", progress=True, **detail)
+
     async def log(self, msg: str, level: str = "info") -> None:
-        entry = {"t": datetime.now().strftime("%m-%d %H:%M:%S"), "level": level, "msg": msg}
+        now = utc_now()
+        safe_msg = redact_text(msg, 4000)
+        entry = {
+            "t": datetime.now().strftime("%m-%d %H:%M:%S"),
+            "at": now,
+            "level": level,
+            "msg": safe_msg,
+            "phase": self.status.get("phase"),
+        }
         self.logbuf.append(entry)
+        self.status["last_log_at"] = now
+        self.status["last_heartbeat_at"] = now
+        self._last_heartbeat_monotonic = time.monotonic()
+        if level in {"error", "critical"}:
+            self.status["last_error"] = safe_msg[-1200:]
         async with SessionLocal() as s:
-            s.add(EngineEvent(level=level, message=msg, experiment_id=self.exp_id))
+            s.add(EngineEvent(
+                level=level,
+                message=safe_msg,
+                experiment_id=self.exp_id,
+                payload={
+                    "state": self.status.get("state"),
+                    "phase": self.status.get("phase"),
+                    "mode": self._mode,
+                    "outer_step": self.status.get("outer_step"),
+                    "inner_evals": self.status.get("inner_evals"),
+                    "current_task": self.status.get("current_task"),
+                },
+            ))
             await s.commit()
 
     def _panel_glob(self) -> str | None:
@@ -90,13 +152,30 @@ class Engine:
         self.status["experiment_id"] = self.exp_id
         self.running = True
         self._mode = mode
-        self.status["state"] = "starting"
-        self.task = asyncio.create_task(self._run_v2() if mode == "v2" else self._run())
+        now = utc_now()
+        self._started_monotonic = time.monotonic()
+        self.status.update({
+            "state": "starting",
+            "started_at": now,
+            "stopped_at": None,
+            "last_error": None,
+            "current_task": None,
+            "current_operation": None,
+            "current_seed": None,
+            "current_budget_index": None,
+            "current_budget_total": None,
+        })
+        self._set_phase("starting", progress=True)
+        self.task = asyncio.create_task(
+            self._run_v2() if mode == "v2" else self._run(),
+            name=f"research.worker.{self.exp_id}.{mode}",
+        )
         return {"ok": True, "msg": f"引擎启动 (mode={mode})"}
 
     async def stop(self) -> dict:
         self.running = False
         self.status["state"] = "stopping"
+        self._set_phase("stopping", progress=True)
         task = self.task
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
@@ -104,8 +183,46 @@ class Engine:
                 await task
             except asyncio.CancelledError:
                 pass
-        self.status["state"] = "stopped"
+        self.status.update({"state": "stopped", "stopped_at": utc_now()})
+        self._set_phase("stopped", progress=True)
         return {"ok": True, "msg": "引擎已停止，已保留已提交研究数据"}
+
+    def diagnostics(self, include_logs: bool = True) -> dict:
+        task = self.task
+        task_done = bool(task and task.done())
+        task_cancelled = bool(task and task.cancelled())
+        task_exception = None
+        if task_done and not task_cancelled:
+            try:
+                exc = task.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                exc = None
+            if exc is not None:
+                task_exception = redact_text(exc, 1200)
+        heartbeat_age = max(0.0, time.monotonic() - self._last_heartbeat_monotonic)
+        uptime = (
+            max(0.0, time.monotonic() - self._started_monotonic)
+            if self._started_monotonic is not None
+            else 0.0
+        )
+        levels = Counter(row.get("level", "info") for row in self.logbuf)
+        result = dict(self.status)
+        result.update({
+            "mode": self._mode,
+            "running": self.running,
+            "task_created": task is not None,
+            "task_done": task_done,
+            "task_cancelled": task_cancelled,
+            "task_exception": task_exception,
+            "heartbeat_age_seconds": round(heartbeat_age, 3),
+            "heartbeat_stale": bool(self.running and heartbeat_age >= 300.0),
+            "uptime_seconds": round(uptime, 3),
+            "log_counts": dict(levels),
+            "task_config": redact_value(self.task_config),
+        })
+        if include_logs:
+            result["logs"] = list(self.logbuf)
+        return result
 
     # ================================================================
     # V2 主循环 (B组: MinerTemplate + multi-seed + t-test)
@@ -113,6 +230,7 @@ class Engine:
 
     async def _run_v2(self) -> None:
         try:
+            self._set_phase("validating_experiment", progress=True)
             async with SessionLocal() as s:
                 exp = await s.get(Experiment, self.exp_id)
                 if not exp:
@@ -121,10 +239,12 @@ class Engine:
                     raise RuntimeError(f"实验「{exp.name}」已归档")
             self.status["experiment_id"] = self.exp_id
             await self.log(f"[V2] 引擎启动: 实验[{exp.name}] 外层可改写 MinerTemplate")
+            self._set_phase("loading_panel", progress=True)
             panel = PanelStore.get(self._panel_glob(), self.task_config.get("market", "us"))
             await asyncio.to_thread(panel.ensure_loaded)
             await self.log(f"面板就绪: {panel.summary()['rows']} 行 · {self.task_config.get('market', 'configured')}")
 
+            self._set_phase("initializing_miner", progress=True)
             incumbent = await self._ensure_incumbent_v2()
             self.status["state"] = "running"
             cfg = await self._config_v2()
@@ -132,19 +252,37 @@ class Engine:
             while self.running:
                 step_no = await self._next_step_no()
                 self.status["outer_step"] = step_no
+                self._set_phase(
+                    "outer_step",
+                    progress=True,
+                    current_operation="prepare",
+                    current_seed=None,
+                    current_budget_index=None,
+                    current_budget_total=None,
+                )
                 incumbent, cfg = await self._outer_step_v2(step_no, incumbent, cfg)
         except Exception:
+            self._set_phase("failed")
             await self.log(f"引擎异常退出:\n{traceback.format_exc()}", "error")
         finally:
-            self.status["state"] = "stopped"
             self.running = False
+            self.status.update({"state": "stopped", "stopped_at": utc_now()})
+            if self.status.get("phase") != "failed":
+                self._set_phase("stopped", progress=True)
 
     async def _outer_step_v2(self, step_no: int, incumbent: MinerVersion, cfg: dict):
+        self._set_phase(
+            "outer_proposal",
+            progress=True,
+            current_operation="load_context",
+            current_task=None,
+        )
         provider = await self._provider("outer_provider")
         history = await self._version_history_v2()
 
         # 外层 LLM 提议新模板
         inc_template = incumbent.harness_spec if isinstance(incumbent.harness_spec, dict) else DEFAULT_MINER_TEMPLATE
+        self._set_phase("outer_proposal", current_operation="llm_or_fallback")
         cand_template, note, source = await propose_template(
             inc_template, history, provider,
             market=self.task_config.get("market", "us"),
@@ -170,6 +308,14 @@ class Engine:
         n_seeds = int(cfg["n_seeds_per_candidate"])
         cand_scores = []
         for seed in range(n_seeds):
+            self._set_phase(
+                "candidate_mining",
+                progress=True,
+                current_operation="seed",
+                current_seed=seed,
+                current_budget_index=0,
+                current_budget_total=budget,
+            )
             seed_score = await self._mining_session_v2(cand, step_no, budget, cfg, seed)
             cand_scores.append(seed_score)
             await self.log(f"[V2]   seed {seed+1}/{n_seeds} meta={seed_score:.4f}")
@@ -183,6 +329,14 @@ class Engine:
         if incumbent.meta_score is None or step_no % remeasure_every == 0:
             inc_scores = []
             for seed in range(n_seeds):
+                self._set_phase(
+                    "incumbent_remeasure",
+                    progress=True,
+                    current_operation="seed",
+                    current_seed=seed + 1000,
+                    current_budget_index=0,
+                    current_budget_total=remeasure_budget,
+                )
                 inc_seed_score = await self._mining_session_v2(incumbent, step_no, remeasure_budget, cfg, seed + 1000)
                 inc_scores.append(inc_seed_score)
             inc_mean = st.mean(inc_scores) if inc_scores else 0.0
@@ -224,6 +378,12 @@ class Engine:
 
         verdict = f"接受 ✓ p={p_value:.4f}" if accepted else f"拒绝 ✗ p={p_value:.4f}"
 
+        self._set_phase(
+            "outer_decision",
+            progress=True,
+            current_operation="persist_verdict",
+            current_task=None,
+        )
         async with SessionLocal() as s:
             s.add(OuterStep(
                 experiment_id=self.exp_id,
@@ -265,6 +425,15 @@ class Engine:
             if not self.running:
                 break
             task = tasks[i % len(tasks)]
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                progress=True,
+                current_task=task["name"],
+                current_operation="context_lookup",
+                current_seed=seed,
+                current_budget_index=i + 1,
+                current_budget_total=budget,
+            )
             top_nodes = await self._top_nodes(miner.id, task["name"])
 
             # 操作选择: 根据 draft_strategy 中的指令决定 draft/improve 概率
@@ -276,6 +445,10 @@ class Engine:
                 improve_bias = 0.7  # 偏改进
 
             op = "improve" if (top_nodes and rng.random() < improve_bias) else "draft"
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation=f"proposal:{op}",
+            )
             expr, hypo, source = await propose(
                 template, op, task, top_nodes, provider,
                 fields=get_dsl_fields(self.task_config.get("market")),
@@ -288,6 +461,10 @@ class Engine:
                 op=op, expression=expr, hypothesis=hypo, source=source, task_name=task["name"],
             )
             try:
+                self._set_phase(
+                    self.status.get("phase") or "candidate_mining",
+                    current_operation="factor_evaluation",
+                )
                 metrics = await asyncio.to_thread(
                     evaluate, expr, task["universe_n"], task["horizon"],
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
@@ -310,6 +487,10 @@ class Engine:
                 node.error = str(e)[:500]
 
             async with SessionLocal() as s:
+                self._set_phase(
+                    self.status.get("phase") or "candidate_mining",
+                    current_operation="persist_trial",
+                )
                 s.add(node)
                 s.add(Trial(
                     experiment_id=self.exp_id,
@@ -325,6 +506,9 @@ class Engine:
                 await s.refresh(node)
 
             self.status["inner_evals"] = self.status.get("inner_evals", 0) + 1
+            self._touch_progress(
+                current_operation="register_factor" if node.status == "ok" else "candidate_failed",
+            )
             if node.status == "ok":
                 min_icir = float(template.get("min_public_icir", 0.25))
                 await self._maybe_register_factor_v2(node, min_icir)
@@ -454,6 +638,7 @@ class Engine:
 
     async def _run(self) -> None:
         try:
+            self._set_phase("validating_experiment", progress=True)
             async with SessionLocal() as s:
                 exp = await s.get(Experiment, self.exp_id)
                 if not exp:
@@ -462,11 +647,13 @@ class Engine:
                     raise RuntimeError(f"实验「{exp.name}」已归档, 请先切换到开放实验")
             self.status["experiment_id"] = self.exp_id
             await self.log(f"引擎启动: 实验[{exp.name}] 加载数据面板...")
+            self._set_phase("loading_panel", progress=True)
             panel = PanelStore.get(self._panel_glob(), self.task_config.get("market", "us"))
             await asyncio.to_thread(panel.ensure_loaded)
             await self.log(
                 f"面板就绪: {panel.summary()['rows']} 行 · {self.task_config.get('market', 'configured')}"
             )
+            self._set_phase("initializing_miner", progress=True)
             incumbent = await self._ensure_incumbent()
             self.status["state"] = "running"
             cfg = await self._config()
@@ -474,14 +661,31 @@ class Engine:
             while self.running:
                 step_no = await self._next_step_no()
                 self.status["outer_step"] = step_no
+                self._set_phase(
+                    "outer_step",
+                    progress=True,
+                    current_operation="prepare",
+                    current_seed=None,
+                    current_budget_index=None,
+                    current_budget_total=None,
+                )
                 incumbent, cfg = await self._outer_step(step_no, incumbent, cfg)
         except Exception:
+            self._set_phase("failed")
             await self.log(f"引擎异常退出:\n{traceback.format_exc()}", "error")
         finally:
-            self.status["state"] = "stopped"
             self.running = False
+            self.status.update({"state": "stopped", "stopped_at": utc_now()})
+            if self.status.get("phase") != "failed":
+                self._set_phase("stopped", progress=True)
 
     async def _outer_step(self, step_no: int, incumbent: MinerVersion, cfg: dict):
+        self._set_phase(
+            "outer_proposal",
+            progress=True,
+            current_operation="llm_or_fallback",
+            current_task=None,
+        )
         provider = await self._provider("outer_provider")
         history = await self._version_history()
         cand_spec, note, source = await propose_spec(incumbent.harness_spec, history, provider)
@@ -497,14 +701,34 @@ class Engine:
         await self.log(f"外层步 {step_no}: 候选 v{cand.version_no} {note} ({source})")
 
         budget = int(cfg["inner_budget_per_outer_step"])
+        self._set_phase(
+            "candidate_mining",
+            progress=True,
+            current_operation="session",
+            current_budget_index=0,
+            current_budget_total=budget,
+        )
         cand_score = await self._mining_session(cand, step_no, budget, cfg)
 
         if incumbent.meta_score is None or step_no % int(cfg["incumbent_remeasure_every"]) == 0:
+            self._set_phase(
+                "incumbent_remeasure",
+                progress=True,
+                current_operation="session",
+                current_budget_index=0,
+                current_budget_total=budget,
+            )
             inc_score = await self._mining_session(incumbent, step_no, budget, cfg)
             incumbent = await self._update_score(incumbent.id, inc_score)
         inc_score = incumbent.meta_score or 0.0
 
         accepted = cand_score > inc_score + float(cfg["outer_accept_epsilon"])
+        self._set_phase(
+            "outer_decision",
+            progress=True,
+            current_operation="persist_verdict",
+            current_task=None,
+        )
         async with SessionLocal() as s:
             s.add(OuterStep(
                 experiment_id=self.exp_id,
@@ -538,8 +762,20 @@ class Engine:
             if not self.running:
                 break
             task = tasks[i % len(tasks)]
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                progress=True,
+                current_task=task["name"],
+                current_operation="context_lookup",
+                current_budget_index=i + 1,
+                current_budget_total=budget,
+            )
             top_nodes = await self._top_nodes(miner.id, task["name"])
             op = "improve" if (top_nodes and random.random() < float(spec.get("improve_bias", 0.6))) else "draft"
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation=f"proposal:{op}",
+            )
             expr, hypo, source = await propose(
                 spec, op, task, top_nodes, provider,
                 fields=get_dsl_fields(self.task_config.get("market")),
@@ -552,6 +788,10 @@ class Engine:
                 op=op, expression=expr, hypothesis=hypo, source=source, task_name=task["name"],
             )
             try:
+                self._set_phase(
+                    self.status.get("phase") or "candidate_mining",
+                    current_operation="factor_evaluation",
+                )
                 metrics = await asyncio.to_thread(
                     evaluate, expr, task["universe_n"], task["horizon"],
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
@@ -573,6 +813,10 @@ class Engine:
                 node.status = "error"
                 node.error = str(e)[:500]
             async with SessionLocal() as s:
+                self._set_phase(
+                    self.status.get("phase") or "candidate_mining",
+                    current_operation="persist_trial",
+                )
                 s.add(node)
                 s.add(Trial(
                     experiment_id=self.exp_id,
@@ -586,6 +830,9 @@ class Engine:
                 await s.commit()
                 await s.refresh(node)
             self.status["inner_evals"] = self.status.get("inner_evals", 0) + 1
+            self._touch_progress(
+                current_operation="register_factor" if node.status == "ok" else "candidate_failed",
+            )
             if node.status == "ok":
                 await self._maybe_register_factor(node, spec)
                 await self.log(
@@ -744,19 +991,38 @@ class EngineManager:
     def status_for(self, experiment_id: int, include_logs: bool = True) -> dict:
         worker = self.workers.get(experiment_id)
         if worker:
-            result = worker.status | {
-                "mode": worker._mode,
-                "task_config": worker.task_config,
-            }
-            if include_logs:
-                result["logs"] = list(worker.logbuf)
-            return result
+            return worker.diagnostics(include_logs=include_logs)
+        now = utc_now()
         result = {
             "state": "stopped",
+            "phase": "not_started",
+            "phase_started_at": None,
             "outer_step": 0,
             "inner_evals": 0,
             "experiment_id": experiment_id,
             "mode": None,
+            "running": False,
+            "task_created": False,
+            "task_done": False,
+            "task_cancelled": False,
+            "task_exception": None,
+            "heartbeat_age_seconds": None,
+            "heartbeat_stale": False,
+            "uptime_seconds": 0.0,
+            "started_at": None,
+            "stopped_at": None,
+            "last_heartbeat_at": None,
+            "last_progress_at": None,
+            "last_log_at": None,
+            "last_error": None,
+            "current_task": None,
+            "current_operation": None,
+            "current_seed": None,
+            "current_budget_index": None,
+            "current_budget_total": None,
+            "log_counts": {},
+            "task_config": {},
+            "observed_at": now,
         }
         if include_logs:
             result["logs"] = []

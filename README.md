@@ -23,6 +23,7 @@ createdb factor_factory      # 首次
 | 因子库 | V4 四层审计、费后实盘排序及 Vault 校准诊断、F1–F5 生命周期、结构相似度分组、Web LaTeX |
 | 选股器 | 单次 Polars 懒执行的多因子或直接 DSL 截面选股；历史窗裁剪、结果缓存与逐股因子归因 |
 | 回测 | `t` 收盘信号 → `t+1` 原始开盘成交的步进事件引擎、逐日状态、事件流、交割单与完整性门 |
+| 诊断 | 请求 P50/P95/P99、5xx 与请求 ID、进程/事件循环、PostgreSQL 连接池、面板文件身份、缓存、worker 阶段/心跳及脱敏事件 |
 | 设置 | A股/美股研究任务、纯多头/多空、冻结信号方向、成本/容量/OOS 门槛及模型接入 |
 
 ## 架构
@@ -40,6 +41,9 @@ createdb factor_factory      # 首次
   仅用于检验冻结排序与后续费后结果的 Spearman、Top 组盈利率和分组单调性。
 - **交互性能**: 页面使用 KeepAlive、GET 去重/短缓存和非重载任务切换；列表 API 只返回指标摘要，
   worker 状态不再重复携带日志，元信息接口也不触发冷面板全量加载。
+- **可观测性**: `/api/health/live` 提供轻量存活检查，`/api/health/ready` 验证数据库与任务面板，
+  `/api/observability` 返回脱敏工程快照，`/api/metrics` 暴露低基数 Prometheus 指标。诊断只保留有界
+  内存窗口，不采集请求体、DSL 输入或 LLM 密钥。
 - **事件回测**: A股使用万2免5及历史印花税/过户费，美股使用 IBKR Pro Fixed；
   CSV/Parquet 交割单、事件账本、逐日账本与 SHA-256 manifest 来自同一个状态引擎。
 - **因子资产索引**: 规范化 AST、SimHash LSH 与加权 Jaccard 先快速召回再精排，
