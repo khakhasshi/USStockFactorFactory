@@ -542,6 +542,7 @@ const App = {
     <Dashboard v-if="tab==='dash'" />
     <ResearchTree v-else-if="tab==='tree'" />
     <FactorLibrary v-else-if="tab==='factors'" />
+	    <ScreenerView v-else-if="tab==='screener'" />
     <BacktestView v-else-if="tab==='backtest'" />
     <ExperimentsView v-else-if="tab==='exps'" />
     <SettingsView v-else />
@@ -550,7 +551,7 @@ const App = {
     const tab = ref("dash");
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
-      { id: "factors", label: "因子库" }, { id: "backtest", label: "回测" },
+      { id: "factors", label: "因子库" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
       { id: "exps", label: "实验" }, { id: "settings", label: "设置" },
     ];
     const engState = ref("…");
@@ -577,3 +578,50 @@ const App = {
 };
 
 createApp(App).mount("#app");
+
+// ========== 选股器组件 ==========
+const ScreenerView = {
+  template: '<div class="screener"><div class="panel" style="margin-bottom:12px"><h3>多因子选股器</h3><div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap"><div><label>日期</label><input type="date" v-model="date" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px 8px"/></div><div><label>股票池</label><select v-model.number="univN" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px 8px"><option :value="100">Top 100</option><option :value="300">Top 300</option><option :value="500">Top 500</option><option :value="1000">Top 1000</option></select></div><div><label>显示</label><select v-model.number="topN" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px 8px"><option :value="20">Top 20</option><option :value="50">Top 50</option><option :value="100">Top 100</option></select></div><button @click="run" :disabled="loading" class="btn btn-primary">{{ loading ? "计算中..." : "执行选股" }}</button></div></div><div class="panel" style="margin-bottom:12px"><h4>因子选择 (勾选启用, 可调权重)</h4><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><div v-for="(f,i) in factors" :key="i" style="display:flex;align-items:center;gap:4px;background:var(--bg);padding:3px 8px;border-radius:4px;border:1px solid var(--border);font-size:12px"><input type="checkbox" v-model="f.enabled" :title="f.expression"/><span style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="f.expression">{{ f.name }}</span><input v-if="f.enabled" v-model.number="f.weight" type="number" step="0.5" min="0.5" max="5" style="width:36px;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:1px 3px;font-size:11px"/></div></div><div style="margin-top:6px;font-size:11px;color:var(--muted)">已选 {{ enabledCount }} 个因子 | 权重越大越重要</div></div><div v-if="result" class="panel"><h4>选股结果 ({{ result.date }})</h4><table style="width:100%;margin-top:8px"><thead><tr><th>排名</th><th>代码</th><th>名称</th><th>得分</th></tr></thead><tbody><tr v-for="s in result.stocks" :key="s.rank" :style="{background:s.rank<=10?\'rgba(63,185,80,0.08)\':\'transparent\'}"><td>{{ s.rank }}</td><td><code>{{ s.ts_code }}</code></td><td>{{ s.name }}</td><td>{{ s.score.toFixed(1) }}</td></tr></tbody></table></div><div v-if="error" class="panel" style="color:var(--red)">{{ error }}</div></div>',
+  setup() {
+    const date = ref(new Date().toISOString().slice(0,10));
+    const univN = ref(500); const topN = ref(50);
+    const factors = ref([]);
+    const result = ref(null); const error = ref(""); const loading = ref(false);
+    const enabledCount = Vue.computed(() => factors.value.filter(f=>f.enabled).length);
+
+    async function loadFactors() {
+      try {
+        const d = await api("/factors");
+        const fs = (d.factors||[]).filter(f=>f.expression);
+        const seen=new Set(); const uniq=[];
+        for (const f of fs.sort((a,b)=>(b.public_metrics?.score||0)-(a.public_metrics?.score||0))) {
+          if (!seen.has(f.expression)) { seen.add(f.expression); uniq.push(f); }
+          if (uniq.length>=50) break;
+        }
+        factors.value = uniq.map((f,i)=>({
+          expression: f.expression,
+          name: f.name || f.expression.slice(0,30),
+          enabled: i<10,
+          weight: 1.0,
+        }));
+      } catch(e) { error.value="加载因子失败: "+e.message; }
+    }
+
+    async function run() {
+      const enabled = factors.value.filter(f=>f.enabled);
+      if (!enabled.length) { error.value="请至少选择一个因子"; return; }
+      loading.value=true; error.value=""; result.value=null;
+      try {
+        const r = await api("/screener", { method:"POST", body:JSON.stringify({
+          factors: enabled.map(f=>({expression:f.expression,weight:f.weight})),
+          date: date.value, universe_n: univN.value, top_n: topN.value, direction:"top"
+        })});
+        result.value = r;
+      } catch(e) { error.value = "选股失败: "+e.message; }
+      finally { loading.value=false; }
+    }
+
+    onMounted(loadFactors);
+    return { date, univN, topN, factors, result, error, loading, enabledCount, run };
+  },
+};

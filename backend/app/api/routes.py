@@ -8,7 +8,7 @@ from ..backtest.engine import run_backtest
 from ..config import DEFAULT_ENGINE_CONFIG
 from ..data.panel import PanelStore
 from ..db import SessionLocal, get_active_experiment_id
-from ..dsl.engine import OPERATORS_DOC, validate
+from ..dsl.engine import OPERATORS_DOC, parse, validate
 from ..eval.harness import era_detail, evaluate
 from ..models import Backtest, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
 from ..orchestrator import Engine
@@ -379,6 +379,84 @@ async def activate_experiment(eid: int):
             s.add(Setting(key="active_experiment", value={"id": eid}))
         await s.commit()
     return {"ok": True}
+
+
+# ---------- 选股器 ----------
+
+class ScreenerReq(BaseModel):
+    factors: list[dict]  # [{"expression": "...", "weight": 1.0}, ...]
+    date: str | None = None  # YYYY-MM-DD, None=最新交易日
+    universe_n: int = 500
+    top_n: int = 50
+    direction: str = "top"  # "top" | "bottom" | "both"
+
+
+@router.post("/screener")
+async def screener(req: ScreenerReq):
+    """多因子选股: 按加权综合排名返回股票列表。"""
+    import polars as pl
+    df = PanelStore.get().ensure_loaded()
+    import datetime as _dt
+    target_date = _dt.date.fromisoformat(req.date) if req.date else df["trade_date"].max()
+
+    # 计算每个因子的截面排名
+    rank_cols = []
+    for i, f in enumerate(req.factors):
+        expr_str = f["expression"]
+        pipe = parse(expr_str)
+        work = pipe.apply(df.lazy()).select(
+            pl.col("trade_date"), pl.col("ts_code"), pl.col("name"), pl.col("factor").alias(f"f{i}")
+        )
+        # 截面 rank (1=最好)
+        ranked = (
+            work.filter(pl.col("trade_date") == target_date)
+            .filter(pl.col(f"f{i}").is_finite())
+            .with_columns(pl.col(f"f{i}").rank(descending=True).alias(f"r{i}"))
+            .select("ts_code", "name", f"r{i}")
+        )
+        rank_cols.append(ranked.collect())
+
+    if not rank_cols:
+        raise HTTPException(400, "至少需要一个因子")
+
+    # 合并 & 加权
+    merged = rank_cols[0]
+    for rc in rank_cols[1:]:
+        merged = merged.join(rc, on="ts_code", how="inner")
+
+    # 加权综合分
+    n_factors = len(req.factors)
+    score_expr = pl.lit(0.0)
+    for i, f in enumerate(req.factors):
+        w = float(f.get("weight", 1.0)) / n_factors
+        score_expr = score_expr + pl.col(f"r{i}") * w
+
+    result = merged.with_columns(score_expr.alias("score"))
+
+    # 排序
+    if req.direction == "bottom":
+        result = result.sort("score")
+    elif req.direction == "both":
+        result = result.with_columns(
+            pl.when(pl.col("score") > pl.col("score").median())
+            .then(pl.col("score"))
+            .otherwise(-pl.col("score"))
+            .alias("score")
+        )
+        result = result.sort("score", descending=True)
+    else:
+        result = result.sort("score", descending=True)
+
+    result = result.head(req.top_n)
+
+    return {
+        "date": str(target_date),
+        "stocks": [
+            {"rank": j + 1, "ts_code": r["ts_code"], "name": r.get("name", ""),
+             "score": round(float(r["score"]), 2)}
+            for j, r in enumerate(result.iter_rows(named=True))
+        ],
+    }
 
 
 # ---------- 元信息 ----------

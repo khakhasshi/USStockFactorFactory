@@ -46,7 +46,7 @@ class PanelStore:
     def _load(self) -> pl.DataFrame:
         lf = pl.scan_parquet(PANEL_GLOB, hive_partitioning=True)
         base_cols = [
-            "trade_date", "ts_code", "open", "high", "low", "close",
+            "trade_date", "ts_code", "name", "open", "high", "low", "close",
             "vol", "amount", "raw_open",
         ]
         # 额外字段: A股估值/市值/流动性/资金流向 (按存在性自适应)
