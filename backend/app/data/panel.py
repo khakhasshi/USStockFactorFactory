@@ -12,7 +12,12 @@ from datetime import date, datetime, timezone
 
 import polars as pl
 
-from ..config import PANEL_GLOB, get_dsl_fields, get_layer_bounds
+from ..config import (
+    PANEL_GLOB,
+    default_panel_glob,
+    get_dsl_fields,
+    get_layer_bounds,
+)
 
 HORIZONS = [1, 5, 10, 20]
 REQUIRED_PANEL_COLUMNS = {
@@ -41,8 +46,19 @@ class PanelStore:
         self.df: pl.DataFrame | None = None
         self.trading_dates: list[date] = []
         self.load_error: str = ""
-        self.panel_glob = panel_glob or os.environ.get("FF_PANEL_GLOB")
         self.market = market or os.environ.get("FF_MARKET", "us")
+        # An explicitly requested market must never inherit the process-wide
+        # panel.  The single-port service normally boots with FF_MARKET=us,
+        # while A-share backtests are selected per task at request time.
+        self.panel_glob = (
+            panel_glob
+            or (
+                default_panel_glob(self.market)
+                if market is not None
+                else os.environ.get("FF_PANEL_GLOB")
+                or default_panel_glob(self.market)
+            )
+        )
         self.layer_bounds = get_layer_bounds(self.market)
         self._load_lock = threading.Lock()
         self._diagnostic_lock = threading.Lock()
@@ -59,11 +75,19 @@ class PanelStore:
     @classmethod
     def get(cls, panel_glob: str | None = None, market: str | None = None) -> "PanelStore":
         resolved_market = market or os.environ.get("FF_MARKET", "us")
-        resolved_glob = panel_glob or os.environ.get("FF_PANEL_GLOB", "__default__")
+        resolved_glob = (
+            panel_glob
+            or (
+                default_panel_glob(resolved_market)
+                if market is not None
+                else os.environ.get("FF_PANEL_GLOB")
+                or default_panel_glob(resolved_market)
+            )
+        )
         key = f"{resolved_market}::{resolved_glob}"
         with cls._registry_lock:
             if key not in cls._instances:
-                cls._instances[key] = cls(panel_glob, resolved_market)
+                cls._instances[key] = cls(resolved_glob, resolved_market)
             return cls._instances[key]
 
     def ensure_loaded(self) -> pl.DataFrame:
@@ -114,7 +138,7 @@ class PanelStore:
             return self.df
 
     def _load(self) -> pl.DataFrame:
-        panel_glob = self.panel_glob or PANEL_GLOB
+        panel_glob = self.panel_glob or default_panel_glob(self.market)
         lf = pl.scan_parquet(panel_glob, hive_partitioning=True)
         base_cols = [
             "trade_date", "ts_code", "name", "open", "high", "low", "close",

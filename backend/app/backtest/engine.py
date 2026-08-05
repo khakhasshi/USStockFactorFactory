@@ -33,6 +33,14 @@ from .fees import (
 )
 
 BACKTEST_PROTOCOL = "step_event_v1"
+_EVENT_PHASE_ORDER = {
+    "SESSION_OPEN": 0,
+    "OPEN_CORPORATE_ACTION": 1,
+    "OPEN_EXECUTION": 2,
+    "CLOSE_FINANCING": 3,
+    "CLOSE_SIGNAL": 4,
+    "SESSION_CLOSE": 5,
+}
 
 
 def _finite(value: Any) -> bool:
@@ -106,11 +114,17 @@ class EventBacktestConfig:
 class StepEventBacktester:
     """Stateful engine whose ``step`` method advances exactly one session."""
 
-    def __init__(self, config: EventBacktestConfig) -> None:
+    def __init__(
+        self,
+        config: EventBacktestConfig,
+        *,
+        capture_detail: bool = True,
+    ) -> None:
         config.validate()
         # Validate the selected fee profile before the first event is emitted.
         fee_schedule_snapshot(config.market, config.resolved_fee_profile)
         self.config = config
+        self.capture_detail = bool(capture_detail)
         self.cash = float(config.initial_capital)
         self.positions: dict[str, float] = {}
         self.names: dict[str, str] = {}
@@ -127,11 +141,31 @@ class StepEventBacktester:
         self._cumulative_fees = 0.0
         self._cumulative_slippage = 0.0
         self._cumulative_borrow = 0.0
+        self._cumulative_traded_notional = 0.0
         self._rejected_orders = 0
         self._partial_orders = 0
         self._executed_orders = 0
         self._requested_execution_quantity = 0.0
         self._filled_execution_quantity = 0.0
+        self._online_integrity = {
+            "cash_reconciliation_max_error": 0.0,
+            "fee_formula_max_error": 0.0,
+            "fee_component_sum_max_error": 0.0,
+            "gross_amount_max_error": 0.0,
+            "slippage_formula_max_error": 0.0,
+            "position_formula_max_error": 0.0,
+            "same_day_signal_fill_violations": 0,
+            "scheduled_execution_date_violations": 0,
+            "duplicate_fill_id_violations": 0,
+            "nonpositive_fill_violations": 0,
+            "side_sign_violations": 0,
+            "fee_profile_violations": 0,
+            "ashare_buy_lot_violations": 0,
+            "event_phase_order_violations": 0,
+        }
+        self._seen_fill_ids: set[str] = set()
+        self._last_event_date = ""
+        self._last_event_phase = -1
 
     def _emit(
         self,
@@ -145,16 +179,106 @@ class StepEventBacktester:
         payload: dict | None = None,
     ) -> None:
         self._event_seq += 1
-        self.events.append({
-            "seq": self._event_seq,
-            "trade_date": str(trade_date),
-            "phase": phase,
-            "event_type": event_type,
-            "symbol": symbol,
-            "order_id": order_id,
-            "message": message,
-            "payload_json": json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
-        })
+        date_key = str(trade_date)
+        phase_order = _EVENT_PHASE_ORDER.get(phase, 99)
+        if date_key == self._last_event_date and phase_order < self._last_event_phase:
+            self._online_integrity["event_phase_order_violations"] += 1
+        if date_key != self._last_event_date:
+            self._last_event_date = date_key
+            self._last_event_phase = -1
+        self._last_event_phase = phase_order
+        if self.capture_detail:
+            self.events.append({
+                "seq": self._event_seq,
+                "trade_date": date_key,
+                "phase": phase,
+                "event_type": event_type,
+                "symbol": symbol,
+                "order_id": order_id,
+                "message": message,
+                "payload_json": json.dumps(
+                    payload or {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            })
+
+    def _audit_trade_online(self, trade: dict) -> None:
+        """Reconcile one transient fill even when its statement is not retained."""
+        signed = (
+            trade["filled_quantity"]
+            if trade["side"] == "BUY"
+            else -trade["filled_quantity"]
+        )
+        values = {
+            "cash_reconciliation_max_error": abs(
+                trade["cash_before"]
+                - signed * trade["fill_price"]
+                - trade["total_fees"]
+                - trade["cash_after"]
+            ),
+            "gross_amount_max_error": abs(
+                trade["filled_quantity"] * trade["fill_price"]
+                - trade["gross_amount"]
+            ),
+            "slippage_formula_max_error": abs(
+                trade["filled_quantity"]
+                * abs(trade["fill_price"] - trade["reference_price"])
+                - trade["slippage_cost"]
+            ),
+            "position_formula_max_error": abs(
+                trade["position_before"] + signed - trade["position_after"]
+            ),
+            "fee_component_sum_max_error": abs(
+                trade["commission"]
+                + trade["stamp_duty"]
+                + trade["transfer_fee"]
+                + trade["regulatory_fee"]
+                + trade["exchange_fee"]
+                - trade["total_fees"]
+            ),
+        }
+        recalculated = calculate_trade_fees(
+            market=trade["market"],
+            side=trade["side"],
+            quantity=trade["filled_quantity"],
+            price=trade["fill_price"],
+            trade_date=date.fromisoformat(trade["trade_date"]),
+            profile=trade["fee_profile"],
+        )
+        values["fee_formula_max_error"] = abs(
+            recalculated.total - trade["total_fees"]
+        )
+        for key, value in values.items():
+            self._online_integrity[key] = max(
+                float(self._online_integrity[key]),
+                float(value),
+            )
+        if trade["signal_date"] >= trade["trade_date"]:
+            self._online_integrity["same_day_signal_fill_violations"] += 1
+        if trade.get("scheduled_execute_date") != trade["trade_date"]:
+            self._online_integrity["scheduled_execution_date_violations"] += 1
+        if trade["fill_id"] in self._seen_fill_ids:
+            self._online_integrity["duplicate_fill_id_violations"] += 1
+        self._seen_fill_ids.add(trade["fill_id"])
+        if trade["filled_quantity"] <= 0 or trade["fill_price"] <= 0:
+            self._online_integrity["nonpositive_fill_violations"] += 1
+        if (
+            trade["side"] == "BUY"
+            and trade["position_after"] < trade["position_before"] - 1e-8
+        ) or (
+            trade["side"] == "SELL"
+            and trade["position_after"] > trade["position_before"] + 1e-8
+        ):
+            self._online_integrity["side_sign_violations"] += 1
+        if trade["fee_profile"] != self.config.resolved_fee_profile:
+            self._online_integrity["fee_profile_violations"] += 1
+        if (
+            self.config.market == "ashare"
+            and trade["side"] == "BUY"
+            and abs(trade["filled_quantity"] % self.config.lot_size) > 1e-8
+        ):
+            self._online_integrity["ashare_buy_lot_violations"] += 1
 
     def _price(self, symbol: str, market: dict[str, dict], field: str) -> float:
         row = market.get(symbol)
@@ -344,6 +468,7 @@ class StepEventBacktester:
         slippage_cost = filled_abs * abs(fill_price - reference_price)
         self._cumulative_fees += fees.total
         self._cumulative_slippage += slippage_cost
+        self._cumulative_traded_notional += filled_abs * fill_price
         self._fill_seq += 1
         nlv_after, _, _ = self._nlv(market, "raw_open")
         unfilled = max(0.0, requested_abs - filled_abs)
@@ -382,7 +507,9 @@ class StepEventBacktester:
             "fee_profile": fees.profile,
             "fee_notes": fees.notes,
         }
-        self.trades.append(trade)
+        self._audit_trade_online(trade)
+        if self.capture_detail:
+            self.trades.append(trade)
         self._emit(
             trade_date,
             "OPEN_EXECUTION",
@@ -510,11 +637,15 @@ class StepEventBacktester:
         rows: list[dict],
         next_trade_date: date | None,
         rebalance: bool,
+        market_by_symbol: dict[str, dict] | None = None,
     ) -> dict:
         """Advance one session and return that session's reconciled state."""
-        market = {str(row["ts_code"]): row for row in rows}
-        event_start = len(self.events)
-        trade_start = len(self.trades)
+        market = market_by_symbol or {
+            str(row["ts_code"]): row for row in rows
+        }
+        event_start = self._event_seq
+        fill_start = self._fill_seq
+        notional_start = self._cumulative_traded_notional
         self._emit(trade_date, "SESSION_OPEN", "SESSION_OPEN", message="进入交易日")
         self._apply_corporate_actions(trade_date, market)
         open_nlv_before, _, _ = self._nlv(market, "raw_open")
@@ -540,9 +671,7 @@ class StepEventBacktester:
                     },
                 )
         close_nlv = close_nlv_before_financing - borrow_fee
-        traded_notional = sum(
-            trade["gross_amount"] for trade in self.trades[trade_start:]
-        )
+        traded_notional = self._cumulative_traded_notional - notional_start
         daily_return = close_nlv / self._previous_close_nlv - 1.0 \
             if self._previous_close_nlv > 0 else 0.0
         created_orders = 0
@@ -589,9 +718,9 @@ class StepEventBacktester:
                 if self._previous_close_nlv > 0 else 0.0,
                 6,
             ),
-            "fills": len(self.trades) - trade_start,
+            "fills": self._fill_seq - fill_start,
             # SESSION_CLOSE is emitted immediately after this snapshot.
-            "events": len(self.events) - event_start + 1,
+            "events": self._event_seq - event_start + 1,
             "orders_created": created_orders,
             "positions": len(self.positions),
             "borrow_fee": _round(borrow_fee, 6),
@@ -689,19 +818,11 @@ class StepEventBacktester:
                 and abs(trade["filled_quantity"] % self.config.lot_size) > 1e-8
             ):
                 ashare_buy_lot_violations += 1
-        phase_order = {
-            "SESSION_OPEN": 0,
-            "OPEN_CORPORATE_ACTION": 1,
-            "OPEN_EXECUTION": 2,
-            "CLOSE_FINANCING": 3,
-            "CLOSE_SIGNAL": 4,
-            "SESSION_CLOSE": 5,
-        }
         order_violations = 0
         by_date: dict[str, list[int]] = {}
         for event in self.events:
             by_date.setdefault(event["trade_date"], []).append(
-                phase_order.get(event["phase"], 99)
+                _EVENT_PHASE_ORDER.get(event["phase"], 99)
             )
         for phases in by_date.values():
             order_violations += sum(
@@ -760,6 +881,46 @@ class StepEventBacktester:
         )
         return checks
 
+    def _online_integrity_checks(self) -> dict:
+        long_only_short_positions = (
+            sum(quantity < -1e-8 for quantity in self.positions.values())
+            if self.config.mode == "long_only"
+            else 0
+        )
+        checks = {
+            "statement_rows": self._fill_seq,
+            "materialized_statement_rows": 0,
+            "audit_mode": "online_fill_reconciliation",
+            **{
+                key: (
+                    _round(value, 8)
+                    if key.endswith("_max_error")
+                    else int(value)
+                )
+                for key, value in self._online_integrity.items()
+            },
+            "long_only_negative_position_violations": long_only_short_positions,
+            "ledger_source_of_truth": True,
+        }
+        checks["all_pass"] = (
+            checks["cash_reconciliation_max_error"] <= 1e-5
+            and checks["fee_formula_max_error"] <= 1e-8
+            and checks["fee_component_sum_max_error"] <= 1e-8
+            and checks["gross_amount_max_error"] <= 1e-5
+            and checks["slippage_formula_max_error"] <= 1e-5
+            and checks["position_formula_max_error"] <= 1e-5
+            and checks["same_day_signal_fill_violations"] == 0
+            and checks["scheduled_execution_date_violations"] == 0
+            and checks["duplicate_fill_id_violations"] == 0
+            and checks["nonpositive_fill_violations"] == 0
+            and checks["side_sign_violations"] == 0
+            and checks["fee_profile_violations"] == 0
+            and checks["ashare_buy_lot_violations"] == 0
+            and checks["event_phase_order_violations"] == 0
+            and long_only_short_positions == 0
+        )
+        return checks
+
     def result(self) -> dict:
         if not self.daily:
             raise ValueError("回测没有产生交易日")
@@ -778,8 +939,8 @@ class StepEventBacktester:
         for value in net_nav:
             peak = max(peak, value)
             max_drawdown = max(max_drawdown, 1.0 - value / peak if peak else 0.0)
-        fee_total = sum(float(row["total_fees"]) for row in self.trades)
-        slippage_total = sum(float(row["slippage_cost"]) for row in self.trades)
+        fee_total = self._cumulative_fees
+        slippage_total = self._cumulative_slippage
         stats = {
             "protocol": BACKTEST_PROTOCOL,
             "days": n,
@@ -793,7 +954,7 @@ class StepEventBacktester:
             "avg_daily_turnover": _round(
                 sum(float(row["turnover"]) for row in self.daily) / n, 6
             ),
-            "fills": len(self.trades),
+            "fills": self._fill_seq,
             "orders": self._order_seq,
             "orders_executed": self._executed_orders,
             "rejected_orders": self._rejected_orders,
@@ -848,7 +1009,14 @@ class StepEventBacktester:
                 }
                 for symbol, quantity in sorted(self.positions.items())
             ],
-            "integrity": self._integrity_checks(),
+            "integrity": (
+                self._integrity_checks()
+                if self.capture_detail
+                else self._online_integrity_checks()
+            ),
+            "detail_capture": (
+                "full_statement" if self.capture_detail else "summary_online_audit"
+            ),
         }
 
 
@@ -860,6 +1028,7 @@ def _prepare_backtest_frame(
     end: str,
     panel_glob: str | None,
     market: str,
+    forward_horizon: int | None = None,
 ) -> tuple[pl.DataFrame, PanelStore]:
     store = PanelStore.get(panel_glob, market)
     df = store.ensure_loaded()
@@ -888,30 +1057,51 @@ def _prepare_backtest_frame(
         .collect()["ts_code"]
         .to_list()
     )
-    frame = (
+    select_columns = [
+        "trade_date",
+        "ts_code",
+        "name",
+        "factor",
+        "univ_rank",
+        "raw_open",
+        "raw_close",
+        "vol",
+        "amount",
+        "adjustment_factor",
+        "can_buy_open_proxy",
+        "can_sell_open_proxy",
+    ]
+    if forward_horizon is not None:
+        forward_column = f"fwd_{int(forward_horizon)}"
+        if forward_column not in df.columns:
+            raise ValueError(f"不支持的 forward_horizon: {forward_horizon}")
+        select_columns.append(forward_column)
+    # Factor semantics must match the evaluator: calculate every DSL stage on
+    # the complete market cross-section first, then select securities needed
+    # by the requested liquidity universe and position ledger.  Filtering to
+    # the future union of Top-N names before rank/zscore/winsor would leak
+    # future universe membership into earlier cross-sections and change nested
+    # time-series expressions.
+    full_cross_section = (
         pipe.apply(
             df.lazy().filter(
                 pl.col("trade_date").is_between(history_start, end_date)
-                & pl.col("ts_code").is_in(symbols)
             )
         )
+        .select(select_columns)
+        .cache()
+    )
+    frame = (
+        full_cross_section
         .filter(pl.col("trade_date").is_between(start_date, end_date))
-        .select(
-            "trade_date",
-            "ts_code",
-            "name",
-            "factor",
-            "univ_rank",
-            "raw_open",
-            "raw_close",
-            "vol",
-            "amount",
-            "adjustment_factor",
-            "can_buy_open_proxy",
-            "can_sell_open_proxy",
-        )
+        .filter(pl.col("ts_code").is_in(symbols))
         .sort("trade_date", "ts_code")
-        .collect()
+        # Keep the post-factor symbol/date filters behind the cache barrier.
+        # This is intentionally explicit rather than relying on the optimizer
+        # to infer that predicate pushdown across window expressions is unsafe.
+        .collect(
+            optimizations=pl.QueryOptFlags(predicate_pushdown=False)
+        )
     )
     return frame, store
 
@@ -989,6 +1179,7 @@ def run_backtest(
     fee_profile: str | None = None,
     artifact_dir: str | Path | None = None,
     response_trade_limit: int = 200,
+    capture_detail: bool = True,
 ) -> dict:
     """Run the event engine.
 
@@ -996,6 +1187,8 @@ def run_backtest(
     as a synthetic return haircut.  When ``slippage_bps`` is omitted, it is
     treated as the legacy caller's requested market-impact assumption.
     """
+    if artifact_dir is not None and not capture_detail:
+        raise ValueError("写入交割单产物时 capture_detail 必须为 true")
     frame, _ = _prepare_backtest_frame(
         expression=expression,
         universe_n=universe_n,
@@ -1022,7 +1215,7 @@ def run_backtest(
         borrow_cost_bps_annual=borrow_cost_bps_annual,
         fee_profile=fee_profile,
     )
-    runner = StepEventBacktester(config)
+    runner = StepEventBacktester(config, capture_detail=capture_detail)
     sessions = frame.partition_by("trade_date", maintain_order=True)
     session_dates = [session["trade_date"][0] for session in sessions]
     for index, session in enumerate(sessions):

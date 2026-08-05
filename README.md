@@ -6,7 +6,8 @@ Evaluation Protocol V4.2 把连续学习分、硬准入分、实盘排序分与�
 每个新候选在训练安全层同时评价正反方向、按双向试验数惩罚后冻结方向，
 失败候选也保留可比较的严重程度，避免双层 LLM 面对一片 `0.000` 无法归因。
 设计蓝图见 [DESIGN.md](DESIGN.md)，事件回测的冻结口径见
-[docs/BACKTEST_PROTOCOL_V1.md](docs/BACKTEST_PROTOCOL_V1.md)。
+[docs/BACKTEST_PROTOCOL_V1.md](docs/BACKTEST_PROTOCOL_V1.md)，跨任务全因子榜单口径见
+[docs/FACTOR_LEADERBOARD_PROTOCOL_V1.md](docs/FACTOR_LEADERBOARD_PROTOCOL_V1.md)。
 
 ## 快速开始
 
@@ -22,6 +23,16 @@ createdb factor_factory      # 首次
 访问 http://localhost:10010。`service.sh` 使用当前 macOS 用户的 launchd 会话托管并防止双实例；
 `run.sh` 仍可用于前台开发。依赖文件未变化时不会重复安装，敏感环境变量可写入已忽略的 `.env`，
 无需出现在进程命令行。
+
+冻结任务 1–8 的历史节点与因子并用多进程回放 A 股榜单：
+
+```bash
+.venv/bin/python backend/scripts/factor_leaderboard.py \
+  --max-experiment-id 8 --max-node-id 2208 --max-factor-id 1522 \
+  --workers 2 --threads-per-worker 4
+```
+
+运行记录逐条落入 `var/reports`，中断后以相同 `--output-dir` 重跑即可续算。
 
 ## 页面
 

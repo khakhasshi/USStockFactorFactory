@@ -3,15 +3,19 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import polars as pl
 
 from backend.app.backtest.engine import (
     EventBacktestConfig,
     StepEventBacktester,
+    _prepare_backtest_frame,
     _write_artifacts,
 )
 from backend.app.backtest.fees import calculate_trade_fees
+from backend.app.config import ASHARE_PANEL_GLOB, US_PANEL_GLOB
+from backend.app.data.panel import PanelStore
 
 
 def _rows(day_index: int, market: str = "ashare") -> list[dict]:
@@ -323,6 +327,45 @@ class EventLedgerRegressionTests(unittest.TestCase):
         self.assertFalse(checks["all_pass"])
         self.assertGreater(checks["cash_reconciliation_max_error"], 0.9)
 
+    def test_summary_capture_matches_full_ledger_and_audits_every_fill(self):
+        config = EventBacktestConfig(
+            market="ashare",
+            mode="long_only",
+            universe_n=4,
+            top_fraction=0.25,
+            initial_capital=100_000,
+            rebalance_every=1,
+            slippage_bps=5,
+            max_volume_participation=1.0,
+        )
+        full = StepEventBacktester(config)
+        summary = StepEventBacktester(config, capture_detail=False)
+        dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+        for index, trade_date in enumerate(dates):
+            rows = _rows(index)
+            next_date = dates[index + 1] if index + 1 < len(dates) else None
+            for runner in (full, summary):
+                runner.step(
+                    trade_date=trade_date,
+                    rows=rows,
+                    next_trade_date=next_date,
+                    rebalance=True,
+                )
+        full_result = full.result()
+        summary_result = summary.result()
+        self.assertEqual(full_result["stats"], summary_result["stats"])
+        self.assertEqual(summary_result["trades"], [])
+        self.assertEqual(summary_result["events"], [])
+        self.assertEqual(
+            summary_result["integrity"]["statement_rows"],
+            full_result["stats"]["fills"],
+        )
+        self.assertEqual(
+            summary_result["integrity"]["audit_mode"],
+            "online_fill_reconciliation",
+        )
+        self.assertTrue(summary_result["integrity"]["all_pass"])
+
     def test_fill_rate_counts_rejected_day_orders(self):
         config = EventBacktestConfig(
             market="ashare",
@@ -400,6 +443,79 @@ class EventLedgerRegressionTests(unittest.TestCase):
         checks = runner.result()["integrity"]
         self.assertTrue(checks["all_pass"])
         self.assertLessEqual(checks["cash_reconciliation_max_error"], 1e-5)
+
+
+class PanelRoutingRegressionTests(unittest.TestCase):
+    def test_explicit_market_uses_its_own_default_panel(self):
+        self.assertEqual(
+            PanelStore(panel_glob=None, market="ashare").panel_glob,
+            ASHARE_PANEL_GLOB,
+        )
+        self.assertEqual(
+            PanelStore(panel_glob=None, market="us").panel_glob,
+            US_PANEL_GLOB,
+        )
+
+    def test_factor_is_computed_before_liquidity_union_filter(self):
+        dates = [date(2023, 1, 2) + timedelta(days=index) for index in range(65)]
+        rows = []
+        for trade_date in dates:
+            for code, close, univ_rank in (
+                ("A", 1.0, 1),
+                ("B", 2.0, 2),
+                # Never enters Top-2 but must remain in the cross-section used
+                # by zscore before A/B are selected for the event ledger.
+                ("OUT", 100.0, 3),
+            ):
+                rows.append({
+                    "trade_date": trade_date,
+                    "ts_code": code,
+                    "name": code,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "vol": 1_000_000.0,
+                    "amount": 10_000_000.0,
+                    "raw_open": close,
+                    "raw_close": close,
+                    "adjustment_factor": 1.0,
+                    "can_buy_open_proxy": True,
+                    "can_sell_open_proxy": True,
+                    "univ_rank": univ_rank,
+                })
+        panel = pl.DataFrame(rows)
+
+        class FakeStore:
+            trading_dates = dates
+
+            @staticmethod
+            def ensure_loaded():
+                return panel
+
+        with patch(
+            "backend.app.backtest.engine.PanelStore.get",
+            return_value=FakeStore(),
+        ):
+            frame, _ = _prepare_backtest_frame(
+                expression="zscore(close)",
+                universe_n=2,
+                start=str(dates[0]),
+                end=str(dates[-1]),
+                panel_glob="unused",
+                market="us",
+            )
+        first_a = frame.filter(
+            (pl.col("trade_date") == dates[0])
+            & (pl.col("ts_code") == "A")
+        )["factor"][0]
+        expected = (1.0 - (1.0 + 2.0 + 100.0) / 3.0) / pl.Series(
+            [1.0, 2.0, 100.0]
+        ).std()
+        union_only = (1.0 - 1.5) / pl.Series([1.0, 2.0]).std()
+        self.assertAlmostEqual(first_a, expected, places=10)
+        self.assertNotAlmostEqual(first_a, union_only, places=5)
+        self.assertEqual(set(frame["ts_code"].unique()), {"A", "B"})
 
 
 if __name__ == "__main__":
