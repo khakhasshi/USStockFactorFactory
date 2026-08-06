@@ -174,6 +174,10 @@ async def init_db() -> None:
             "ON trials (experiment_id, evaluation_protocol, task_name, id DESC)",
             "CREATE INDEX IF NOT EXISTS ix_llm_call_audits_experiment_id_desc "
             "ON llm_call_audits (experiment_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_screener_runs_experiment_id_desc "
+            "ON screener_runs (experiment_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_screener_runs_experiment_date_desc "
+            "ON screener_runs (experiment_id, target_date DESC, id DESC)",
         ):
             await conn.execute(text(statement))
         # Preserve contaminated historical expressions while preventing them

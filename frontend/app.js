@@ -1598,7 +1598,7 @@ const ScreenerView = {
       <div>
         <div class="eyebrow">SINGLE-PASS POLARS / CACHED CROSS-SECTION</div>
         <h1>高性能多因子选股器</h1>
-        <p>一次懒执行计划计算所有因子，自动裁剪所需历史窗口并缓存完全相同的截面快照。</p>
+        <p>任务 #{{ appState.experimentId || '—' }} · 每次运行保存不可变快照，可回看当时的因子、参数与完整候选清单。</p>
       </div>
       <span class="tag amber">研究用途 · 非交易批准</span>
     </div>
@@ -1640,7 +1640,7 @@ const ScreenerView = {
       </div>
       <div class="selector-actions">
         <button class="btn" @click="loadFactors" :disabled="loading">刷新因子</button>
-        <button class="btn primary" @click="run" :disabled="loading || !canRun">
+        <button class="btn primary" data-testid="screener-run-button" @click="run" :disabled="loading || !canRun">
           {{ loading ? "计算中..." : "执行选股" }}
         </button>
       </div>
@@ -1697,7 +1697,7 @@ const ScreenerView = {
         </div>
         <template v-if="result && !loading">
           <div class="result-summary">
-            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · {{ rankingTitle }}</h2><small v-if="result.date_adjusted" class="sub">请求日 {{ result.requested_date }} 非交易日或超出面板，已回退到最近交易日</small></div><span class="tag blue">已完成</span></div>
+            <div class="result-title"><div><div class="eyebrow">SCREENING SNAPSHOT</div><h2>{{ result.date }} · {{ rankingTitle }}</h2><small v-if="result.date_adjusted" class="sub">请求日 {{ result.requested_date }} 非交易日或超出面板，已回退到最近交易日</small><small v-else-if="result.recorded_at" class="sub">记录时间 {{ formatRecordTime(result.recorded_at) }}</small></div><span class="tag blue">{{ result.run_id ? '记录 #' + result.run_id : '已完成' }}</span></div>
           <div class="metric-strip selector-metrics">
               <div class="metric-card"><span>股票池</span><b>Top {{ result.universe_n || univN }}</b><small>按 60 日成交额</small></div>
               <div class="metric-card"><span>启用因子</span><b>{{ result.factor_count }}</b><small>加权截面排名</small></div>
@@ -1721,6 +1721,39 @@ const ScreenerView = {
         </template>
       </main>
     </div>
+
+    <div class="card screener-history-card" data-testid="screener-history">
+      <div class="panel-title-row">
+        <div>
+          <div class="eyebrow">TASK-SCOPED AUDIT TRAIL</div>
+          <h2>本任务选股记录</h2>
+          <span class="sub">仅显示任务 #{{ appState.experimentId || '—' }}；记录按生成时快照保存，不随当前因子库或设置变化。</span>
+        </div>
+        <div class="history-heading-actions">
+          <span class="count-badge">{{ historyTotal }} 次</span>
+          <button class="btn" data-testid="screener-history-refresh" @click="loadHistory" :disabled="historyLoading">刷新</button>
+        </div>
+      </div>
+      <div v-if="historyError" class="selector-error history-error">{{ historyError }}</div>
+      <div v-if="historyLoading && !historyRuns.length" class="history-empty">正在读取任务记录…</div>
+      <div v-else-if="!historyRuns.length" class="history-empty">这个任务还没有选股记录。执行一次选股后，完整快照会保存在这里。</div>
+      <div v-else class="history-table-wrap">
+        <table class="history-table">
+          <thead><tr><th>记录</th><th>截面</th><th>榜单 / 模式</th><th>冻结配置</th><th>候选预览</th><th>性能</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="runRow in historyRuns" :key="runRow.id" :class="{active:activeHistoryId===runRow.id}" @click="openHistory(runRow)">
+              <td><b>#{{ runRow.id }}</b><small>{{ formatRecordTime(runRow.created_at) }}</small></td>
+              <td><b>{{ runRow.target_date }}</b><small v-if="runRow.date_adjusted">请求 {{ runRow.requested_date }} · 已回退</small><small v-else>实际交易日</small></td>
+              <td><span class="tag" :class="runRow.direction==='bottom'?'red':(runRow.direction==='both'?'amber':'green')">{{ directionLabel(runRow.direction) }}</span><small>{{ runRow.expression_mode ? '直接 DSL' : runRow.factor_count + ' 因子组合' }} · {{ runRow.portfolio_mode }}</small></td>
+              <td><b>Top {{ runRow.universe_n }} → {{ runRow.result_count }}</b><small :title="factorPreviewTitle(runRow)">{{ factorPreviewLabel(runRow) }}</small></td>
+              <td><span class="stock-preview" v-if="runRow.stock_preview?.length"><code v-for="stock in runRow.stock_preview" :key="stock.side + ':' + stock.ts_code">{{ stock.ts_code }}</code></span><small v-else>没有候选</small></td>
+              <td><b>{{ formatLatency(runRow.elapsed_ms) }}</b><small>{{ runRow.cache_hit ? '缓存命中' : '实时计算' }} · 有效 {{ runRow.eligible_count }}</small></td>
+              <td><button class="text-btn" @click.stop="openHistory(runRow)" :disabled="openingRunId===runRow.id">{{ openingRunId===runRow.id ? '加载中' : '回看' }}</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </section>`,
   setup() {
     const date = ref(new Date().toISOString().slice(0,10));
@@ -1735,6 +1768,12 @@ const ScreenerView = {
     const outputDirection = ref("top");
     const result = ref(null); const error = ref(""); const loading = ref(false);
     const selectedStock = ref(null);
+    const historyRuns = ref([]);
+    const historyTotal = ref(0);
+    const historyLoading = ref(false);
+    const historyError = ref("");
+    const activeHistoryId = ref(null);
+    const openingRunId = ref(null);
     let loadedExperimentVersion = -1;
     const enabledCount = computed(() => factors.value.filter(f=>f.enabled).length);
     const canRun = computed(() => Boolean(directExpr.value.trim()) || enabledCount.value > 0);
@@ -1782,14 +1821,42 @@ const ScreenerView = {
       const sideRank = Number(stock.side === "bottom" ? stock.tail_rank : stock.head_rank);
       return `${Math.max(0, Math.min(100, (eligible - sideRank + 1) / eligible * 100))}%`;
     }
+    function formatRecordTime(value) {
+      if (!value) return "—";
+      return String(value).replace("T", " ").slice(0, 19);
+    }
+    function formatLatency(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "—";
+      return number >= 1000 ? `${(number / 1000).toFixed(2)} s` : `${number.toFixed(0)} ms`;
+    }
+    function directionLabel(value) {
+      return value === "bottom" ? "尾部" : value === "both" ? "头尾双榜" : "头部";
+    }
+    function factorPreviewLabel(runRow) {
+      const factorsPreview = runRow.factor_preview || [];
+      if (!factorsPreview.length) return "因子快照不可用";
+      const suffix = runRow.factor_count > factorsPreview.length ? ` 等 ${runRow.factor_count} 条` : "";
+      return `${factorsPreview[0].direction === -1 ? "反向 " : ""}${factorsPreview[0].expression}${suffix}`;
+    }
+    function factorPreviewTitle(runRow) {
+      return (runRow.factor_preview || [])
+        .map(row => `${row.direction === -1 ? "-1" : "+1"} × ${row.weight} · ${row.expression}`)
+        .join("\n");
+    }
 
     async function loadFactors() {
+      const requestedVersion = appState.experimentVersion;
       try {
         error.value = "";
+        const experimentId = Number(appState.experimentId);
+        const taskQuery = experimentId ? `&experiment_id=${encodeURIComponent(experimentId)}` : "";
+        const similarityQuery = experimentId ? `?experiment_id=${encodeURIComponent(experimentId)}` : "";
         const [d, similarity] = await Promise.all([
-          api("/factors?sort=grade", { cacheTtl: 1000 }),
-          api("/factors/similarity-groups", { cacheTtl: 1000 }),
+          api(`/factors?sort=grade${taskQuery}`, { cacheTtl: 1000 }),
+          api(`/factors/similarity-groups${similarityQuery}`, { cacheTtl: 1000 }),
         ]);
+        if (requestedVersion !== appState.experimentVersion) return;
         const groupByFactor = new Map();
         for (const group of similarity.groups || []) {
           for (const id of group.factor_ids || []) groupByFactor.set(Number(id), group);
@@ -1816,7 +1883,11 @@ const ScreenerView = {
           family: groupByFactor.get(Number(f.id))?.family,
         }));
         loadedExperimentVersion = appState.experimentVersion;
-      } catch(e) { error.value="加载因子失败: "+e.message; }
+      } catch(e) {
+        if (requestedVersion === appState.experimentVersion) {
+          error.value="加载因子失败: "+e.message;
+        }
+      }
     }
     function ensureFresh() {
       if (loadedExperimentVersion !== appState.experimentVersion) loadFactors();
@@ -1827,51 +1898,129 @@ const ScreenerView = {
 
     async function inspectDsl() {
       const expression = directExpr.value.trim();
+      const requestedVersion = appState.experimentVersion;
+      const experimentId = Number(appState.experimentId) || undefined;
       dslInfo.value = null;
       if (!expression) return;
       try {
-        dslInfo.value = await api("/dsl/inspect", {
+        const inspected = await api("/dsl/inspect", {
           method: "POST",
-          body: { expression },
+          body: { expression, experiment_id: experimentId },
         });
-        error.value = "";
+        if (requestedVersion === appState.experimentVersion) {
+          dslInfo.value = inspected;
+          error.value = "";
+        }
       } catch (e) {
-        error.value = `DSL 检查失败: ${e.message}`;
+        if (requestedVersion === appState.experimentVersion) {
+          error.value = `DSL 检查失败: ${e.message}`;
+        }
       }
     }
 
     async function run() {
       const enabled = factors.value.filter(f=>f.enabled);
       if (!enabled.length && !directExpr.value.trim()) { error.value="请至少选择一个因子或输入 DSL 表达式"; return; }
+      const requestedVersion = appState.experimentVersion;
+      const experimentId = Number(appState.experimentId) || undefined;
       loading.value=true; error.value=""; result.value=null; selectedStock.value=null;
       try {
         const r = await api("/screener", { method:"POST", body:{
+          experiment_id: experimentId,
           expression: directExpr.value.trim() || undefined,
           expression_direction: directDirection.value,
           factors: enabled.map(f=>({expression:f.expression,weight:f.weight,direction:f.direction})),
           date: date.value, universe_n: univN.value, top_n: topN.value, direction:outputDirection.value
         }});
+        if (requestedVersion !== appState.experimentVersion) return;
         result.value = r;
-      } catch(e) { error.value = "选股失败: "+e.message; }
-      finally { loading.value=false; }
+        activeHistoryId.value = r.run_id;
+        await loadHistory();
+      } catch(e) {
+        if (requestedVersion === appState.experimentVersion) {
+          error.value = "选股失败: "+e.message;
+        }
+      }
+      finally {
+        if (requestedVersion === appState.experimentVersion) loading.value=false;
+      }
+    }
+
+    async function loadHistory() {
+      const experimentId = Number(appState.experimentId);
+      const requestedVersion = appState.experimentVersion;
+      const query = experimentId ? `?experiment_id=${encodeURIComponent(experimentId)}&limit=50` : "?limit=50";
+      historyLoading.value = true;
+      historyError.value = "";
+      try {
+        const data = await api(`/screener/runs${query}`);
+        if (requestedVersion !== appState.experimentVersion) return;
+        historyRuns.value = data.runs || [];
+        historyTotal.value = Number(data.total || 0);
+      } catch (e) {
+        if (requestedVersion === appState.experimentVersion) {
+          historyError.value = `读取选股记录失败: ${e.message}`;
+        }
+      } finally {
+        if (requestedVersion === appState.experimentVersion) historyLoading.value = false;
+      }
+    }
+
+    async function openHistory(runRow) {
+      const experimentId = Number(appState.experimentId);
+      const requestedVersion = appState.experimentVersion;
+      openingRunId.value = runRow.id;
+      historyError.value = "";
+      try {
+        const suffix = experimentId ? `?experiment_id=${encodeURIComponent(experimentId)}` : "";
+        const data = await api(`/screener/runs/${runRow.id}${suffix}`);
+        if (requestedVersion !== appState.experimentVersion) return;
+        result.value = data.run.result;
+        activeHistoryId.value = runRow.id;
+        selectedStock.value = null;
+        error.value = "";
+        nextTick(() => document.querySelector(".result-summary")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+      } catch (e) {
+        if (requestedVersion === appState.experimentVersion) {
+          historyError.value = `读取记录 #${runRow.id} 失败: ${e.message}`;
+        }
+      } finally {
+        if (requestedVersion === appState.experimentVersion) openingRunId.value = null;
+      }
     }
 
     watch(directExpr, () => { dslInfo.value = null; });
     watch(() => appState.experimentVersion, () => {
       result.value=null;
       selectedStock.value=null;
+      loading.value=false;
+      historyRuns.value=[];
+      historyTotal.value=0;
+      historyLoading.value=false;
+      historyError.value="";
+      activeHistoryId.value=null;
+      openingRunId.value=null;
       directExpr.value="";
       factorSearch.value="";
       factorGroup.value="";
-      if (appState.activeTab === "screener") ensureFresh();
+      if (appState.activeTab === "screener") {
+        ensureFresh();
+        loadHistory();
+      }
     });
-    onActivated(ensureFresh);
+    onActivated(() => {
+      ensureFresh();
+      loadHistory();
+    });
     return {
+      appState,
       date, univN, topN, directExpr, directDirection, dslInfo, outputDirection,
       factors, groups, factorSearch, factorGroup, filteredFactors,
       result, selectedStock, error, loading, enabledCount, canRun,
+      historyRuns, historyTotal, historyLoading, historyError, activeHistoryId, openingRunId,
       totalWeight, topScore, tailScore, rankingTitle, formatScore, formatPrice, compactAmount,
-      rankWidth, selectAll, clearAll, inspectDsl, run, loadFactors,
+      rankWidth, formatRecordTime, formatLatency, directionLabel, factorPreviewLabel, factorPreviewTitle,
+      selectAll, clearAll, inspectDsl, run, loadFactors, loadHistory, openHistory,
     };
   },
 };

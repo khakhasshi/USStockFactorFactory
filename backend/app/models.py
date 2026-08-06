@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .config import EVALUATION_PROTOCOL_VERSION
@@ -167,6 +167,35 @@ class Backtest(Base):
     experiment_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
     result: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="done")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ScreenerRun(Base):
+    """Append-only, task-scoped snapshot of one completed stock selection."""
+
+    __tablename__ = "screener_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(
+        ForeignKey("experiments.id"), index=True
+    )
+    schema_version: Mapped[str] = mapped_column(
+        String(32), default="screener_run_v1", index=True
+    )
+    market: Mapped[str] = mapped_column(String(16), index=True)
+    portfolio_mode: Mapped[str] = mapped_column(String(24))
+    target_date: Mapped[date] = mapped_column(Date, index=True)
+    requested_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    direction: Mapped[str] = mapped_column(String(16))
+    panel_identity: Mapped[str] = mapped_column(Text, default="")
+    request_spec: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    factor_count: Mapped[int] = mapped_column(Integer, default=0)
+    eligible_count: Mapped[int] = mapped_column(Integer, default=0)
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
+    elapsed_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="done", index=True)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

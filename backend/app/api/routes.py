@@ -57,6 +57,7 @@ from ..models import (
     MinerVersion,
     Node,
     OuterStep,
+    ScreenerRun,
     Setting,
     Trial,
 )
@@ -1683,6 +1684,77 @@ async def activate_experiment(eid: int):
 
 # ---------- 选股器 ----------
 
+SCREENER_RUN_SCHEMA_VERSION = "screener_run_v1"
+
+
+def _screener_run_payload(
+    row: ScreenerRun,
+    *,
+    include_snapshot: bool = False,
+) -> dict:
+    request_spec = dict(row.request_spec or {})
+    result = dict(row.result_snapshot or {})
+    stocks = list(result.get("stocks") or [])
+    factors = list(request_spec.get("factors") or [])
+    payload = {
+        "id": row.id,
+        "experiment_id": row.experiment_id,
+        "schema_version": row.schema_version,
+        "market": row.market,
+        "portfolio_mode": row.portfolio_mode,
+        "target_date": str(row.target_date),
+        "requested_date": (
+            str(row.requested_date) if row.requested_date else None
+        ),
+        "date_adjusted": bool(
+            row.requested_date and row.requested_date != row.target_date
+        ),
+        "direction": row.direction,
+        "factor_count": row.factor_count,
+        "eligible_count": row.eligible_count,
+        "result_count": row.result_count,
+        "cache_hit": row.cache_hit,
+        "elapsed_ms": row.elapsed_ms,
+        "status": row.status,
+        "error": row.error,
+        "expression_mode": bool(request_spec.get("expression_mode")),
+        "universe_n": request_spec.get("universe_n"),
+        "top_n": request_spec.get("top_n"),
+        "factor_preview": [
+            {
+                "expression": factor.get("expression"),
+                "weight": factor.get("weight"),
+                "direction": factor.get("direction"),
+            }
+            for factor in factors[:3]
+        ],
+        "stock_preview": [
+            {
+                "ts_code": stock.get("ts_code"),
+                "name": stock.get("name"),
+                "side": stock.get("side"),
+                "side_rank": stock.get("side_rank"),
+                "score": stock.get("score"),
+            }
+            for stock in stocks[:5]
+        ],
+        "created_at": (
+            row.created_at.isoformat()
+            if isinstance(row.created_at, datetime)
+            else str(row.created_at)
+        ),
+    }
+    if include_snapshot:
+        payload["panel_identity"] = row.panel_identity
+        payload["request_spec"] = request_spec
+        payload["result"] = {
+            **result,
+            "run_id": row.id,
+            "recorded_at": payload["created_at"],
+        }
+    return payload
+
+
 class DSLInspectReq(BaseModel):
     expression: str
     experiment_id: int | None = None
@@ -1703,6 +1775,7 @@ async def inspect_dsl(req: DSLInspectReq):
 
 
 class ScreenerReq(BaseModel):
+    experiment_id: int | None = None
     factors: list[dict] = Field(default_factory=list)  # [{"expression": "...", "weight": 1.0}, ...]
     expression: str | None = None  # 单个 DSL 直接选股
     expression_direction: int = 1
@@ -1715,10 +1788,12 @@ class ScreenerReq(BaseModel):
 
 @router.post("/screener")
 async def screener(req: ScreenerReq):
-    """多因子选股: 单一 Polars 计划计算并缓存截面排名。"""
-    _, cfg = await _experiment_context()
+    """多因子选股，并追加保存任务隔离、可复查的完整结果快照。"""
+    started = time.perf_counter()
+    experiment_id, cfg = await _experiment_context(req.experiment_id)
     panel_glob = req.panel_glob or cfg.get("panel_glob")
     market = cfg.get("market", "us")
+    portfolio_mode = cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
     fields = get_dsl_fields(market)
     if req.direction not in {"top", "bottom", "both"}:
         raise HTTPException(400, "direction 必须是 top/bottom/both")
@@ -1746,6 +1821,14 @@ async def screener(req: ScreenerReq):
         factor_direction = int(factor.get("direction", 1))
         if factor_direction not in {-1, 1}:
             raise HTTPException(400, "因子 direction 必须为 1 或 -1")
+    factors = [
+        {
+            "expression": str(factor["expression"]),
+            "weight": float(factor.get("weight", 1.0)),
+            "direction": int(factor.get("direction", 1)),
+        }
+        for factor in factors
+    ]
 
     store = PanelStore.get(panel_glob, market)
     df = store.ensure_loaded()
@@ -1763,15 +1846,16 @@ async def screener(req: ScreenerReq):
         target_date = store.trading_dates[index]
     else:
         target_date = store.trading_dates[-1]
+    panel_identity = (
+        f"{market}:{panel_glob or 'default'}:{df.height}:"
+        f"{store.trading_dates[-1]}"
+    )
     try:
         screened = await asyncio.to_thread(
             screen_cross_section,
             df=df,
             trading_dates=store.trading_dates,
-            panel_identity=(
-                f"{market}:{panel_glob or 'default'}:{df.height}:"
-                f"{store.trading_dates[-1]}"
-            ),
+            panel_identity=panel_identity,
             target_date=target_date,
             factors=factors,
             fields=fields,
@@ -1782,7 +1866,8 @@ async def screener(req: ScreenerReq):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    return {
+    response = {
+        "experiment_id": experiment_id,
         "date": str(target_date),
         "requested_date": str(requested_date) if requested_date else None,
         "date_adjusted": bool(requested_date and target_date != requested_date),
@@ -1791,9 +1876,120 @@ async def screener(req: ScreenerReq):
         "factor_count": len(factors),
         "expression_mode": bool(req.expression),
         "market": market,
-        "portfolio_mode": cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE),
+        "portfolio_mode": portfolio_mode,
         "direction": req.direction,
         **screened,
+    }
+    request_spec = {
+        "schema_version": SCREENER_RUN_SCHEMA_VERSION,
+        "experiment_id": experiment_id,
+        "market": market,
+        "portfolio_mode": portfolio_mode,
+        "evaluation_protocol": cfg.get(
+            "evaluation_protocol",
+            EVALUATION_PROTOCOL_VERSION,
+        ),
+        "panel_glob": str(panel_glob) if panel_glob else None,
+        "panel_identity": panel_identity,
+        "requested_date": req.date,
+        "target_date": str(target_date),
+        "date_adjusted": response["date_adjusted"],
+        "universe_n": req.universe_n,
+        "top_n": req.top_n,
+        "direction": req.direction,
+        "expression_mode": bool(req.expression),
+        "factors": factors,
+    }
+    run = ScreenerRun(
+        experiment_id=experiment_id,
+        schema_version=SCREENER_RUN_SCHEMA_VERSION,
+        market=market,
+        portfolio_mode=portfolio_mode,
+        target_date=target_date,
+        requested_date=requested_date,
+        direction=req.direction,
+        panel_identity=panel_identity,
+        request_spec=request_spec,
+        result_snapshot=response,
+        factor_count=len(factors),
+        eligible_count=int(screened.get("eligible_count") or 0),
+        result_count=len(screened.get("stocks") or []),
+        cache_hit=bool((screened.get("performance") or {}).get("cache_hit")),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        status="done",
+    )
+    async with SessionLocal() as session:
+        session.add(run)
+        await session.commit()
+        await session.refresh(run)
+    return {
+        **response,
+        "run_id": run.id,
+        "recorded_at": (
+            run.created_at.isoformat()
+            if isinstance(run.created_at, datetime)
+            else str(run.created_at)
+        ),
+    }
+
+
+@router.get("/screener/runs")
+async def list_screener_runs(
+    experiment_id: int | None = None,
+    limit: int = 30,
+    offset: int = 0,
+):
+    if not 1 <= limit <= 100:
+        raise HTTPException(400, "limit 必须在 1 到 100 之间")
+    if offset < 0:
+        raise HTTPException(400, "offset 不能小于 0")
+    eid, cfg = await _experiment_context(experiment_id)
+    where = ScreenerRun.experiment_id == eid
+    async with SessionLocal() as session:
+        total = int(
+            await session.scalar(
+                select(func.count(ScreenerRun.id)).where(where)
+            )
+            or 0
+        )
+        rows = (
+            await session.scalars(
+                select(ScreenerRun)
+                .where(where)
+                .order_by(ScreenerRun.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+    return {
+        "experiment_id": eid,
+        "market": cfg.get("market", "us"),
+        "portfolio_mode": cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "runs": [_screener_run_payload(row) for row in rows],
+    }
+
+
+@router.get("/screener/runs/{run_id}")
+async def screener_run_detail(
+    run_id: int,
+    experiment_id: int | None = None,
+):
+    eid, _ = await _experiment_context(experiment_id)
+    async with SessionLocal() as session:
+        row = await session.scalar(
+            select(ScreenerRun).where(
+                ScreenerRun.id == run_id,
+                ScreenerRun.experiment_id == eid,
+            )
+        )
+    if not row:
+        raise HTTPException(404, "该任务下不存在这条选股记录")
+    return {
+        "experiment_id": eid,
+        "run": _screener_run_payload(row, include_snapshot=True),
     }
 
 
