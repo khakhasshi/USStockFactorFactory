@@ -1,4 +1,4 @@
-"""Batch research helpers for cross-task A-share factor backtests.
+"""Batch research helpers for cross-task equity-factor backtests.
 
 The batch protocol deliberately separates three decisions:
 
@@ -27,6 +27,34 @@ from .engine import EventBacktestConfig, StepEventBacktester
 
 
 BATCH_PROTOCOL = "ashare_cross_task_factor_leaderboard_v1"
+US_LONG_SHORT_BATCH_PROTOCOL = (
+    "us_cross_task_long_short_factor_leaderboard_v1"
+)
+US_LONG_ONLY_BATCH_PROTOCOL = (
+    "us_cross_task_long_only_factor_leaderboard_v1"
+)
+# Backward-compatible alias for callers that previously treated every US
+# batch as long-short.
+US_BATCH_PROTOCOL = US_LONG_SHORT_BATCH_PROTOCOL
+
+
+def batch_protocol_for_market(
+    market: str,
+    mode: str | None = None,
+) -> str:
+    """Return the immutable batch protocol for a market/portfolio pair."""
+    if market == "ashare":
+        if mode not in {None, "long_only"}:
+            raise ValueError("A股批量协议只支持 long_only")
+        return BATCH_PROTOCOL
+    if market == "us":
+        resolved_mode = mode or "long_short"
+        if resolved_mode == "long_short":
+            return US_LONG_SHORT_BATCH_PROTOCOL
+        if resolved_mode == "long_only":
+            return US_LONG_ONLY_BATCH_PROTOCOL
+        raise ValueError("美股 mode 必须是 long_only 或 long_short")
+    raise ValueError("market 必须是 ashare 或 us")
 
 
 @dataclass(frozen=True)
@@ -43,7 +71,11 @@ class BatchBacktestSpec:
     train_end: str = "2022-12-31"
     holdout_start: str = "2023-01-01"
     holdout_end: str = "2024-12-31"
+    vault_start: str = "2025-01-01"
+    vault_end: str = "2026-08-04"
     slippage_bps: tuple[float, ...] = (0.0, 5.0, 15.0)
+    borrow_cost_bps_annual: float = 0.0
+    fee_profile: str | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -284,6 +316,8 @@ def run_cost_scenarios(
                 rebalance_every=spec.rebalance_every,
                 slippage_bps=float(bps),
                 max_volume_participation=spec.max_volume_participation,
+                borrow_cost_bps_annual=spec.borrow_cost_bps_annual,
+                fee_profile=spec.fee_profile,
             ),
             capture_detail=capture_detail,
         )
@@ -318,7 +352,12 @@ def run_cost_scenarios(
             "fill_rate": stats["fill_rate"],
             "commission_and_tax": stats["commission_and_tax"],
             "slippage_cost": stats["slippage_cost"],
+            "borrow_cost": stats["borrow_cost"],
             "total_execution_cost": stats["total_execution_cost"],
+            "avg_gross_exposure": stats["avg_gross_exposure"],
+            "avg_net_exposure": stats["avg_net_exposure"],
+            "fee_profile": stats["fee_profile"],
+            "currency": stats["currency"],
             "integrity": result["integrity"],
             "detail_capture": result["detail_capture"],
         }
@@ -381,7 +420,12 @@ def flatten_factor_result(result: dict) -> dict:
                     "fill_rate",
                     "commission_and_tax",
                     "slippage_cost",
+                    "borrow_cost",
                     "total_execution_cost",
+                    "avg_gross_exposure",
+                    "avg_net_exposure",
+                    "fee_profile",
+                    "currency",
                 }
             }
             for bps, scenario in result["scenarios"].items()
@@ -464,13 +508,19 @@ def _benjamini_hochberg(
 
 
 def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
-    """Add transparent multi-dimensional ranks and a robust composite score."""
+    """Add absolute quality gates plus cross-sectional diagnostic ranks.
+
+    ``robust_score`` remains a within-run percentile and is never interpreted
+    as qualification. ``absolute_quality_score`` uses fixed economic targets;
+    a run where every candidate fails therefore has no synthetic champion.
+    """
     ranked = [dict(row) for row in rows if row.get("status") == "ok"]
     groups: dict[str, list[dict]] = {}
     for row in ranked:
         groups.setdefault(
             str(
-                row.get("evaluation_fingerprint")
+                row.get("portfolio_fingerprint_bps_15")
+                or row.get("evaluation_fingerprint")
                 or row.get("oriented_expression_hash")
                 or row["expression_hash"]
             ),
@@ -495,9 +545,37 @@ def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
                 "expression_hash"
             ]
             duplicate["equivalence_group_size"] = len(members)
+    for row in representatives:
+        long_only = str(row.get("portfolio_mode") or "") == "long_only"
+        has_active = row.get("active_sharpe_bps_15") not in {None, ""}
+        use_active = long_only or has_active
+        row["portfolio_metric_basis"] = "active" if use_active else "net"
+        for bps in (0, 5, 15):
+            row[f"ranking_ann_return_bps_{bps}"] = _safe_float(
+                row.get(
+                    f"active_ann_return_bps_{bps}"
+                    if use_active
+                    else f"ann_return_bps_{bps}"
+                )
+            )
+            row[f"ranking_sharpe_bps_{bps}"] = _safe_float(
+                row.get(
+                    f"active_sharpe_bps_{bps}"
+                    if use_active
+                    else f"sharpe_bps_{bps}"
+                )
+            )
+            row[f"ranking_max_drawdown_bps_{bps}"] = _safe_float(
+                row.get(
+                    f"active_max_drawdown_bps_{bps}"
+                    if use_active
+                    else f"max_drawdown_bps_{bps}"
+                ),
+                1.0,
+            )
     dimensions = {
-        "ann_return_bps_15": 0.20,
-        "sharpe_bps_15": 0.25,
+        "ranking_ann_return_bps_15": 0.20,
+        "ranking_sharpe_bps_15": 0.25,
         "oos_ic_mean": 0.10,
         "oos_icir": 0.15,
         "oos_rank_ic_mean": 0.10,
@@ -537,8 +615,8 @@ def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
             8,
         )
         row["cost_resilience"] = round(
-            _safe_float(row.get("ann_return_bps_15"))
-            - _safe_float(row.get("ann_return_bps_0")),
+            _safe_float(row.get("ranking_ann_return_bps_15"))
+            - _safe_float(row.get("ranking_ann_return_bps_0")),
             8,
         )
     _benjamini_hochberg(
@@ -569,9 +647,14 @@ def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
                 percentiles[key][expression_hash],
                 6,
             )
-        return_0 = _safe_float(row.get("ann_return_bps_0"))
-        return_5 = _safe_float(row.get("ann_return_bps_5"))
-        return_15 = _safe_float(row.get("ann_return_bps_15"))
+        return_0 = _safe_float(row.get("ranking_ann_return_bps_0"))
+        return_5 = _safe_float(row.get("ranking_ann_return_bps_5"))
+        return_15 = _safe_float(row.get("ranking_ann_return_bps_15"))
+        sharpe_15 = _safe_float(row.get("ranking_sharpe_bps_15"))
+        drawdown_15 = _safe_float(
+            row.get("ranking_max_drawdown_bps_15"),
+            1.0,
+        )
         integrity = all(
             bool(row.get(f"integrity_bps_{bps}"))
             for bps in (0, 5, 15)
@@ -580,21 +663,64 @@ def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
             return_0 + 1e-9 >= return_5
             and return_5 + 1e-9 >= return_15
         )
+        signal_evidence_pass = bool(
+            (
+                _safe_float(row.get("oos_rank_ic_mean")) > 0
+                and _safe_float(row.get("oos_rank_ic_bh_q"), 1.0) <= 0.10
+            )
+            or (
+                _safe_float(row.get("oos_ic_mean")) > 0
+                and _safe_float(row.get("oos_ic_bh_q"), 1.0) <= 0.10
+            )
+        )
         row["practical_pass"] = bool(
             integrity
             and row["cost_monotonic"]
             and return_15 > 0
-            and _safe_float(row.get("sharpe_bps_15")) > 0
-            and _safe_float(row.get("oos_ic_mean")) > 0
-            and _safe_float(row.get("oos_rank_ic_mean")) > 0
-            and _safe_float(row.get("oos_rank_ic_bh_q"), 1.0) <= 0.10
+            and sharpe_15 >= 0.50
+            and drawdown_15 <= 0.35
+            and signal_evidence_pass
         )
-        row["multiple_test_pass"] = bool(
-            _safe_float(row.get("oos_rank_ic_bh_q"), 1.0) <= 0.10
+        row["multiple_test_pass"] = signal_evidence_pass
+        profitability = 0.50 * max(0.0, min(1.0, return_15 / 0.10)) + 0.50 * max(
+            0.0, min(1.0, sharpe_15 / 1.50)
+        )
+        drawdown_quality = max(0.0, min(1.0, (0.50 - drawdown_15) / 0.40))
+        predictive = 0.50 * max(
+            0.0, min(1.0, _safe_float(row.get("oos_icir")) / 1.0)
+        ) + 0.50 * max(
+            0.0, min(1.0, _safe_float(row.get("oos_rank_icir")) / 1.0)
+        )
+        q_value = min(
+            _safe_float(row.get("oos_ic_bh_q"), 1.0),
+            _safe_float(row.get("oos_rank_ic_bh_q"), 1.0),
+        )
+        confidence = max(0.0, min(1.0, (0.25 - q_value) / 0.25))
+        cost_survival = (
+            0.50 * float(row["cost_monotonic"])
+            + 0.50 * max(0.0, min(1.0, return_15 / max(0.01, return_0)))
+        )
+        row["absolute_quality_score"] = round(
+            100.0
+            * (
+                0.35 * profitability
+                + 0.15 * drawdown_quality
+                + 0.20 * predictive
+                + 0.15 * confidence
+                + 0.10 * cost_survival
+                + 0.05 * float(integrity)
+            ),
+            4,
+        )
+        row["qualification_status"] = (
+            "qualified"
+            if row["practical_pass"]
+            else "diagnostic_only_failed_gate"
         )
     representatives.sort(
         key=lambda row: (
             bool(row["practical_pass"]),
+            _safe_float(row["absolute_quality_score"]),
             _safe_float(row["robust_score"]),
         ),
         reverse=True,
@@ -623,6 +749,9 @@ def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
             for key in (
                 "cost_resilience",
                 "robust_score",
+                "absolute_quality_score",
+                "qualification_status",
+                "portfolio_metric_basis",
                 "cost_monotonic",
                 "practical_pass",
                 "multiple_test_pass",
@@ -633,6 +762,9 @@ def rank_factor_results(rows: Iterable[dict]) -> list[dict]:
                 "oos_ic_bh_q",
                 "oos_rank_ic_bh_q",
                 "overall_rank",
+                *[f"ranking_ann_return_bps_{bps}" for bps in (0, 5, 15)],
+                *[f"ranking_sharpe_bps_{bps}" for bps in (0, 5, 15)],
+                *[f"ranking_max_drawdown_bps_{bps}" for bps in (0, 5, 15)],
                 *[f"pct_{dimension}" for dimension in dimensions],
                 *[f"rank_{dimension}" for dimension in dimensions],
             ):

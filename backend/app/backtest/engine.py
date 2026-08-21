@@ -954,6 +954,14 @@ class StepEventBacktester:
             "avg_daily_turnover": _round(
                 sum(float(row["turnover"]) for row in self.daily) / n, 6
             ),
+            "avg_gross_exposure": _round(
+                sum(float(row["gross_exposure"]) for row in self.daily) / n,
+                6,
+            ),
+            "avg_net_exposure": _round(
+                sum(float(row["net_exposure"]) for row in self.daily) / n,
+                6,
+            ),
             "fills": self._fill_seq,
             "orders": self._order_seq,
             "orders_executed": self._executed_orders,
@@ -1031,12 +1039,16 @@ def _prepare_backtest_frame(
     forward_horizon: int | None = None,
 ) -> tuple[pl.DataFrame, PanelStore]:
     store = PanelStore.get(panel_glob, market)
-    df = store.ensure_loaded()
+    snapshot_reader = getattr(store, "read_snapshot", None)
+    if callable(snapshot_reader):
+        df, dates, _, _ = snapshot_reader()
+    else:  # Compatibility with lightweight integrations and test doubles.
+        df = store.ensure_loaded()
+        dates = tuple(store.trading_dates)
     fields = get_dsl_fields(market)
     pipe = parse(expression, fields)
     start_date = date.fromisoformat(start)
     end_date = date.fromisoformat(end)
-    dates = store.trading_dates
     in_range = [value for value in dates if start_date <= value <= end_date]
     if len(in_range) < 60:
         raise ValueError("回测样本不足 (有效交易日 < 60)")

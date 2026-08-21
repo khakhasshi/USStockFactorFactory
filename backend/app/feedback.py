@@ -17,10 +17,17 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from .config import EVALUATION_PROTOCOL_VERSION
+from .factors.diversity import diversity_snapshot, mechanism_from_item
+from .factors.return_path import (
+    combined_training_signature,
+    return_path_correlation,
+)
+from .factors.semantics import audit_expression_semantics
+from .factors.similarity import expression_similarity
 from .observability import redact_text, redact_value
 
-FEEDBACK_SCHEMA_VERSION = "factorfactory.evaluation-feedback/v2"
-OUTER_REPORT_SCHEMA_VERSION = "factorfactory.outer-feedback/v2"
+FEEDBACK_SCHEMA_VERSION = "factorfactory.evaluation-feedback/v3"
+OUTER_REPORT_SCHEMA_VERSION = "factorfactory.outer-feedback/v3"
 
 DEFAULT_CONTEXT_POLICY = {
     "top_k": 4,
@@ -88,6 +95,38 @@ def _canonical_hash(value: Any) -> str:
 
 def _normalised_expression(expression: str) -> str:
     return re.sub(r"\s+", "", expression or "").lower()
+
+
+def _cluster_duplicate_rate(
+    items: list[dict],
+    similarity,
+    threshold: float,
+) -> float:
+    if len(items) < 2:
+        return 0.0
+    parent = list(range(len(items)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    for left in range(len(items)):
+        for right in range(left + 1, len(items)):
+            try:
+                value = similarity(items[left], items[right])
+            except (SyntaxError, ValueError, TypeError):
+                value = None
+            if value is not None and float(value) >= threshold:
+                union(left, right)
+    groups = len({find(index) for index in range(len(items))})
+    return round(1.0 - groups / len(items), 6)
 
 
 def _worst_stress_sharpe(metrics: dict) -> float | None:
@@ -180,6 +219,39 @@ def build_feedback_envelope(
         str(evaluation_protocol or public.get("protocol_version") or "")
         or "legacy_unoriented"
     )
+    proposal = dict(proposal_meta or {})
+    mechanism_family = str(
+        proposal.get("declared_family")
+        or proposal.get("mechanism_family")
+        or ""
+    )
+    if not mechanism_family:
+        mechanism_family = mechanism_from_item({
+            "expression": expression,
+            "hypothesis": hypothesis,
+            "proposal_meta": proposal,
+        })
+    semantic_audit = dict(
+        proposal.get("semantic_audit")
+        or audit_expression_semantics(expression, market)
+    )
+    return_signature = dict(
+        public.get("training_return_path_signature")
+        or combined_training_signature(
+            public,
+            dict(public_metrics or {}).get("gate") or {},
+        )
+    )
+    # The caller normally passes public and gate separately.  Fall back to a
+    # public-only signature here; orchestrator enriches it before persistence.
+    if not return_signature.get("available"):
+        public_signature = public.get("return_path_signature") or {}
+        return_signature = {
+            "available": bool(public_signature.get("available")),
+            "protocol": "public_return_path_v1",
+            "vector": list(public_signature.get("vector") or []),
+            "fingerprint": public_signature.get("fingerprint") or "",
+        }
     envelope = {
         "schema_version": FEEDBACK_SCHEMA_VERSION,
         "protocol_version": protocol,
@@ -199,7 +271,19 @@ def build_feedback_envelope(
         "expression": str(expression)[:1200],
         "hypothesis": str(hypothesis or "")[:500],
         "source": source,
-        "proposal": redact_value(proposal_meta or {}),
+        "proposal": redact_value(proposal),
+        "diversity": {
+            "target_family": proposal.get("target_family"),
+            "declared_family": mechanism_family,
+            "inferred_family": proposal.get("inferred_family")
+            or mechanism_from_item({
+                "expression": expression,
+                "hypothesis": hypothesis,
+            }),
+            "family_match": proposal.get("family_match"),
+            "semantic_audit": redact_value(semantic_audit),
+            "return_path_signature": redact_value(return_signature),
+        },
         "outcome": {
             "status": status,
             "score": _round(public_score, 4) or 0.0,
@@ -474,8 +558,10 @@ def _format_example(item: dict, template: dict | None) -> str:
     reasons = item.get("failure_reasons") or []
     proposal = item.get("proposal") or {}
     direction_selection = item.get("direction_selection") or {}
+    diversity = item.get("diversity") or {}
     line = (
         f"node={item.get('node_id') or 'pending'} "
+        f"mechanism={diversity.get('declared_family') or 'unknown'} "
         f"direction={int(item.get('direction') or 1):+d} "
         f"learning_score={_finite_float(outcome.get('learning_score', outcome.get('score')), 0.0):.3f} "
         f"hard_gate_score={_finite_float(outcome.get('gate_score'), 0.0):.3f} "
@@ -583,7 +669,17 @@ def build_inner_feedback_context(
             f"learning_mean={summary['score_mean']:.3f}，"
             f"hard_gate_mean={summary['gate_score_mean']:.3f}，"
             f"方向(+/-)={summary['direction_counts']}，"
-            f"error={summary['errors']}，duplicate={summary['duplicate_rate']:.1%}"
+            f"error={summary['errors']}，exact_duplicate={summary['duplicate_rate']:.1%}，"
+            f"structural_duplicate={summary['structural_duplicate_rate']:.1%}，"
+            f"return_path_duplicate={summary['behavior_duplicate_rate']:.1%}"
+        ),
+        (
+            f"收益机制覆盖: distinct={summary['distinct_mechanisms']}，"
+            f"passed_distinct={summary['distinct_passed_mechanisms']}，"
+            f"coverage={summary['mechanism_coverage']:.1%}，"
+            f"HHI={summary['mechanism_hhi']:.3f}；"
+            f"attempts={summary['mechanism_counts']}；"
+            f"passed={summary['passed_mechanism_counts']}"
         ),
     ]
     if summary["failure_reason_counts"]:
@@ -706,6 +802,29 @@ def _summary_core(envelopes: list[dict]) -> dict:
         if item.get("expression")
     ]
     unique_expressions = len(set(expressions))
+    market = str(next((item.get("market") for item in valid if item.get("market")), "us"))
+    diversity = diversity_snapshot(valid, market)
+    structural_duplicate_rate = _cluster_duplicate_rate(
+        valid,
+        lambda left, right: expression_similarity(
+            str(left.get("expression") or ""),
+            str(right.get("expression") or ""),
+        ),
+        0.84,
+    )
+    behavior_rows = [
+        item
+        for item in valid
+        if ((item.get("diversity") or {}).get("return_path_signature") or {}).get("available")
+    ]
+    behavior_duplicate_rate = _cluster_duplicate_rate(
+        behavior_rows,
+        lambda left, right: return_path_correlation(
+            (left.get("diversity") or {}).get("return_path_signature"),
+            (right.get("diversity") or {}).get("return_path_signature"),
+        ),
+        0.85,
+    )
     return {
         "score_semantics": "continuous_failure_margin_v4.2",
         "attempts": attempts,
@@ -732,6 +851,9 @@ def _summary_core(envelopes: list[dict]) -> dict:
             1.0 - unique_expressions / max(1, len(expressions)),
             6,
         ),
+        "structural_duplicate_rate": structural_duplicate_rate,
+        "behavior_duplicate_rate": behavior_duplicate_rate,
+        **diversity,
         "source_counts": dict(sources.most_common()),
         "direction_counts": dict(directions.most_common()),
         "failure_reason_counts": dict(reasons.most_common(12)),

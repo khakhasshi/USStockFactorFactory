@@ -9,18 +9,63 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api.routes import router
+from .api.routes import invalidate_panel_dependents, router
 from .config import (
     ALLOW_REMOTE_UNAUTHENTICATED,
     HOST,
+    PANEL_AUTO_RELOAD,
+    PANEL_WATCH_SECONDS,
     PORT,
     is_loopback_host,
 )
+from .data.panel import PanelStore
 from .db import init_db
 from .observability import OBSERVABILITY
 from .seed import seed_classics
 
 FRONTEND = Path(__file__).resolve().parent.parent.parent / "frontend"
+
+
+async def _watch_panel_sources() -> None:
+    """Detect stable source changes and hot-swap loaded panel generations."""
+    logger = logging.getLogger("factorfactory.panel_reload")
+    while True:
+        await asyncio.sleep(PANEL_WATCH_SECONDS)
+        try:
+            results = await asyncio.to_thread(
+                PanelStore.reload_changed_instances
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - watcher must survive one bad poll
+            logger.exception("Panel change detection poll failed")
+            continue
+        reloaded = [row for row in results if row.get("status") == "reloaded"]
+        if reloaded:
+            invalidation = invalidate_panel_dependents()
+            for row in reloaded:
+                logger.info(
+                    "Panel hot reload completed market=%s generation=%s "
+                    "date_max=%s duration_ms=%s cache_removed=%s",
+                    row.get("market"),
+                    row.get("generation"),
+                    row.get("date_max"),
+                    row.get("duration_ms"),
+                    invalidation["screener_entries_removed"],
+                )
+        for row in results:
+            if row.get("status") in {
+                "reload_failed",
+                "source_changed_during_reload",
+            }:
+                logger.warning(
+                    "Panel hot reload retained old generation market=%s "
+                    "status=%s generation=%s error=%s",
+                    row.get("market"),
+                    row.get("status"),
+                    row.get("generation"),
+                    row.get("error") or "source changed during reload",
+                )
 
 
 @asynccontextmanager
@@ -32,12 +77,25 @@ async def lifespan(app: FastAPI):
         name="startup.seed_classics",
     )  # 首次启动播种经典因子 (后台, 幂等)
     OBSERVABILITY.track_task(seed_task)
+    panel_watch_task = None
+    if PANEL_AUTO_RELOAD:
+        panel_watch_task = asyncio.create_task(
+            _watch_panel_sources(),
+            name="runtime.panel_hot_reload",
+        )
+        OBSERVABILITY.track_task(panel_watch_task)
     try:
         yield
     finally:
         if not seed_task.done():
             seed_task.cancel()
-        await asyncio.gather(seed_task, return_exceptions=True)
+        if panel_watch_task is not None and not panel_watch_task.done():
+            panel_watch_task.cancel()
+        await asyncio.gather(
+            seed_task,
+            *([panel_watch_task] if panel_watch_task is not None else []),
+            return_exceptions=True,
+        )
         await OBSERVABILITY.stop()
 
 
@@ -103,7 +161,15 @@ async def request_telemetry(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["Server-Timing"] = f"app;dur={duration_ms:.3f}"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
+    is_embedded_leaderboard = (
+        request.url.path.startswith("/api/leaderboards/")
+        and "/files/" in request.url.path
+    )
+    response.headers["X-Frame-Options"] = (
+        "SAMEORIGIN" if is_embedded_leaderboard else "DENY"
+    )
+    if is_embedded_leaderboard:
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
     response.headers["Referrer-Policy"] = "no-referrer"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"

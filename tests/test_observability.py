@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from datetime import date
@@ -323,11 +324,15 @@ class ObservabilityTests(unittest.TestCase):
         cache.put("b", {"value": 2})
         self.assertEqual(cache.get("a"), {"value": 1})
         cache.put("c", {"value": 3})
+        removed = cache.clear()
         stats = cache.stats()
         self.assertEqual(stats["hits"], 1)
         self.assertEqual(stats["misses"], 1)
         self.assertEqual(stats["evictions"], 1)
-        self.assertEqual(stats["entries"], 2)
+        self.assertEqual(removed, 2)
+        self.assertEqual(stats["entries"], 0)
+        self.assertEqual(stats["clears"], 1)
+        self.assertEqual(stats["cleared_entries"], 2)
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "part-000.parquet"
@@ -355,6 +360,133 @@ class ObservabilityTests(unittest.TestCase):
             ).diagnostics()
             self.assertEqual(ashare["state"], "error")
             self.assertIn("pe_ttm", ashare["missing_dsl_fields"])
+
+    def test_panel_hot_reload_detects_stable_change_and_swaps_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "part-000.parquet"
+
+            def write_panel(trade_date: date, close: float) -> None:
+                pl.DataFrame({
+                    "trade_date": [trade_date],
+                    "ts_code": ["TEST"],
+                    "name": ["Test"],
+                    "open": [close],
+                    "high": [close + 0.5],
+                    "low": [close - 0.5],
+                    "close": [close],
+                    "vol": [1000.0],
+                    "amount": [close * 1000.0],
+                }).write_parquet(source)
+
+            write_panel(date(2026, 1, 2), 10.0)
+            panel = PanelStore(str(Path(directory) / "*.parquet"), "us")
+            _, dates_v1, identity_v1, generation_v1 = panel.read_snapshot()
+            self.assertEqual(dates_v1[-1], date(2026, 1, 2))
+            self.assertEqual(generation_v1, 1)
+
+            write_panel(date(2026, 1, 5), 11.0)
+            detected = panel.reload_if_changed(require_stable=True)
+            self.assertEqual(detected["status"], "change_detected")
+            self.assertEqual(panel.read_snapshot()[3], generation_v1)
+            reloaded = panel.reload_if_changed(require_stable=True)
+            self.assertEqual(reloaded["status"], "reloaded")
+
+            frame_v2, dates_v2, identity_v2, generation_v2 = panel.read_snapshot()
+            self.assertEqual(dates_v2[-1], date(2026, 1, 5))
+            self.assertEqual(float(frame_v2["close"][0]), 11.0)
+            self.assertNotEqual(identity_v1, identity_v2)
+            self.assertEqual(generation_v2, 2)
+            diagnostics = panel.diagnostics()
+            self.assertFalse(diagnostics["stale"])
+            self.assertEqual(diagnostics["reload_count"], 1)
+
+    def test_panel_hot_reload_failure_keeps_previous_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "part-000.parquet"
+            pl.DataFrame({
+                "trade_date": [date(2026, 1, 2)],
+                "ts_code": ["TEST"],
+                "name": ["Test"],
+                "open": [10.0],
+                "high": [10.5],
+                "low": [9.5],
+                "close": [10.0],
+                "vol": [1000.0],
+                "amount": [10_000.0],
+            }).write_parquet(source)
+            panel = PanelStore(str(Path(directory) / "*.parquet"), "us")
+            frame_v1, dates_v1, identity_v1, generation_v1 = panel.read_snapshot()
+
+            pl.DataFrame({
+                "trade_date": [date(2026, 1, 5)],
+                "ts_code": ["BROKEN"],
+            }).write_parquet(source)
+            failed = panel.reload_if_changed()
+            self.assertEqual(failed["status"], "reload_failed")
+            self.assertTrue(failed["serving_continued"])
+
+            frame_after, dates_after, identity_after, generation_after = (
+                panel.read_snapshot()
+            )
+            self.assertIs(frame_after, frame_v1)
+            self.assertEqual(dates_after, dates_v1)
+            self.assertEqual(identity_after, identity_v1)
+            self.assertEqual(generation_after, generation_v1)
+            diagnostics = panel.diagnostics()
+            self.assertTrue(diagnostics["stale"])
+            self.assertIsNotNone(diagnostics["reload_error"])
+
+    def test_panel_reads_continue_while_new_generation_builds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "part-000.parquet"
+
+            def write_panel(trade_date: date) -> None:
+                pl.DataFrame({
+                    "trade_date": [trade_date],
+                    "ts_code": ["TEST"],
+                    "name": ["Test"],
+                    "open": [10.0],
+                    "high": [10.5],
+                    "low": [9.5],
+                    "close": [10.0],
+                    "vol": [1000.0],
+                    "amount": [10_000.0],
+                }).write_parquet(source)
+
+            write_panel(date(2026, 1, 2))
+            panel = PanelStore(str(Path(directory) / "*.parquet"), "us")
+            old_frame, old_dates, _, old_generation = panel.read_snapshot()
+            write_panel(date(2026, 1, 5))
+            original_load = panel._load
+            reload_started = threading.Event()
+            allow_reload = threading.Event()
+
+            def slow_load():
+                reload_started.set()
+                self.assertTrue(allow_reload.wait(timeout=2.0))
+                return original_load()
+
+            panel._load = slow_load
+            result: dict = {}
+
+            def run_reload() -> None:
+                result.update(panel.reload_if_changed())
+
+            thread = threading.Thread(target=run_reload)
+            thread.start()
+            self.assertTrue(reload_started.wait(timeout=2.0))
+            serving_frame, serving_dates, _, serving_generation = (
+                panel.read_snapshot()
+            )
+            self.assertIs(serving_frame, old_frame)
+            self.assertEqual(serving_dates, old_dates)
+            self.assertEqual(serving_generation, old_generation)
+            self.assertEqual(panel.diagnostics()["state"], "reloading")
+            allow_reload.set()
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["status"], "reloaded")
+            self.assertEqual(panel.read_snapshot()[3], old_generation + 1)
 
     def test_slo_exposes_explicit_objectives(self):
         snapshot = {
@@ -385,7 +517,7 @@ class ObservabilityTests(unittest.TestCase):
         slo = build_slo(snapshot)
         self.assertEqual(slo["status"], "pass")
         self.assertEqual(slo["failed"], 0)
-        self.assertEqual(len(slo["objectives"]), 7)
+        self.assertEqual(len(slo["objectives"]), 8)
 
 
 class EngineHeartbeatTests(unittest.IsolatedAsyncioTestCase):

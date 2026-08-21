@@ -1,4 +1,4 @@
-"""Backtest every persisted factor candidate on the A-share event engine.
+"""Backtest persisted factor candidates on one frozen event-engine protocol.
 
 Example:
     ../.venv/bin/python -m scripts.factor_leaderboard \
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import glob
 import hashlib
 import json
 import os
@@ -39,6 +40,7 @@ import polars as pl  # noqa: E402
 from app.backtest.batch import (  # noqa: E402
     BATCH_PROTOCOL,
     BatchBacktestSpec,
+    batch_protocol_for_market,
     canonical_expression,
     flatten_factor_result,
     information_coefficients,
@@ -48,7 +50,12 @@ from app.backtest.batch import (  # noqa: E402
     select_training_direction,
 )
 from app.backtest.engine import _prepare_backtest_frame, _write_artifacts  # noqa: E402
-from app.config import ASHARE_PANEL_GLOB, get_dsl_fields  # noqa: E402
+from app.config import (  # noqa: E402
+    ASHARE_PANEL_GLOB,
+    US_PANEL_GLOB,
+    get_dsl_fields,
+    get_layer_bounds,
+)
 from app.dsl.engine import expression_profile, validate  # noqa: E402
 
 
@@ -56,7 +63,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPORT_ROOT = PROJECT_ROOT / "var" / "reports"
 _WORKER_SPEC: BatchBacktestSpec | None = None
 _WORKER_PANEL_GLOB = ASHARE_PANEL_GLOB
+_WORKER_PROTOCOL = BATCH_PROTOCOL
+SOURCE_POLICY_ALL = "all"
+SOURCE_POLICY_US_PLUS_ASHARE_PRICE_VOLUME = (
+    "us_plus_ashare_price_volume"
+)
+PURE_PRICE_VOLUME_FIELDS = frozenset(
+    {"open", "high", "low", "close", "vol", "amount"}
+)
 REPORT_DIMENSIONS = (
+    "absolute_quality_score",
     "robust_score",
     "ann_return_bps_0",
     "ann_return_bps_5",
@@ -116,12 +132,44 @@ def _database_value(value: Any) -> Any:
     return value
 
 
+def _selection_reason(
+    item: dict,
+    source_policy: str,
+) -> str | None:
+    """Return why one AST-unique expression belongs to the frozen run."""
+    if source_policy == SOURCE_POLICY_ALL:
+        return "all_sources"
+    if source_policy != SOURCE_POLICY_US_PLUS_ASHARE_PRICE_VOLUME:
+        raise ValueError(f"未知来源筛选策略: {source_policy}")
+    origins = set(item.get("origin_markets") or [])
+    fields = set((item.get("profile") or {}).get("fields") or [])
+    us_origin = "us" in origins
+    ashare_price_volume = (
+        "ashare" in origins
+        and bool(item.get("profile"))
+        and fields <= PURE_PRICE_VOLUME_FIELDS
+    )
+    if us_origin and ashare_price_volume:
+        return "us_origin_and_ashare_price_volume"
+    if us_origin:
+        return "us_origin"
+    if ashare_price_volume:
+        return "ashare_price_volume_transfer"
+    return None
+
+
 async def _freeze_snapshot(
     *,
     max_experiment_id: int,
     max_node_id: int,
     max_factor_id: int,
+    target_market: str = "ashare",
+    source_policy: str = SOURCE_POLICY_ALL,
+    protocol: str | None = None,
 ) -> dict:
+    if target_market not in {"ashare", "us"}:
+        raise ValueError("target_market 必须是 ashare 或 us")
+    protocol = protocol or batch_protocol_for_market(target_market)
     connection = await asyncpg.connect(database="factor_factory")
     try:
         server_time = await connection.fetchval(
@@ -239,8 +287,10 @@ async def _freeze_snapshot(
             "created_at": str(record["created_at"]),
         })
 
+    selected: list[dict] = []
     valid: list[dict] = []
     invalid: list[dict] = []
+    excluded: list[dict] = []
     for item in expressions.values():
         item["origin_markets"] = sorted(item["origin_markets"])
         item["experiment_ids"] = sorted(item["experiment_ids"])
@@ -250,12 +300,29 @@ async def _freeze_snapshot(
             else item["origin_markets"][0]
         )
         item["source_record_count"] = len(item["provenance"])
-        error = validate(item["expression"], get_dsl_fields("ashare"))
+        try:
+            item["profile"] = expression_profile(item["expression"])
+        except (SyntaxError, TypeError, ValueError) as exc:
+            item["profile_error"] = str(exc)
+        selection_reason = _selection_reason(item, source_policy)
+        if selection_reason is None:
+            item["selection_exclusion"] = (
+                "not_us_origin_and_not_ashare_price_volume"
+            )
+            excluded.append(item)
+            continue
+        item["selection_reason"] = selection_reason
+        selected.append(item)
+        error = validate(
+            item["expression"],
+            get_dsl_fields(target_market),
+        )
         if error:
             item["validation_error"] = error
             invalid.append(item)
             continue
-        item["profile"] = expression_profile(item["expression"])
+        if "profile" not in item:
+            item["profile"] = expression_profile(item["expression"])
         valid.append(item)
     valid.sort(
         key=lambda row: (
@@ -264,8 +331,68 @@ async def _freeze_snapshot(
         )
     )
     invalid.sort(key=lambda row: row["expression_hash"])
+    excluded.sort(key=lambda row: row["expression_hash"])
+    all_items = list(expressions.values())
+    ashare_price_volume = [
+        item
+        for item in all_items
+        if (
+            "ashare" in set(item["origin_markets"])
+            and bool(item.get("profile"))
+            and set(item["profile"]["fields"]) <= PURE_PRICE_VOLUME_FIELDS
+        )
+    ]
+    selection_counts = {
+        "all_source_rows": len(records),
+        "all_unique_expressions": len(expressions),
+        "us_origin_unique_expressions": sum(
+            "us" in set(item["origin_markets"])
+            for item in all_items
+        ),
+        "ashare_origin_unique_expressions": sum(
+            "ashare" in set(item["origin_markets"])
+            for item in all_items
+        ),
+        "ashare_price_volume_unique_expressions": len(
+            ashare_price_volume
+        ),
+        "ashare_only_price_volume_unique_expressions": sum(
+            set(item["origin_markets"]) == {"ashare"}
+            for item in ashare_price_volume
+        ),
+        "us_ashare_price_volume_overlap_unique_expressions": sum(
+            "us" in set(item["origin_markets"])
+            for item in ashare_price_volume
+        ),
+        "selected_unique_before_validation": len(selected),
+        "selected_source_records": sum(
+            int(item["source_record_count"]) for item in selected
+        ),
+        "selected_provenance_us_records": sum(
+            provenance["market"] == "us"
+            for item in selected
+            for provenance in item["provenance"]
+        ),
+        "selected_provenance_ashare_records": sum(
+            provenance["market"] == "ashare"
+            for item in selected
+            for provenance in item["provenance"]
+        ),
+        "valid_target_expressions": len(valid),
+        "valid_target_source_records": sum(
+            int(item["source_record_count"]) for item in valid
+        ),
+        "invalid_target_expressions": len(invalid),
+        "invalid_target_source_records": sum(
+            int(item["source_record_count"]) for item in invalid
+        ),
+        "excluded_unique_expressions": len(excluded),
+    }
     return {
-        "protocol": BATCH_PROTOCOL,
+        "protocol": protocol,
+        "target_market": target_market,
+        "source_policy": source_policy,
+        "pure_price_volume_fields": sorted(PURE_PRICE_VOLUME_FIELDS),
         "snapshot_at_asia_shanghai": str(server_time),
         "cutoffs": {
             "max_experiment_id": max_experiment_id,
@@ -275,21 +402,34 @@ async def _freeze_snapshot(
         "experiments": experiment_rows,
         "source_rows": len(records),
         "unique_expressions": len(expressions),
-        "valid_ashare_expressions": len(valid),
-        "invalid_ashare_expressions": len(invalid),
+        "selected_source_rows": selection_counts[
+            "selected_source_records"
+        ],
+        "selected_unique_expressions": len(selected),
+        "valid_target_expressions": len(valid),
+        "invalid_target_expressions": len(invalid),
+        f"valid_{target_market}_expressions": len(valid),
+        f"invalid_{target_market}_expressions": len(invalid),
+        "selection_counts": selection_counts,
         "syntax_failures": syntax_failures,
         "invalid": invalid,
+        "excluded": excluded,
         "expressions": valid,
     }
 
 
-def _worker_init(spec: dict, panel_glob: str) -> None:
-    global _WORKER_SPEC, _WORKER_PANEL_GLOB
+def _worker_init(
+    spec: dict,
+    panel_glob: str,
+    protocol: str,
+) -> None:
+    global _WORKER_SPEC, _WORKER_PANEL_GLOB, _WORKER_PROTOCOL
     _WORKER_SPEC = BatchBacktestSpec(**{
         **spec,
         "slippage_bps": tuple(spec["slippage_bps"]),
     })
     _WORKER_PANEL_GLOB = panel_glob
+    _WORKER_PROTOCOL = protocol
 
 
 def _prepare_expression_frame(expression: str) -> pl.DataFrame:
@@ -301,7 +441,7 @@ def _prepare_expression_frame(expression: str) -> pl.DataFrame:
         start=_WORKER_SPEC.train_start,
         end=_WORKER_SPEC.holdout_end,
         panel_glob=_WORKER_PANEL_GLOB,
-        market="ashare",
+        market=_WORKER_SPEC.market,
         forward_horizon=_WORKER_SPEC.horizon,
     )
     return frame
@@ -312,12 +452,15 @@ def _worker_factor(record: dict) -> dict:
         raise RuntimeError("worker 未初始化")
     started = time.perf_counter()
     base = {
-        "protocol": BATCH_PROTOCOL,
+        "protocol": _WORKER_PROTOCOL,
         "status": "ok",
+        "market": _WORKER_SPEC.market,
+        "portfolio_mode": _WORKER_SPEC.mode,
         "expression_hash": record["expression_hash"],
         "expression": record["expression"],
         "origin_scope": record["origin_scope"],
         "origin_markets": record["origin_markets"],
+        "selection_reason": record.get("selection_reason"),
         "experiment_ids": record["experiment_ids"],
         "factor_ids": record["factor_ids"],
         "node_ids": record["node_ids"],
@@ -376,8 +519,8 @@ def _worker_vault(record: dict, direction: int) -> dict:
         raise RuntimeError("worker 未初始化")
     vault_spec = replace(
         _WORKER_SPEC,
-        holdout_start="2025-01-01",
-        holdout_end="2026-08-04",
+        holdout_start=_WORKER_SPEC.vault_start,
+        holdout_end=_WORKER_SPEC.vault_end,
         slippage_bps=(15.0,),
     )
     started = time.perf_counter()
@@ -388,7 +531,7 @@ def _worker_vault(record: dict, direction: int) -> dict:
             start=vault_spec.holdout_start,
             end=vault_spec.holdout_end,
             panel_glob=_WORKER_PANEL_GLOB,
-            market="ashare",
+            market=vault_spec.market,
             forward_horizon=vault_spec.horizon,
         )
         metrics = information_coefficients(
@@ -503,9 +646,13 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
     preferred = [
         "overall_rank",
         "practical_pass",
+        "qualification_status",
+        "absolute_quality_score",
         "robust_score",
+        "portfolio_metric_basis",
         "expression_hash",
         "origin_scope",
+        "selection_reason",
         "direction",
         "ann_return_bps_0",
         "ann_return_bps_5",
@@ -541,11 +688,39 @@ def _number(value: Any, digits: int = 3) -> str:
         return "—"
 
 
+def _market_label(market: str) -> str:
+    return "A股" if market == "ashare" else "美股"
+
+
+def _portfolio_label(mode: str) -> str:
+    return "纯多头" if mode == "long_only" else "多空"
+
+
+def _cost_description(spec: BatchBacktestSpec) -> str:
+    if spec.market == "ashare":
+        return (
+            "万二免五佣金、卖出印花税、双向过户费始终计入；"
+            "0/5/15 BPS 是额外买卖滑点。"
+        )
+    if spec.mode == "long_only":
+        return (
+            "IBKR Pro Fixed 佣金始终计入；纯多头不产生空头借券费；"
+            "0/5/15 BPS 是额外买卖滑点。"
+        )
+    return (
+        "IBKR Pro Fixed 佣金与"
+        f"{spec.borrow_cost_bps_annual / 100:.2f}% 年化空头借券代理始终计入；"
+        "0/5/15 BPS 是额外买卖滑点。"
+    )
+
+
 def _leaderboard_markdown(
     ranked: list[dict],
     *,
     snapshot: dict,
     vault: dict[str, dict],
+    spec: BatchBacktestSpec,
+    protocol: str,
 ) -> str:
     representatives = [
         row for row in ranked if row["economic_representative"]
@@ -554,25 +729,25 @@ def _leaderboard_markdown(
         row for row in representatives if row["practical_pass"]
     ]
     display = (practical or representatives)[:30]
+    market_label = _market_label(spec.market)
+    portfolio_label = _portfolio_label(spec.mode)
     lines = [
-        "# A股事件回测：全任务历史因子多维榜单",
+        f"# {market_label}{portfolio_label}事件回测：跨任务历史因子多维榜单",
         "",
-        f"- 协议：`{BATCH_PROTOCOL}`",
+        f"- 协议：`{protocol}`",
         (
             "- 冻结快照："
             f"{snapshot['snapshot_at_asia_shanghai']}；"
             f"{snapshot['source_rows']} 条来源记录，"
             f"{snapshot['unique_expressions']} 个 AST 去重表达式，"
-            f"{snapshot['valid_ashare_expressions']} 个可执行。"
+            f"{snapshot['valid_target_expressions']} 个在"
+            f"{market_label}可执行。"
         ),
         (
             "- 排名样本：方向只用 2020–2022 选择；"
             "榜单只用 2023–2024；2025–2026 Vault 不参与排序。"
         ),
-        (
-            "- 成本：万二免五佣金、卖出印花税、双向过户费始终计入；"
-            "0/5/15 BPS 是额外买卖滑点。"
-        ),
+        f"- 成本：{_cost_description(spec)}",
         "- 标签：`NON_PIT_RESEARCH`，不是实盘批准。",
         "",
         (
@@ -640,6 +815,7 @@ def _leaderboard_markdown(
 
 def _progress_payload(
     *,
+    protocol: str,
     started_at: float,
     completed: int,
     total: int,
@@ -652,7 +828,7 @@ def _progress_payload(
     rate = completed / elapsed if elapsed > 0 else 0.0
     remaining = max(0, total - completed)
     return {
-        "protocol": BATCH_PROTOCOL,
+        "protocol": protocol,
         "phase": phase,
         "completed": completed,
         "total": total,
@@ -674,6 +850,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-experiment-id", type=int, required=True)
     parser.add_argument("--max-node-id", type=int, required=True)
     parser.add_argument("--max-factor-id", type=int, required=True)
+    parser.add_argument(
+        "--market",
+        choices=("ashare", "us"),
+        default="ashare",
+    )
+    parser.add_argument(
+        "--source-policy",
+        choices=(
+            SOURCE_POLICY_ALL,
+            SOURCE_POLICY_US_PLUS_ASHARE_PRICE_VOLUME,
+        ),
+    )
+    parser.add_argument(
+        "--portfolio-mode",
+        choices=("long_only", "long_short"),
+    )
+    parser.add_argument("--borrow-cost-bps-annual", type=float)
+    parser.add_argument("--initial-capital", type=float)
+    parser.add_argument("--panel-glob")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--threads-per-worker", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0)
@@ -690,24 +885,103 @@ def main() -> None:
         raise SystemExit("--workers 必须在 1..4")
     if not 1 <= args.threads_per_worker <= 10:
         raise SystemExit("--threads-per-worker 必须在 1..10")
+    source_policy = args.source_policy or (
+        SOURCE_POLICY_US_PLUS_ASHARE_PRICE_VOLUME
+        if args.market == "us"
+        else SOURCE_POLICY_ALL
+    )
+    portfolio_mode = args.portfolio_mode or (
+        "long_short" if args.market == "us" else "long_only"
+    )
+    if args.market == "ashare" and portfolio_mode != "long_only":
+        raise SystemExit("A股批量事件回测只允许 --portfolio-mode long_only")
+    borrow_cost_bps_annual = (
+        float(args.borrow_cost_bps_annual)
+        if args.borrow_cost_bps_annual is not None
+        else (300.0 if args.market == "us" and portfolio_mode == "long_short" else 0.0)
+    )
+    if borrow_cost_bps_annual < 0:
+        raise SystemExit("--borrow-cost-bps-annual 不能为负数")
+    initial_capital = (
+        float(args.initial_capital)
+        if args.initial_capital is not None
+        else (1_000_000.0 if args.market == "us" else 10_000_000.0)
+    )
+    if initial_capital <= 0:
+        raise SystemExit("--initial-capital 必须为正数")
+    panel_glob = (
+        args.panel_glob
+        or (US_PANEL_GLOB if args.market == "us" else ASHARE_PANEL_GLOB)
+    )
+    layers = get_layer_bounds(args.market)
+    spec = BatchBacktestSpec(
+        market=args.market,
+        mode=portfolio_mode,
+        initial_capital=initial_capital,
+        train_start=layers["META_TRAIN"][0],
+        train_end=layers["META_TRAIN"][1],
+        holdout_start=layers["META_HOLDOUT"][0],
+        holdout_end=layers["META_HOLDOUT"][1],
+        vault_start=layers["FACTOR_VAULT"][0],
+        vault_end=layers["FACTOR_VAULT"][1],
+        borrow_cost_bps_annual=borrow_cost_bps_annual,
+    )
+    protocol = batch_protocol_for_market(
+        args.market,
+        portfolio_mode,
+    )
     os.environ["POLARS_MAX_THREADS"] = str(args.threads_per_worker)
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir
-        else (REPORT_ROOT / f"ashare-factor-leaderboard-{run_stamp}")
+        else (
+            REPORT_ROOT
+            / f"{args.market}-factor-leaderboard-{run_stamp}"
+        )
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = output_dir / "snapshot.json"
     if snapshot_path.exists() and not args.refresh_snapshot:
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        expected_cutoffs = {
+            "max_experiment_id": args.max_experiment_id,
+            "max_node_id": args.max_node_id,
+            "max_factor_id": args.max_factor_id,
+        }
+        if snapshot.get("cutoffs") != expected_cutoffs:
+            raise SystemExit(
+                "已有快照的数据库冻结点与当前参数不一致；"
+                "请换用新的 --output-dir"
+            )
+        if (
+            snapshot.get("target_market", "ashare") != args.market
+            or snapshot.get("source_policy", SOURCE_POLICY_ALL)
+            != source_policy
+        ):
+            raise SystemExit(
+                "已有快照的目标市场或来源策略与当前参数不一致；"
+                "请换用新的 --output-dir"
+            )
     else:
         snapshot = asyncio.run(_freeze_snapshot(
             max_experiment_id=args.max_experiment_id,
             max_node_id=args.max_node_id,
             max_factor_id=args.max_factor_id,
+            target_market=args.market,
+            source_policy=source_policy,
+            protocol=protocol,
         ))
         _write_json(snapshot_path, snapshot)
+    snapshot.setdefault(
+        "valid_target_expressions",
+        snapshot.get(f"valid_{args.market}_expressions", 0),
+    )
+    snapshot.setdefault(
+        "invalid_target_expressions",
+        snapshot.get(f"invalid_{args.market}_expressions", 0),
+    )
+    snapshot.setdefault("excluded", [])
     expressions = list(snapshot["expressions"])
     if args.limit > 0:
         expressions = expressions[: args.limit]
@@ -719,12 +993,9 @@ def main() -> None:
         row for row in expressions
         if row["expression_hash"] not in completed_hashes
     ]
-    spec = BatchBacktestSpec()
-    panel_files = sorted(
-        Path(ASHARE_PANEL_GLOB.split("trade_year=")[0]).glob(
-            "trade_year=*/data_0.parquet"
-        )
-    )
+    panel_files = [Path(path) for path in sorted(glob.glob(panel_glob))]
+    if not panel_files:
+        raise SystemExit(f"面板路径未匹配任何文件: {panel_glob}")
     panel_inventory = [
         {
             "path": str(path),
@@ -760,10 +1031,12 @@ def main() -> None:
         else previous_protocol
     )
     current_protocol = {
-        "protocol": BATCH_PROTOCOL,
+        "protocol": protocol,
         "policy_label": "NON_PIT_RESEARCH",
+        "target_market": args.market,
+        "source_policy": source_policy,
         "spec": spec.as_dict(),
-        "panel_glob": ASHARE_PANEL_GLOB,
+        "panel_glob": panel_glob,
         "panel_identity_path_size_mtime_sha256": panel_identity,
         "panel_inventory": panel_inventory,
         "execution_source_sha256": {
@@ -776,6 +1049,14 @@ def main() -> None:
         "platform": platform.platform(),
         "python": sys.version,
         "ranking_uses_vault": False,
+        "short_borrow_proxy": (
+            {
+                "annual_bps": borrow_cost_bps_annual,
+                "semantics": "constant_pressure_proxy_not_historical_locate_data",
+            }
+            if portfolio_mode == "long_short"
+            else None
+        ),
     }
     if existing and generation_protocol:
         if (
@@ -819,6 +1100,7 @@ def main() -> None:
     _write_json(protocol_path, current_protocol)
     started_at = time.time()
     print(
+        f"{_market_label(args.market)}{_portfolio_label(portfolio_mode)} · "
         f"快照 {snapshot['snapshot_at_asia_shanghai']} · "
         f"待回测 {len(pending)}/{len(expressions)} · "
         f"{args.workers} workers × {args.threads_per_worker} Polars threads",
@@ -829,7 +1111,7 @@ def main() -> None:
         max_workers=args.workers,
         mp_context=context,
         initializer=_worker_init,
-        initargs=(spec.as_dict(), ASHARE_PANEL_GLOB),
+        initargs=(spec.as_dict(), panel_glob, protocol),
     ) as executor:
         futures = {
             executor.submit(_worker_factor, row): row["expression_hash"]
@@ -850,6 +1132,7 @@ def main() -> None:
             else:
                 errors += 1
             progress = _progress_payload(
+                protocol=protocol,
                 started_at=started_at,
                 completed=done,
                 total=total,
@@ -988,6 +1271,22 @@ def main() -> None:
         for row in snapshot["invalid"]
     ]
     _write_csv(output_dir / "invalid_expressions.csv", invalid_rows)
+    excluded_rows = [
+        {
+            "expression_hash": row["expression_hash"],
+            "expression": row["expression"],
+            "origin_scope": row["origin_scope"],
+            "experiment_ids": row["experiment_ids"],
+            "factor_ids": row["factor_ids"],
+            "node_ids": row["node_ids"],
+            "fields": ",".join(
+                (row.get("profile") or {}).get("fields") or []
+            ),
+            "selection_exclusion": row["selection_exclusion"],
+        }
+        for row in snapshot.get("excluded", [])
+    ]
+    _write_csv(output_dir / "excluded_expressions.csv", excluded_rows)
     top_by_dimension = {
         key: sorted(
             [
@@ -1041,10 +1340,13 @@ def main() -> None:
             ranked,
             snapshot=snapshot,
             vault=vault_results,
+            spec=spec,
+            protocol=protocol,
         ),
         encoding="utf-8",
     )
     final_progress = _progress_payload(
+        protocol=protocol,
         started_at=started_at,
         completed=len(expressions),
         total=len(expressions),
@@ -1062,7 +1364,9 @@ def main() -> None:
                 "sha256": _sha256(path),
             }
     manifest = {
-        "protocol": BATCH_PROTOCOL,
+        "protocol": protocol,
+        "target_market": args.market,
+        "source_policy": source_policy,
         "completed_at": datetime.now(timezone.utc).isoformat(
             timespec="seconds"
         ),
@@ -1075,10 +1379,12 @@ def main() -> None:
         ),
         "source_rows": snapshot["source_rows"],
         "unique_expressions": snapshot["unique_expressions"],
+        "selection_counts": snapshot.get("selection_counts", {}),
         "scheduled_expressions": len(expressions),
         "successful_expressions": len(ranked),
         "failed_expressions": len(failures),
         "invalid_expressions": len(snapshot["invalid"]),
+        "excluded_expressions": len(snapshot.get("excluded", [])),
         "economic_equivalence_groups": sum(
             row["economic_representative"] for row in ranked
         ),

@@ -68,6 +68,37 @@ class FactorLibraryV4Tests(unittest.TestCase):
             81,
         )
 
+    def test_numeric_window_variants_do_not_escape_lsh_grouping(self):
+        expressions = [
+            (
+                "rank(ts_mean((ts_delta(close, 1)/(delay(close, 1)+1e-9))"
+                "*vol/(ts_mean(vol, 40)+1e-9), 30))"
+            ),
+            (
+                "-(rank(ts_mean((ts_delta(close, 1)/(delay(close, 1)+1e-9))"
+                "*vol/(ts_mean(vol, 3)+1e-9), 30)))"
+            ),
+            (
+                "-(rank(ts_mean((ts_delta(close, 1)/(delay(close, 1)+1e-9))"
+                "*vol/(ts_mean(vol, 120)+1e-9), 30)))"
+            ),
+        ]
+        items = [
+            {
+                "id": index,
+                "name": f"window-{index}",
+                "expression": expression,
+                "score": 4 - index,
+            }
+            for index, expression in enumerate(expressions, start=10)
+        ]
+        index = build_similarity_index(items, threshold=0.64)
+        groups = index["factor_to_group"]
+        self.assertEqual(groups[10], groups[11])
+        self.assertEqual(groups[10], groups[12])
+        self.assertEqual(index["stats"]["template_candidate_pairs"], 3)
+        self.assertIn("ast_template", index["stats"]["algorithm"])
+
 
 if __name__ == "__main__":
     unittest.main()

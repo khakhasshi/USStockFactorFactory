@@ -61,13 +61,28 @@ class PanelStore:
         )
         self.layer_bounds = get_layer_bounds(self.market)
         self._load_lock = threading.Lock()
+        self._reload_lock = threading.Lock()
+        self._snapshot_lock = threading.Lock()
         self._diagnostic_lock = threading.Lock()
         self.load_state = "cold"
         self.load_attempts = 0
         self.load_started_at: str | None = None
+        self.initial_loaded_at: str | None = None
         self.loaded_at: str | None = None
         self.load_duration_ms: float | None = None
         self.last_accessed_at: str | None = None
+        self.loaded_identity: str | None = None
+        self.generation = 0
+        self.reload_state = "idle"
+        self.reload_attempts = 0
+        self.reload_count = 0
+        self.reload_started_at: str | None = None
+        self.reloaded_at: str | None = None
+        self.reload_duration_ms: float | None = None
+        self.reload_error: str = ""
+        self.last_change_detected_at: str | None = None
+        self._pending_identity: str | None = None
+        self._pending_identity_checks = 0
         self._loaded_summary: dict = {}
         self._inventory_cache: dict = {}
         self._inventory_cached_at = 0.0
@@ -94,13 +109,15 @@ class PanelStore:
         self.last_accessed_at = datetime.now(timezone.utc).isoformat(
             timespec="milliseconds"
         )
-        if self.df is not None:
-            return self.df
+        with self._snapshot_lock:
+            if self.df is not None:
+                return self.df
         # Different market panels may load concurrently; only duplicate loads
         # of this exact panel instance are serialized.
         with self._load_lock:
-            if self.df is not None:
-                return self.df
+            with self._snapshot_lock:
+                if self.df is not None:
+                    return self.df
             self.load_attempts += 1
             self.load_state = "loading"
             self.load_error = ""
@@ -109,7 +126,8 @@ class PanelStore:
             )
             started = time.perf_counter()
             try:
-                frame = self._load()
+                frame, trading_dates = self._load()
+                inventory = self._source_inventory(force=True)
             except Exception as exc:
                 self.load_state = "error"
                 self.load_error = str(exc)[:1200]
@@ -118,26 +136,84 @@ class PanelStore:
                     3,
                 )
                 raise
-            self.df = frame
-            self.load_state = "ready"
-            self.loaded_at = datetime.now(timezone.utc).isoformat(
-                timespec="milliseconds"
-            )
-            self.load_duration_ms = round(
+            duration_ms = round(
                 (time.perf_counter() - started) * 1000.0,
                 3,
             )
-            self._loaded_summary = {
-                "rows": frame.height,
-                "securities": frame["ts_code"].n_unique(),
-                "date_min": str(frame["trade_date"].min()),
-                "date_max": str(frame["trade_date"].max()),
-                "columns": len(frame.columns),
-                "estimated_size_bytes": frame.estimated_size("b"),
-            }
-            return self.df
+            self._commit_snapshot(
+                frame,
+                trading_dates,
+                source_identity=inventory.get("identity"),
+                duration_ms=duration_ms,
+                reloaded=False,
+            )
+            return frame
 
-    def _load(self) -> pl.DataFrame:
+    def read_snapshot(
+        self,
+    ) -> tuple[pl.DataFrame, tuple[date, ...], str | None, int]:
+        """Return one internally consistent panel generation.
+
+        A hot reload swaps ``df`` and ``trading_dates`` under one lock. Existing
+        callers retain their reference to the old immutable Polars frame while
+        new callers receive the new generation, so no request observes a
+        half-swapped calendar/frame pair.
+        """
+        self.ensure_loaded()
+        with self._snapshot_lock:
+            assert self.df is not None
+            return (
+                self.df,
+                tuple(self.trading_dates),
+                self.loaded_identity,
+                self.generation,
+            )
+
+    @staticmethod
+    def _frame_summary(frame: pl.DataFrame) -> dict:
+        return {
+            "rows": frame.height,
+            "securities": frame["ts_code"].n_unique(),
+            "date_min": str(frame["trade_date"].min()),
+            "date_max": str(frame["trade_date"].max()),
+            "columns": len(frame.columns),
+            "estimated_size_bytes": frame.estimated_size("b"),
+        }
+
+    def _commit_snapshot(
+        self,
+        frame: pl.DataFrame,
+        trading_dates: list[date],
+        *,
+        source_identity: str | None,
+        duration_ms: float,
+        reloaded: bool,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        summary = self._frame_summary(frame)
+        with self._snapshot_lock:
+            self.df = frame
+            self.trading_dates = trading_dates
+            self.loaded_identity = source_identity
+            self.generation += 1
+            self._loaded_summary = summary
+            self.loaded_at = now
+            if self.initial_loaded_at is None:
+                self.initial_loaded_at = now
+            self.load_state = "ready"
+            self.load_error = ""
+            if reloaded:
+                self.reload_count += 1
+                self.reloaded_at = now
+                self.reload_duration_ms = duration_ms
+            else:
+                self.load_duration_ms = duration_ms
+            self.reload_state = "idle"
+            self.reload_error = ""
+            self._pending_identity = None
+            self._pending_identity_checks = 0
+
+    def _load(self) -> tuple[pl.DataFrame, list[date]]:
         panel_glob = self.panel_glob or default_panel_glob(self.market)
         lf = pl.scan_parquet(panel_glob, hive_partitioning=True)
         base_cols = [
@@ -226,8 +302,10 @@ class PanelStore:
             )
         lf = lf.with_columns(layer_expr.alias("layer"))
         frame = lf.collect()
-        self.trading_dates = frame["trade_date"].unique().sort().to_list()
-        return frame
+        trading_dates = frame["trade_date"].unique().sort().to_list()
+        if not trading_dates:
+            raise ValueError(f"{self.market} 面板没有有效交易日")
+        return frame, trading_dates
 
     def summary(self, ensure_loaded: bool = True) -> dict:
         if not ensure_loaded and self.df is None:
@@ -272,11 +350,15 @@ class PanelStore:
             "panel_glob": self.panel_glob or PANEL_GLOB,
         }
 
-    def _source_inventory(self) -> dict:
+    def _source_inventory(self, *, force: bool = False) -> dict:
         """Cheap cached file identity; never loads the Polars panel."""
         now = time.monotonic()
         with self._diagnostic_lock:
-            if self._inventory_cache and now - self._inventory_cached_at < 30.0:
+            if (
+                not force
+                and self._inventory_cache
+                and now - self._inventory_cached_at < 30.0
+            ):
                 return dict(self._inventory_cache)
             source = self.panel_glob or PANEL_GLOB
             try:
@@ -330,6 +412,9 @@ class PanelStore:
                 )
                 result = {
                     "source": source,
+                    "inventory_checked_at": datetime.now(timezone.utc).isoformat(
+                        timespec="milliseconds"
+                    ),
                     "file_count": len(paths),
                     "sampled_files": len(sampled),
                     "inventory_truncated": len(paths) > len(sampled),
@@ -357,6 +442,9 @@ class PanelStore:
             except (OSError, ValueError) as exc:
                 result = {
                     "source": source,
+                    "inventory_checked_at": datetime.now(timezone.utc).isoformat(
+                        timespec="milliseconds"
+                    ),
                     "file_count": 0,
                     "sampled_files": 0,
                     "total_bytes": 0,
@@ -376,28 +464,238 @@ class PanelStore:
             self._inventory_cached_at = now
             return dict(result)
 
+    def reload_if_changed(
+        self,
+        *,
+        force: bool = False,
+        require_stable: bool = False,
+    ) -> dict:
+        """Reload a changed source with a double-buffered atomic swap.
+
+        ``require_stable`` is used by the automatic watcher: the same changed
+        identity must be observed twice before a multi-gigabyte reload starts.
+        Manual reloads skip that debounce. A failed or concurrently-changing
+        source never replaces the currently serving generation.
+        """
+        inventory = self._source_inventory(force=True)
+        source_identity = inventory.get("identity")
+        with self._snapshot_lock:
+            loaded = self.df is not None
+            loaded_identity = self.loaded_identity
+            generation = self.generation
+        if not loaded:
+            try:
+                self.ensure_loaded()
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "status": "load_failed",
+                    "market": self.market,
+                    "generation": generation,
+                    "serving_continued": False,
+                    "error": str(exc)[:1200],
+                }
+            return {
+                "status": "loaded",
+                "market": self.market,
+                "generation": self.generation,
+                "source_identity": self.loaded_identity,
+                "serving_continued": False,
+            }
+        if inventory.get("source_error") or inventory.get("schema_status") == "error":
+            error = (
+                inventory.get("source_error")
+                or inventory.get("schema_error")
+                or "面板数据契约失败"
+            )
+            with self._snapshot_lock:
+                self.reload_state = "error"
+                self.reload_error = str(error)[:1200]
+            return {
+                "status": "reload_failed",
+                "market": self.market,
+                "generation": generation,
+                "source_identity": source_identity,
+                "loaded_identity": loaded_identity,
+                "serving_continued": True,
+                "error": str(error)[:1200],
+            }
+        if not force and source_identity == loaded_identity:
+            with self._snapshot_lock:
+                self._pending_identity = None
+                self._pending_identity_checks = 0
+                if self.reload_state != "reloading":
+                    self.reload_state = "idle"
+                    self.reload_error = ""
+            return {
+                "status": "unchanged",
+                "market": self.market,
+                "generation": generation,
+                "source_identity": source_identity,
+                "serving_continued": True,
+            }
+        if require_stable and not force:
+            with self._snapshot_lock:
+                if self._pending_identity != source_identity:
+                    self._pending_identity = source_identity
+                    self._pending_identity_checks = 1
+                    self.last_change_detected_at = datetime.now(
+                        timezone.utc
+                    ).isoformat(timespec="milliseconds")
+                else:
+                    self._pending_identity_checks += 1
+                checks = self._pending_identity_checks
+            if checks < 2:
+                return {
+                    "status": "change_detected",
+                    "market": self.market,
+                    "generation": generation,
+                    "source_identity": source_identity,
+                    "loaded_identity": loaded_identity,
+                    "stable_checks": checks,
+                    "serving_continued": True,
+                }
+        if not self._reload_lock.acquire(blocking=False):
+            return {
+                "status": "already_reloading",
+                "market": self.market,
+                "generation": generation,
+                "source_identity": source_identity,
+                "loaded_identity": loaded_identity,
+                "serving_continued": True,
+            }
+        started = time.perf_counter()
+        try:
+            with self._snapshot_lock:
+                self.reload_attempts += 1
+                self.reload_state = "reloading"
+                self.reload_error = ""
+                self.reload_started_at = datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                )
+            frame, trading_dates = self._load()
+            final_inventory = self._source_inventory(force=True)
+            final_identity = final_inventory.get("identity")
+            if (
+                final_inventory.get("source_error")
+                or final_inventory.get("schema_status") == "error"
+            ):
+                raise ValueError(
+                    final_inventory.get("source_error")
+                    or final_inventory.get("schema_error")
+                    or "热重载后的面板数据契约失败"
+                )
+            if final_identity != source_identity:
+                with self._snapshot_lock:
+                    self.reload_state = "deferred"
+                    self.reload_error = "源文件在重载过程中再次变化，已保留旧面板"
+                    self._pending_identity = final_identity
+                    self._pending_identity_checks = 1
+                    self.last_change_detected_at = datetime.now(
+                        timezone.utc
+                    ).isoformat(timespec="milliseconds")
+                return {
+                    "status": "source_changed_during_reload",
+                    "market": self.market,
+                    "generation": generation,
+                    "source_identity": final_identity,
+                    "loaded_identity": loaded_identity,
+                    "serving_continued": True,
+                }
+            duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            self._commit_snapshot(
+                frame,
+                trading_dates,
+                source_identity=final_identity,
+                duration_ms=duration_ms,
+                reloaded=True,
+            )
+            return {
+                "status": "reloaded",
+                "market": self.market,
+                "generation": self.generation,
+                "previous_generation": generation,
+                "source_identity": final_identity,
+                "previous_identity": loaded_identity,
+                "duration_ms": duration_ms,
+                "rows": frame.height,
+                "date_max": str(trading_dates[-1]),
+                "serving_continued": True,
+            }
+        except Exception as exc:  # noqa: BLE001
+            duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            with self._snapshot_lock:
+                self.reload_state = "error"
+                self.reload_error = str(exc)[:1200]
+                self.reload_duration_ms = duration_ms
+            return {
+                "status": "reload_failed",
+                "market": self.market,
+                "generation": generation,
+                "source_identity": source_identity,
+                "loaded_identity": loaded_identity,
+                "duration_ms": duration_ms,
+                "serving_continued": True,
+                "error": str(exc)[:1200],
+            }
+        finally:
+            self._reload_lock.release()
+
     def diagnostics(self) -> dict:
         inventory = self._source_inventory()
-        loaded = dict(self._loaded_summary)
+        with self._snapshot_lock:
+            loaded = dict(self._loaded_summary)
+            is_loaded = self.df is not None
+            loaded_identity = self.loaded_identity
+            generation = self.generation
+            reload_state = self.reload_state
+            reload_error = self.reload_error or None
+            pending_identity = self._pending_identity
+            pending_checks = self._pending_identity_checks
+        source_identity = inventory.get("identity")
+        stale = bool(
+            is_loaded
+            and loaded_identity
+            and source_identity
+            and loaded_identity != source_identity
+        )
         state = self.load_state
         if state == "cold" and (
             inventory.get("source_error")
             or inventory.get("schema_status") == "error"
         ):
             state = "error"
+        elif reload_state == "reloading":
+            state = "reloading"
+        elif stale:
+            state = "stale"
         return {
             "id": hashlib.sha256(
                 f"{self.market}::{inventory.get('source')}".encode("utf-8")
             ).hexdigest()[:12],
             "market": self.market,
             "state": state,
-            "loaded": self.df is not None,
+            "loaded": is_loaded,
             "load_attempts": self.load_attempts,
             "load_started_at": self.load_started_at,
+            "initial_loaded_at": self.initial_loaded_at,
             "loaded_at": self.loaded_at,
             "load_duration_ms": self.load_duration_ms,
             "last_accessed_at": self.last_accessed_at,
             "load_error": self.load_error or None,
+            "generation": generation,
+            "loaded_identity": loaded_identity,
+            "source_identity": source_identity,
+            "stale": stale,
+            "reload_state": reload_state,
+            "reload_attempts": self.reload_attempts,
+            "reload_count": self.reload_count,
+            "reload_started_at": self.reload_started_at,
+            "reloaded_at": self.reloaded_at,
+            "reload_duration_ms": self.reload_duration_ms,
+            "reload_error": reload_error,
+            "last_change_detected_at": self.last_change_detected_at,
+            "pending_identity": pending_identity,
+            "pending_identity_checks": pending_checks,
             "layer_bounds": {k: list(v) for k, v in self.layer_bounds.items()},
             **PANEL_META,
             **inventory,
@@ -413,9 +711,28 @@ class PanelStore:
             "instances": len(panels),
             "loaded": sum(bool(row.get("loaded")) for row in panels),
             "loading": sum(row.get("state") == "loading" for row in panels),
+            "reloading": sum(row.get("state") == "reloading" for row in panels),
+            "stale": sum(bool(row.get("stale")) for row in panels),
+            "reload_errors": sum(bool(row.get("reload_error")) for row in panels),
             "errors": sum(row.get("state") == "error" for row in panels),
             "estimated_size_bytes": sum(
                 int(row.get("estimated_size_bytes") or 0) for row in panels
             ),
             "panels": panels,
         }
+
+    @classmethod
+    def reload_changed_instances(cls) -> list[dict]:
+        """Check and reload every currently serving panel generation."""
+        with cls._registry_lock:
+            stores = list(cls._instances.values())
+        results = []
+        for store in stores:
+            with store._snapshot_lock:
+                loaded = store.df is not None
+            if not loaded:
+                continue
+            result = store.reload_if_changed(require_stable=True)
+            if result.get("status") != "unchanged":
+                results.append(result)
+        return results

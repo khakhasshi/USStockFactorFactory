@@ -8,6 +8,18 @@ import random
 
 from ..config import DEFAULT_MINER_TEMPLATE, DSL_FIELDS, get_dsl_fields
 from ..dsl.engine import OPERATORS_DOC, validate
+from ..factors.diversity import (
+    MECHANISM_LABELS,
+    mechanism_compatible,
+    mechanism_from_item,
+    mechanisms_for_market,
+    select_target_mechanism,
+)
+from ..factors.semantics import (
+    audit_expression_semantics,
+    render_field_contract,
+)
+from ..factors.similarity import expression_similarity
 from ..feedback import (
     build_feedback_envelope,
     build_inner_feedback_context,
@@ -58,9 +70,441 @@ def random_expression(
         lambda: f"zscore(ts_mean(amount, {f([3, 5])}) / ts_mean(amount, {f([40, 60])}))",
         lambda: f"-rank(ts_rank(close, {w()}))",
         lambda: f"rank(ts_delta(close, {f([40, 60, 120])})) - rank(ts_delta(close, {f([3, 5])}))",
-        lambda: f"rank(ts_mean(abs(ts_delta(close,1))/(amount+1e-9), {w()}))",
+        lambda: f"rank(ts_mean(abs(ts_delta(close,1))/(delay(close,1)+1e-9)/(amount+1e-9), {w()}))",
     ]
     return f(builtin)()
+
+
+def _random_tree_expression_for_family(
+    family: str,
+    fields: list[str],
+    generator: random.Random,
+) -> str:
+    """Build a shallow typed expression tree for one economic mechanism.
+
+    This deliberately has no access to evaluation outcomes.  The types here
+    are economic/measurement types (return, range, liquidity surprise, flow
+    share), which prevents nonsensical raw-price/turnover arithmetic while
+    still giving the random baseline a combinatorial search space.
+    """
+    field_set = set(fields)
+    # A 10k-candidate campaign must not collapse into a few dozen templates
+    # crossed with seven canonical windows.  The ranges stay interpretable
+    # (roughly days, weeks, months and one trading year) while providing enough
+    # independent horizon combinations for a real random-search baseline.
+    fast = generator.choice(list(range(2, 21)))
+    medium = generator.choice(list(range(10, 81, 5)))
+    slow = generator.choice(list(range(40, 251, 10)))
+    transform_window = generator.choice([fast, medium, slow])
+
+    ret1 = "(ts_delta(close, 1)/(delay(close, 1)+1e-9))"
+    ret_fast = f"(ts_delta(close, {fast})/(delay(close, {fast})+1e-9))"
+    ret_medium = f"(ts_delta(close, {medium})/(delay(close, {medium})+1e-9))"
+    ret_slow = f"(ts_delta(close, {slow})/(delay(close, {slow})+1e-9))"
+    range1 = "((high-low)/(close+1e-9))"
+    overnight = "((open-delay(close, 1))/(delay(close, 1)+1e-9))"
+    intraday = "((close-open)/(open+1e-9))"
+    close_location = "((close-low)/(high-low+1e-9))"
+    breakout = f"((close-ts_min(low, {slow}))/(ts_max(high, {slow})-ts_min(low, {slow})+1e-9))"
+    price_bases = [
+        ret1, ret_fast, ret_medium, ret_slow, range1, overnight,
+        intraday, close_location, breakout,
+    ]
+
+    def temporal(value: str) -> str:
+        return generator.choice([
+            value,
+            f"ts_mean({value}, {transform_window})",
+            f"ts_std({value}, {transform_window})",
+            f"ts_delta({value}, {transform_window})",
+            f"ts_rank({value}, {transform_window})",
+            f"ts_mean(sign({value}), {transform_window})",
+        ])
+
+    def trend_temporal(value: str) -> str:
+        """Direction-preserving transforms for momentum/reversal signals."""
+        return generator.choice([
+            value,
+            f"ts_mean({value}, {transform_window})",
+            f"ts_sum({value}, {transform_window})",
+            f"ts_delta({value}, {transform_window})",
+            f"ts_rank({value}, {transform_window})",
+            f"ts_mean(sign({value}), {transform_window})",
+        ])
+
+    if family in {"momentum", "reversal"}:
+        trend = generator.choice([
+            ret_fast,
+            ret_medium,
+            ret_slow,
+            f"ts_mean({ret1}, {medium})",
+            f"ts_sum({ret1}, {medium})",
+            f"(close/(ts_mean(close, {medium})+1e-9)-1)",
+            f"(ts_mean({ret1}, {fast})-ts_mean({ret1}, {slow}))",
+            f"(ts_rank(close, {slow})-ts_rank(close, {fast}))",
+            f"(close/(ts_max(high, {slow})+1e-9)-1)",
+            f"(close/(ts_min(low, {slow})+1e-9)-1)",
+        ])
+        comparator = generator.choice([
+            f"ts_std({ret1}, {slow})",
+            f"ts_mean(abs({ret1}), {slow})",
+            f"abs(ts_mean({ret1}, {slow}))",
+            f"ts_mean({range1}, {slow})",
+            f"ts_std({trend}, {medium})",
+        ])
+        tree = generator.choice([
+            trend_temporal(trend),
+            f"({trend_temporal(trend)}/({comparator}+1e-9))",
+            f"({trend_temporal(trend)}-ts_mean({ret1}, {slow}))",
+            f"ts_mean(sign({ret1}), {medium})",
+            f"ts_corr({trend}, delay({trend}, {fast}), {medium})",
+            f"ts_rank({trend}, {slow})",
+            f"(ts_mean({trend}, {fast})-ts_mean({trend}, {slow}))",
+            f"ts_delta({trend}, {medium})",
+            f"ts_corr({trend}, {range1}, {medium})",
+        ])
+        prefix = "-" if family == "reversal" else ""
+        return f"{prefix}rank({tree})"
+
+    if family == "volatility":
+        base = generator.choice(price_bases)
+        other = generator.choice(price_bases)
+        tree = generator.choice([
+            f"ts_std({base}, {transform_window})",
+            f"ts_mean(abs({base}), {transform_window})",
+            f"ts_max(abs({base}), {transform_window})",
+            f"(ts_std({base}, {fast})/(ts_std({base}, {slow})+1e-9))",
+            f"ts_delta(ts_std({base}, {medium}), {fast})",
+            f"ts_corr(abs({ret1}), {range1}, {medium})",
+            f"ts_std(ts_mean({base}, {fast}), {slow})",
+            f"ts_mean(({base})*({base}), {medium})",
+            f"(ts_max({base}, {slow})-ts_min({base}, {slow}))",
+            f"ts_corr(abs({base}), abs({other}), {medium})",
+            f"(ts_mean(abs({base}), {fast})/(ts_mean(abs({base}), {slow})+1e-9))",
+            f"ts_rank(ts_std({base}, {medium}), {slow})",
+        ])
+        return f"rank({tree})"
+
+    liquidity_bases = [
+        f"(amount/(ts_mean(amount, {slow})+1e-9))",
+        f"(vol/(ts_mean(vol, {slow})+1e-9))",
+        "log(amount)",
+        "log(vol)",
+        "(amount/(vol+1e-9))",
+    ]
+    if "turnover_rate" in field_set:
+        liquidity_bases.extend([
+            "turnover_rate",
+            f"(turnover_rate/(ts_mean(turnover_rate, {slow})+1e-9))",
+        ])
+    if "volume_ratio" in field_set:
+        liquidity_bases.append("volume_ratio")
+
+    if family == "liquidity":
+        base = generator.choice(liquidity_bases)
+        tree = generator.choice([
+            temporal(base),
+            f"ts_corr({base}, delay({base}, {fast}), {medium})",
+            f"(ts_mean({base}, {fast})-ts_mean({base}, {slow}))",
+            f"(ts_std({base}, {fast})/(ts_std({base}, {slow})+1e-9))",
+        ])
+        return f"rank({tree})"
+
+    if family == "volume_price_interaction":
+        price = generator.choice(price_bases)
+        liquidity = generator.choice(liquidity_bases)
+        price_signal = temporal(price)
+        liquidity_signal = temporal(liquidity)
+        tree = generator.choice([
+            f"ts_corr({price}, {liquidity}, {medium})",
+            f"ts_mean(({price})*({liquidity}), {medium})",
+            f"ts_mean(sign({price})*({liquidity}), {medium})",
+            f"(ts_mean({price}, {fast})/"
+            f"(ts_std({liquidity}, {slow})+1e-9))",
+            f"ts_delta(ts_corr({price}, {liquidity}, {medium}), {fast})",
+            f"ts_mean(abs({price})/(amount+1e-9), {medium})",
+            f"ts_corr({price_signal}, {liquidity_signal}, {medium})",
+            f"ts_mean(({price_signal})*({liquidity_signal}), {medium})",
+            f"(ts_mean({price}, {fast})*ts_mean({liquidity}, {slow}))",
+            f"(ts_mean({price}, {fast})-ts_mean(sign({price})*({liquidity}), {slow}))",
+            f"ts_corr(ts_rank({price}, {fast}), ts_rank({liquidity}, {fast}), {medium})",
+            f"ts_delta(ts_mean(sign({price})*({liquidity}), {medium}), {fast})",
+        ])
+        return f"rank({tree})"
+
+    if family == "gap_intraday":
+        base = generator.choice([overnight, intraday, f"({overnight}-{intraday})"])
+        tree = generator.choice([
+            temporal(base),
+            f"ts_corr({overnight}, {intraday}, {medium})",
+            f"(ts_mean({overnight}, {fast})-ts_mean({intraday}, {slow}))",
+            f"(ts_mean({base}, {medium})/(ts_std({base}, {slow})+1e-9))",
+        ])
+        return f"rank({tree})"
+
+    if family == "price_relationship":
+        left = generator.choice(price_bases)
+        right = generator.choice([
+            value for value in price_bases if value != left
+        ])
+        tree = generator.choice([
+            f"ts_corr({left}, {right}, {medium})",
+            f"ts_delta(ts_corr({left}, {right}, {slow}), {fast})",
+            f"ts_corr(ts_rank({left}, {fast}), ts_rank({right}, {fast}), {medium})",
+            f"ts_corr({left}, delay({right}, {fast}), {medium})",
+        ])
+        return f"rank({tree})"
+
+    if family == "valuation":
+        values = [name for name in ["pe_ttm", "pb", "ps_ttm", "dv_ttm"] if name in field_set]
+        value = generator.choice(values)
+        other = generator.choice(values)
+        tree = generator.choice([
+            temporal(value),
+            f"({value}/(ts_mean({value}, {slow})+1e-9))",
+            f"(zscore({value})-zscore({other}))",
+            f"ts_corr({value}, delay({other}, {fast}), {medium})",
+        ])
+        return f"rank({tree})"
+
+    if family == "size":
+        sizes = [name for name in ["total_mv", "circ_mv", "float_share"] if name in field_set]
+        size = generator.choice(sizes)
+        other = generator.choice(sizes)
+        left = generator.choice([
+            f"log({size})",
+            f"ts_rank(log({size}), {transform_window})",
+            f"({size}/(ts_mean({size}, {slow})+1e-9))",
+            f"ts_delta(log({size}), {medium})",
+            f"ts_mean(log({size}), {medium})",
+            f"ts_std(log({size}), {medium})",
+        ])
+        right_options = [
+            f"log({other})",
+            f"ts_rank(log({other}), {fast})",
+            f"({other}/(ts_mean({other}, {slow})+1e-9))",
+            f"ts_delta(log({other}), {fast})",
+            f"ts_mean(log({other}), {slow})",
+            f"ts_std(log({other}), {slow})",
+        ]
+        right = generator.choice([value for value in right_options if value != left] or right_options)
+        tree = generator.choice([
+            temporal(left),
+            f"({size}/({other}+1e-9))",
+            f"({size}/(ts_mean({size}, {slow})+1e-9))",
+            f"ts_corr(log({size}), delay(log({other}), {fast}), {medium})",
+            f"({left}-{right})",
+            f"({left}/(abs({right})+1e-9))",
+            f"ts_corr({left}, delay({right}, {fast}), {medium})",
+            f"(ts_mean({left}, {fast})-ts_mean({left}, {slow}))",
+            f"ts_delta({left}, {medium})",
+            f"ts_rank({left}, {slow})",
+            f"ts_std({left}, {medium})",
+        ])
+        return f"rank({tree})"
+
+    if family == "capital_flow":
+        flows = [
+            name for name in [
+                "net_mf_amount", "buy_lg_amount", "sell_lg_amount",
+                "buy_elg_amount", "sell_elg_amount",
+            ]
+            if name in field_set
+        ]
+        flow = generator.choice(flows)
+        normalized = f"({flow}/(amount+1e-9))"
+        tree = generator.choice([
+            temporal(normalized),
+            f"(ts_mean({normalized}, {fast})-ts_mean({normalized}, {slow}))",
+            f"ts_corr({normalized}, {ret1}, {medium})",
+            f"(ts_mean({normalized}, {medium})/(ts_std({normalized}, {slow})+1e-9))",
+        ])
+        return f"rank({tree})"
+
+    raise ValueError(f"不支持的随机收益机制: {family}")
+
+
+def random_expression_for_family(
+    family: str,
+    fields: list[str],
+    rng: random.Random | None = None,
+) -> str:
+    """Generate a valid mechanism-targeted fallback without an LLM.
+
+    The random baseline is intended to be a real search baseline rather than a
+    window sweep over one expression per mechanism.  Keep the grammar generic
+    and outcome-agnostic: it samples several economically distinct shapes, then
+    applies the same DSL and field-provenance checks as an LLM proposal.
+    """
+    generator = rng or random
+    market = "ashare" if "pb" in fields else "us"
+    field_set = set(fields)
+
+    for _ in range(32):
+        fast = generator.choice([2, 3, 5, 10, 15, 20])
+        medium = generator.choice([10, 15, 20, 30, 40, 60])
+        slow = generator.choice([40, 60, 90, 120, 180, 240])
+        previous = "(delay(close, 1)+1e-9)"
+        returns = f"(ts_delta(close, 1)/{previous})"
+        lagged = f"(delay(close, {fast})+1e-9)"
+        fast_return = f"(ts_delta(close, {fast})/{lagged})"
+
+        candidates: dict[str, list] = {
+            "momentum": [
+                lambda: f"rank(ts_delta(close, {slow})/(delay(close, {slow})+1e-9))",
+                lambda: f"rank(ts_mean({returns}, {medium}))",
+                lambda: f"rank(ts_sum({returns}, {medium}))",
+                lambda: f"rank(ts_mean({returns}, {fast})-ts_mean({returns}, {slow}))",
+                lambda: f"rank(ts_rank(close, {slow})-ts_rank(close, {fast}))",
+                lambda: f"rank(ts_mean({fast_return}, {medium}))",
+            ],
+            "reversal": [
+                lambda: f"-rank({fast_return})",
+                lambda: f"-rank(ts_mean({returns}, {fast}))",
+                lambda: f"-rank(close/(ts_mean(close, {medium})+1e-9)-1)",
+                lambda: f"-rank(ts_rank(close, {medium}))",
+                lambda: f"-rank(ts_mean({returns}, {fast})-ts_mean({returns}, {slow}))",
+                lambda: f"-rank(ts_delta(ts_mean(close, {fast}), {medium})/(delay(ts_mean(close, {fast}), {medium})+1e-9))",
+            ],
+            "volatility": [
+                lambda: f"-rank(ts_std({returns}, {medium}))",
+                lambda: f"rank(ts_std({returns}, {fast})-ts_std({returns}, {slow}))",
+                lambda: f"-rank(ts_mean((high-low)/(close+1e-9), {medium}))",
+                lambda: f"rank(ts_std((high-low)/(close+1e-9), {medium}))",
+                lambda: f"-rank(ts_max(high, {medium})/(ts_min(low, {medium})+1e-9)-1)",
+                lambda: f"rank(ts_mean(abs({returns}), {fast})/"
+                        f"(ts_mean(abs({returns}), {slow})+1e-9))",
+            ],
+            "liquidity": [
+                lambda: f"-rank(ts_mean(amount, {medium}))",
+                lambda: f"rank(amount/(ts_mean(amount, {medium})+1e-9))",
+                lambda: f"-rank(ts_mean(vol, {medium}))",
+                lambda: f"rank(vol/(ts_mean(vol, {slow})+1e-9))",
+                lambda: f"rank(ts_delta(log(amount), {medium}))",
+                lambda: f"rank(ts_std(amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
+            ],
+            "volume_price_interaction": [
+                lambda: f"rank(ts_corr({returns}, amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
+                lambda: f"rank(ts_corr(abs({returns}), vol/(ts_mean(vol, {slow})+1e-9), {medium}))",
+                lambda: f"rank(ts_mean(sign({returns})*amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
+                lambda: f"rank(ts_mean({returns}*vol/(ts_mean(vol, {slow})+1e-9), {medium}))",
+                lambda: f"rank(ts_corr({fast_return}, log(amount), {medium}))",
+                lambda: f"rank(ts_corr((high-low)/(close+1e-9), vol, {medium}))",
+            ],
+            "gap_intraday": [
+                lambda: f"rank(ts_mean((open-delay(close, 1))/{previous}, {medium}))",
+                lambda: f"rank(ts_mean((close-open)/(open+1e-9), {medium}))",
+                lambda: f"rank(ts_corr((open-delay(close, 1))/{previous}, (close-open)/(open+1e-9), {medium}))",
+                lambda: f"rank(ts_mean((open-delay(close, 1))/{previous}-(close-open)/(open+1e-9), {medium}))",
+                lambda: f"rank((open-delay(close, 1))/{previous})",
+                lambda: f"rank(ts_std((open-delay(close, 1))/{previous}, {medium}))",
+            ],
+            "price_relationship": [
+                lambda: f"rank(ts_corr(high/(close+1e-9), low/(close+1e-9), {medium}))",
+                lambda: f"rank(ts_corr(close/(open+1e-9), high/(low+1e-9), {medium}))",
+                lambda: f"rank(ts_corr({returns}, (high-low)/(close+1e-9), {medium}))",
+                lambda: f"rank(ts_corr(high/(low+1e-9), close/(delay(close, 1)+1e-9), {medium}))",
+                lambda: f"rank(ts_corr(high/(close+1e-9), close/(low+1e-9), {medium}))",
+                lambda: f"rank(ts_corr({returns}, delay({returns}, {fast}), {medium}))",
+            ],
+        }
+
+        valuation_fields = [
+            name for name in ["pe_ttm", "pb", "ps_ttm", "dv_ttm"]
+            if name in field_set
+        ]
+        if valuation_fields:
+            value = generator.choice(valuation_fields)
+            other = generator.choice(valuation_fields)
+            candidates["valuation"] = [
+                lambda: f"-rank({value})",
+                lambda: f"rank(ts_rank({value}, {medium}))",
+                lambda: f"rank(ts_delta({value}, {medium}))",
+                lambda: f"-rank(zscore({value})+zscore({other}))",
+                lambda: f"rank({value}/(ts_mean({value}, {slow})+1e-9))",
+            ]
+
+        size_fields = [
+            name for name in ["total_mv", "circ_mv", "float_share"]
+            if name in field_set
+        ]
+        if size_fields:
+            size = generator.choice(size_fields)
+            other_size = generator.choice(size_fields)
+            candidates["size"] = [
+                lambda: f"-rank({size})",
+                lambda: f"rank(ts_rank({size}, {medium}))",
+                lambda: f"rank(ts_delta(log({size}), {medium}))",
+                lambda: f"rank({size}/({other_size}+1e-9))",
+                lambda: f"rank({size}/(ts_mean({size}, {slow})+1e-9))",
+            ]
+
+        flow_fields = [
+            name for name in [
+                "net_mf_amount", "buy_lg_amount", "sell_lg_amount",
+                "buy_elg_amount", "sell_elg_amount",
+            ]
+            if name in field_set
+        ]
+        if flow_fields and "amount" in field_set:
+            flow = generator.choice(flow_fields)
+            signed_flow = (
+                "(buy_lg_amount-sell_lg_amount)"
+                if {"buy_lg_amount", "sell_lg_amount"}.issubset(field_set)
+                else flow
+            )
+            candidates["capital_flow"] = [
+                lambda: f"rank(ts_mean({flow}/(amount+1e-9), {medium}))",
+                lambda: f"rank(ts_sum({signed_flow}, {medium})/(ts_mean(amount, {medium})+1e-9))",
+                lambda: f"rank(ts_corr({flow}/(amount+1e-9), {returns}, {medium}))",
+                lambda: f"rank(({flow}/(amount+1e-9))/"
+                        f"(ts_mean({flow}/(amount+1e-9), {slow})+1e-9))",
+                lambda: f"rank(ts_delta({signed_flow}/(amount+1e-9), {medium}))",
+            ]
+
+        builders = candidates.get(family) or []
+        if not builders:
+            break
+        # Keep 10% simple templates as interpretable controls.  The remaining
+        # draws use the larger compositional grammar so long campaigns spend
+        # their budget on distinct economic structures instead of repeatedly
+        # revisiting the same canonical window grid.
+        expression = (
+            _random_tree_expression_for_family(family, fields, generator)
+            if generator.random() < 0.90
+            else generator.choice(builders)()
+        )
+        if (
+            validate(expression, fields) is None
+            and not audit_expression_semantics(expression, market)["errors"]
+            and mechanism_compatible(expression, family)
+        ):
+            return expression
+
+    # Every supported family has a conservative deterministic fallback.  Do
+    # not silently return a different mechanism, because that would corrupt
+    # diversity accounting and the factor's research lineage.
+    fallbacks = {
+        "momentum": "rank(ts_delta(close, 60)/(delay(close, 60)+1e-9))",
+        "reversal": "-rank(ts_delta(close, 5)/(delay(close, 5)+1e-9))",
+        "volatility": "-rank(ts_std(ts_delta(close, 1)/(delay(close, 1)+1e-9), 40))",
+        "liquidity": "-rank(ts_mean(amount, 40))",
+        "volume_price_interaction": "rank(ts_corr(ts_delta(close, 1)/(delay(close, 1)+1e-9), amount, 40))",
+        "gap_intraday": "rank(ts_mean((open-delay(close, 1))/(delay(close, 1)+1e-9), 40))",
+        "price_relationship": "rank(ts_corr(high/(close+1e-9), low/(close+1e-9), 40))",
+        "valuation": "-rank(pb)",
+        "size": "-rank(total_mv)",
+        "capital_flow": "rank(ts_mean(net_mf_amount/(amount+1e-9), 40))",
+    }
+    expression = fallbacks.get(family, "")
+    if (
+        expression
+        and validate(expression, fields) is None
+        and not audit_expression_semantics(expression, market)["errors"]
+        and mechanism_compatible(expression, family)
+    ):
+        return expression
+    raise ValueError(f"无法为收益机制 {family} 生成字段兼容的随机表达式")
 
 
 def mutate_expression(
@@ -93,6 +537,7 @@ def _build_system_prompt(
     market: str = "us",
     direction: int = 1,
     direction_policy: str = "both_train_select",
+    target_family: str | None = None,
 ) -> str:
     """从模板组装 system prompt。约束块强制置顶 (外层不可稀释)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
@@ -100,6 +545,13 @@ def _build_system_prompt(
     sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
     fields = fields or _FIELDS
     strategy_part = sys_tpl.format(fields=", ".join(fields), ops=ops_doc, anti=anti)
+    family_instruction = (
+        f"【本轮指定收益机制】{target_family}: "
+        f"{MECHANISM_LABELS.get(target_family, target_family)}。"
+        "必须返回完全相同的 mechanism_family；表达式字段/算子必须与该机制相容。\n"
+        if target_family
+        else ""
+    )
     direction_instruction = (
         (
             "每个候选都在训练安全层同时评价 +1（高值偏多）与 "
@@ -127,6 +579,11 @@ def _build_system_prompt(
         f"{'其余股票保持空仓，不建立空头。' if portfolio_mode == 'long_only' else '另一侧作为空头组合。'}\n"
         f"【硬约束 — 违反者无效】\n"
         f"可用字段 ({len(fields)}个): {', '.join(fields)}\n"
+        "【字段语义与来源】\n"
+        f"{render_field_contract(market, fields)}\n"
+        "禁止把绝对前复权价格尺度直接与原始成交额 amount 混合；"
+        "价格变化必须先归一化为收益率或振幅比例。\n"
+        f"{family_instruction}"
         f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
         f"窗口: 1..250 整数\n"
         "权威目标: 改善 V4.2 连续学习分的最弱组件，同时不得削弱硬门槛；"
@@ -134,6 +591,7 @@ def _build_system_prompt(
         "压力成本和可实施性不能由高 ICIR 抵消。\n"
         "输出格式: 只回复 JSON: "
         "{\"expression\":\"...\",\"hypothesis\":\"...\","
+        "\"mechanism_family\":\"...\","
         "\"reflection\":\"从反馈提炼的经验与本次改变\","
         "\"targeted_failures\":[\"本次针对的失败原因\"],"
         "\"expected_effect\":\"预期改善的评价组件\"}\n"
@@ -215,11 +673,14 @@ async def propose(
     fields: list[str] | None = None,
     trace_context: dict | None = None,
     rng: random.Random | None = None,
+    target_family: str | None = None,
+    deliberate_random: bool = False,
 ) -> tuple[str, str, str, dict]:
     """返回 (expression, hypothesis, source, proposal_meta).
 
     template_or_spec: MinerTemplate (v2) 或 HarnessSpec (v1 兼容)
-    LLM 失败/未配置时回退随机.
+    LLM 失败/未配置时回退随机；deliberate_random 表示任务主动选择
+    无 LLM 随机基线，不得把它记录成供应商故障或模型回退。
     """
     # 兼容 v1 spec 和 v2 template
     is_v2 = "draft_strategy" in template_or_spec
@@ -230,6 +691,13 @@ async def propose(
     direction_policy = str(
         task.get("direction_policy") or "both_train_select"
     )
+    target_family = str(
+        target_family
+        or task.get("target_family")
+        or select_target_mechanism(top_nodes, market, rng)
+    )
+    if target_family not in mechanisms_for_market(market):
+        raise ValueError(f"未知或不可用于 {market} 的收益机制: {target_family}")
     fallback_reason = "provider_not_configured"
     text: str | None = None
 
@@ -243,6 +711,7 @@ async def propose(
                     market,
                     direction,
                     direction_policy,
+                    target_family,
                 )
                 if template
                 else _system_prompt_old(
@@ -274,6 +743,7 @@ async def propose(
                     node
                     for node in top_nodes
                     if str(node.get("status") or "ok") == "ok"
+                    and mechanism_from_item(node) == target_family
                 ),
                 key=lambda node: float(node.get("public_score") or 0.0),
                 default=None,
@@ -299,7 +769,7 @@ async def propose(
                 draft_inst = template.get("draft_strategy", "提出与历史不同的新因子。") if template else "请提出一个与历史尝试思路不同的新因子。"
                 div_inst = template.get("diversity_instruction", "") if template else ""
                 user = (
-                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction_policy={direction_policy}, tie_break_direction={direction}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction_policy={direction_policy}, tie_break_direction={direction}, target_family={target_family}, universe=流动性前{task['universe_n']}, 预测 horizon={task['horizon']} 交易日。\n"
                     f"评价反馈与历史经验:\n{context}\n\n"
                     f"上下文使用要求: {context_instruction}\n"
                     f"策略指令: {draft_inst}\n{div_inst}\n"
@@ -308,7 +778,7 @@ async def propose(
             else:  # improve
                 impr_inst = template.get("improve_strategy", "改进当前最优因子。") if template else "请改进当前最优因子 (调整结构/窗口/复合), 保持简洁。"
                 user = (
-                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction_policy={direction_policy}, tie_break_direction={direction}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
+                    f"任务: market={market}, portfolio_mode={portfolio_mode}, direction_policy={direction_policy}, tie_break_direction={direction}, target_family={target_family}, universe=流动性前{task['universe_n']}, horizon={task['horizon']} 交易日。\n"
                     f"当前最优: {base['expression'] if base else '无'} "
                     f"(learning_score={base['public_score']:.3f} icir={base['public_metrics'].get('icir',0):+.2f})\n"
                     f"完整评价反馈与经验:\n{context}\n\n"
@@ -342,6 +812,7 @@ async def propose(
             if err:
                 raise llm.LLMError(f"表达式非法: {err} | {expr}")
             hypothesis = str(data.get("hypothesis") or "").strip()[:500]
+            declared_family = str(data.get("mechanism_family") or "").strip()
             reflection = str(data.get("reflection") or "").strip()[:800]
             expected_effect = str(
                 data.get("expected_effect") or ""
@@ -357,6 +828,29 @@ async def propose(
             if not hypothesis or not reflection:
                 raise llm.LLMError(
                     "LLM 输出缺少 hypothesis/reflection"
+                )
+            if declared_family != target_family:
+                raise llm.LLMError(
+                    f"mechanism_family 必须为本轮指定的 {target_family}"
+                )
+            if not mechanism_compatible(expr, target_family):
+                raise llm.LLMError(
+                    f"表达式字段/算子与收益机制 {target_family} 不相容"
+                )
+            semantic_audit = audit_expression_semantics(expr, market)
+            if semantic_audit["errors"]:
+                raise llm.LLMError("；".join(semantic_audit["errors"]))
+            structural_similarity = max(
+                (
+                    expression_similarity(expr, str(node.get("expression") or ""))
+                    for node in top_nodes
+                    if node.get("expression")
+                ),
+                default=0.0,
+            )
+            if op == "draft" and structural_similarity >= 0.84:
+                raise llm.LLMError(
+                    f"新草稿结构相似度 {structural_similarity:.3f} 过高"
                 )
             if top_nodes and not targeted:
                 raise llm.LLMError(
@@ -383,6 +877,15 @@ async def propose(
                 "targeted_failures": targeted,
                 "expected_effect": expected_effect,
                 "semantic_normalizations": semantic_normalizations,
+                "target_family": target_family,
+                "declared_family": declared_family,
+                "inferred_family": mechanism_from_item({
+                    "expression": expr,
+                    "hypothesis": hypothesis,
+                }),
+                "family_match": True,
+                "semantic_audit": semantic_audit,
+                "max_structural_similarity": round(structural_similarity, 6),
                 "feedback_context_fingerprint": feedback_snapshot.get(
                     "context_fingerprint",
                     "",
@@ -417,12 +920,47 @@ async def propose(
 
     # 回退随机
     tpls = template.get("dsl_exploration_templates") if template else None
-    fallback_meta = {
-        "reflection": "LLM 不可用或输出无效；本轮使用确定性随机回退，不作为模型经验。",
-        "targeted_failures": [],
-        "expected_effect": "仅维持搜索连续性",
-        "fallback_reason": fallback_reason,
+    if deliberate_random:
+        fallback_meta = {
+            "reflection": "任务主动配置为无 LLM 随机基线；候选不读取模型反馈。",
+            "targeted_failures": [],
+            "expected_effect": "独立估计机制约束随机候选的训练层分布",
+            "proposal_mode": "random",
+            "random_reason": "configured_random_mode",
+            "target_family": target_family,
+            "declared_family": target_family,
+            "family_match": True,
+        }
+    else:
+        fallback_meta = {
+            "reflection": "LLM 不可用或输出无效；本轮使用确定性随机回退，不作为模型经验。",
+            "targeted_failures": [],
+            "expected_effect": "仅维持搜索连续性",
+            "fallback_reason": fallback_reason,
+            "target_family": target_family,
+            "declared_family": target_family,
+            "family_match": True,
+        }
+    known_expressions = {
+        str(node.get("expression") or "").strip()
+        for node in top_nodes
+        if str(node.get("expression") or "").strip()
     }
+
+    def fresh_targeted_expression() -> tuple[str, int]:
+        """Prefer a new AST shape/window before accepting a repeat."""
+        last = ""
+        for retry in range(32):
+            last = random_expression_for_family(
+                target_family, fields or _FIELDS, rng
+            )
+            if last not in known_expressions:
+                return last, retry
+        # A saturated tiny custom field set may have no unseen expression.  A
+        # valid repeat is preferable to crashing a long-running campaign, but
+        # the retry count remains observable in proposal metadata.
+        return last, 32
+
     if op == "improve" and top_nodes:
         base = max(
             (
@@ -433,15 +971,57 @@ async def propose(
             key=lambda node: float(node.get("public_score") or 0.0),
             default=top_nodes[0],
         )
+        use_local_mutation = (rng or random).random() < 0.35
+        expression = (
+            mutate_expression(base["expression"], tpls, fields, rng)
+            if use_local_mutation
+            else ""
+        )
+        semantic_audit = audit_expression_semantics(expression, market)
+        novelty_retries = 0
+        if (
+            not expression
+            or expression in known_expressions
+            or semantic_audit["errors"]
+            or not mechanism_compatible(expression, target_family)
+        ):
+            expression, novelty_retries = fresh_targeted_expression()
+            semantic_audit = audit_expression_semantics(expression, market)
+        fallback_meta.update({
+            "semantic_audit": semantic_audit,
+            "random_strategy": (
+                "local_mutation" if use_local_mutation and novelty_retries == 0
+                else "fresh_mechanism_grammar"
+            ),
+            "novelty_retries": novelty_retries,
+            "inferred_family": mechanism_from_item({
+                "expression": expression,
+                "hypothesis": MECHANISM_LABELS[target_family],
+            }),
+        })
         return (
-            mutate_expression(base["expression"], tpls, fields, rng),
-            "随机变异自当前最优",
+            expression,
+            (
+                f"机制约束随机变异：{MECHANISM_LABELS[target_family]}"
+                if deliberate_random
+                else "随机变异自当前最优"
+            ),
             "random",
             fallback_meta,
         )
+    expression, novelty_retries = fresh_targeted_expression()
+    fallback_meta.update({
+        "semantic_audit": audit_expression_semantics(expression, market),
+        "random_strategy": "fresh_mechanism_grammar",
+        "novelty_retries": novelty_retries,
+        "inferred_family": mechanism_from_item({
+            "expression": expression,
+            "hypothesis": MECHANISM_LABELS[target_family],
+        }),
+    })
     return (
-        random_expression(tpls, fields, rng),
-        "随机模板生成",
+        expression,
+        f"机制约束随机生成：{MECHANISM_LABELS[target_family]}",
         "random",
         fallback_meta,
     )
@@ -452,7 +1032,7 @@ async def propose(
 # ============================================================
 
 _OLD_SYSTEM = """你是量化因子研究员。基于当前市场日线数据设计横截面选股因子表达式。
-可用字段: {fields} (前复权价格与量额)
+可用字段: {fields}；价格是前复权口径，amount 是原始成交额或 raw_close×vol 代理，禁止直接混用绝对价格尺度与 amount。
 可用算子:
 {ops}
 规则: 只能用以上字段与算子; 窗口为 1..250 整数; 表达式一行; 目标是最大化样本内 RankIC 的稳健性而非峰值;

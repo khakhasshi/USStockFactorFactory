@@ -43,7 +43,18 @@ from .feedback import (
     combine_seed_feedback,
     compare_feedback_reports,
 )
-from .factors.similarity import expression_fingerprint
+from .factors.diversity import (
+    diversity_adjusted_score,
+    mechanism_from_item,
+    mechanisms_for_market,
+    select_target_mechanism,
+)
+from .factors.return_path import (
+    combined_training_signature,
+    return_path_correlation,
+)
+from .factors.semantics import audit_expression_semantics
+from .factors.similarity import expression_fingerprint, expression_similarity
 from .meta.agent import (
     propose_spec,
     propose_template,
@@ -269,6 +280,137 @@ class Engine:
             or DEFAULT_RESEARCH_DIRECTION_POLICY
         )
 
+    def _proposal_mode(self) -> str:
+        mode = str(self.task_config.get("proposal_mode") or "llm").strip().lower()
+        if mode not in {"llm", "random"}:
+            raise ValueError("研究任务 proposal_mode 必须为 llm 或 random")
+        return mode
+
+    def _target_factor_count(self) -> int:
+        try:
+            target = int(self.task_config.get("target_factor_count") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("研究任务 target_factor_count 必须为非负整数") from exc
+        if target < 0:
+            raise ValueError("研究任务 target_factor_count 必须为非负整数")
+        return target
+
+    def _candidate_evaluation_budget(self) -> int:
+        try:
+            budget = int(
+                self.task_config.get("candidate_evaluation_budget") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "研究任务 candidate_evaluation_budget 必须为非负整数"
+            ) from exc
+        if budget < 0:
+            raise ValueError(
+                "研究任务 candidate_evaluation_budget 必须为非负整数"
+            )
+        return budget
+
+    def _target_mechanisms(self) -> tuple[str, ...]:
+        configured = self.task_config.get("target_mechanisms") or []
+        if not isinstance(configured, (list, tuple)):
+            raise ValueError("研究任务 target_mechanisms 必须为机制名称列表")
+        allowed = set(
+            mechanisms_for_market(self.task_config.get("market", "us"))
+        )
+        targets: list[str] = []
+        for value in configured:
+            mechanism = str(value).strip()
+            if not mechanism or mechanism not in allowed:
+                raise ValueError(
+                    f"研究任务包含不可用于当前市场的收益机制: {mechanism or value}"
+                )
+            if mechanism not in targets:
+                targets.append(mechanism)
+        return tuple(targets)
+
+    def _target_family_for_attempt(
+        self,
+        feedback_nodes: list[dict],
+        market: str,
+        rng: random.Random,
+    ) -> str:
+        targets = self._target_mechanisms()
+        if not targets:
+            return select_target_mechanism(feedback_nodes, market, rng)
+        # Persisted candidate count is restored at startup, so round-robin
+        # targeting remains balanced and reproducible across service restarts.
+        index = int(self.status.get("candidate_evaluations") or 0)
+        return targets[index % len(targets)]
+
+    async def _factor_count(self) -> int:
+        async with SessionLocal() as session:
+            value = await session.scalar(
+                select(func.count(Factor.id)).where(
+                    Factor.experiment_id == self.exp_id,
+                    Factor.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+        return int(value or 0)
+
+    async def _candidate_evaluation_count(self) -> int:
+        async with SessionLocal() as session:
+            value = await session.scalar(
+                select(func.count(Node.id)).where(
+                    Node.experiment_id == self.exp_id,
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+        return int(value or 0)
+
+    async def _stop_if_evaluation_budget_reached(
+        self,
+        *,
+        refresh: bool = False,
+    ) -> bool:
+        budget = self._candidate_evaluation_budget()
+        if budget <= 0:
+            return False
+        count = (
+            await self._candidate_evaluation_count()
+            if refresh
+            else int(self.status.get("candidate_evaluations") or 0)
+        )
+        self.status.update({
+            "candidate_evaluations": count,
+            "candidate_evaluation_budget": budget,
+            "candidate_evaluation_progress": round(count / budget, 6),
+        })
+        if count < budget:
+            return False
+        if self.status.get("stop_reason") != "candidate_evaluation_budget_reached":
+            self.status["stop_reason"] = "candidate_evaluation_budget_reached"
+            await self.log(
+                f"随机研究预算完成: 候选评价 {count}/{budget}，worker 自动停止",
+                "info",
+            )
+        self.running = False
+        return True
+
+    async def _stop_if_factor_target_reached(self) -> bool:
+        target = self._target_factor_count()
+        if target <= 0:
+            return False
+        count = await self._factor_count()
+        self.status.update({
+            "factor_count": count,
+            "target_factor_count": target,
+            "factor_target_progress": round(count / target, 6),
+        })
+        if count < target:
+            return False
+        self.status["stop_reason"] = "target_factor_count_reached"
+        await self.log(
+            f"研究目标完成: 当前协议因子库 {count}/{target}，worker 自动停止",
+            "info",
+        )
+        self.running = False
+        return True
+
     async def start(self, mode: str = "v2", experiment_id: int | None = None) -> dict:
         if mode != "v2":
             return {
@@ -306,6 +448,15 @@ class Engine:
             "evaluation_heartbeat_count": 0,
             "evaluation_soft_deadline_seconds": None,
             "evaluation_deadline_exceeded": False,
+            "proposal_mode": self._proposal_mode(),
+            "target_factor_count": self._target_factor_count(),
+            "candidate_evaluation_budget": self._candidate_evaluation_budget(),
+            "candidate_evaluations": 0,
+            "candidate_evaluation_progress": 0.0,
+            "target_mechanisms": list(self._target_mechanisms()),
+            "factor_count": 0,
+            "factor_target_progress": 0.0,
+            "stop_reason": None,
         })
         self._set_phase("starting", progress=True)
         self.task = asyncio.create_task(
@@ -401,6 +552,11 @@ class Engine:
             self.status["state"] = "running"
             cfg = await self._config_v2()
 
+            if await self._stop_if_evaluation_budget_reached(refresh=True):
+                return
+            if await self._stop_if_factor_target_reached():
+                return
+
             while self.running:
                 step_no = await self._next_step_no()
                 self.status["outer_step"] = step_no
@@ -430,7 +586,11 @@ class Engine:
             current_task=None,
         )
         provider = await self._provider("outer_provider")
-        history = await self._version_history_v2()
+        deliberate_random = self._proposal_mode() == "random"
+        # Deliberate random baselines must not even build a feedback context;
+        # otherwise provenance could imply that the random proposal learned
+        # from historical scores despite the generator being outcome-agnostic.
+        history = [] if deliberate_random else await self._version_history_v2()
 
         # 外层 LLM 提议新模板
         inc_template = incumbent.harness_spec if isinstance(incumbent.harness_spec, dict) else DEFAULT_MINER_TEMPLATE
@@ -441,6 +601,7 @@ class Engine:
             portfolio_mode=self._portfolio_mode(),
             direction=self._signal_direction(),
             direction_policy=self._direction_policy(),
+            deliberate_random=deliberate_random,
             trace_context={
                 "experiment_id": self.exp_id,
                 "outer_step_no": step_no,
@@ -564,6 +725,21 @@ class Engine:
         ) + 1e-9 >= float(
             inc_report.get("pass_rate") or 0.0
         )
+        if int(inc_report.get("attempts") or 0) > 0:
+            diversity_non_degrading = bool(
+                float(cand_report.get("mechanism_coverage") or 0.0) + 0.05
+                >= float(inc_report.get("mechanism_coverage") or 0.0)
+                and float(cand_report.get("mechanism_hhi") or 1.0)
+                <= float(inc_report.get("mechanism_hhi") or 1.0) + 0.05
+                and float(cand_report.get("structural_duplicate_rate") or 0.0)
+                <= float(inc_report.get("structural_duplicate_rate") or 0.0) + 0.05
+                and float(cand_report.get("behavior_duplicate_rate") or 0.0)
+                <= float(inc_report.get("behavior_duplicate_rate") or 0.0) + 0.05
+            )
+        else:
+            diversity_non_degrading = int(
+                cand_report.get("distinct_mechanisms") or 0
+            ) >= 3
         accepted = bool(
             len(cand_scores) == n_seeds
             and len(cand_scores) >= 2
@@ -571,6 +747,7 @@ class Engine:
             and p_value < p_threshold
             and gate_non_degrading
             and pass_rate_non_degrading
+            and diversity_non_degrading
         )
         comparison = compare_feedback_reports(cand_report, inc_report)
         outcome_reflection, reflection_source = await reflect_on_outcome(
@@ -615,6 +792,7 @@ class Engine:
                     "admission_safety": {
                         "gate_score_non_degrading": gate_non_degrading,
                         "pass_rate_non_degrading": pass_rate_non_degrading,
+                        "diversity_non_degrading": diversity_non_degrading,
                     },
                     "candidate_report": cand_report,
                     "incumbent_report": inc_report,
@@ -679,9 +857,16 @@ class Engine:
         # 固定种子确保可复现
         rng = random.Random(seed * 10000 + miner.id)
         session_start_node_id = await self._max_node_id()
+        campaign_expressions = (
+            await self._experiment_expressions()
+            if self._proposal_mode() == "random"
+            else set()
+        )
 
         for i in range(budget):
             if not self.running:
+                break
+            if await self._stop_if_evaluation_budget_reached():
                 break
             task = tasks[i % len(tasks)]
             self._set_phase(
@@ -703,11 +888,18 @@ class Engine:
                 (feedback_baseline or {}).get(task["name"], []),
                 session_nodes,
             )
+            market = self.task_config.get("market", "us")
+            target_family = self._target_family_for_attempt(
+                feedback_nodes,
+                market,
+                rng,
+            )
             base_node = max(
                 (
                     node
                     for node in feedback_nodes
                     if node.get("status") == "ok"
+                    and mechanism_from_item(node) == target_family
                 ),
                 key=lambda node: float(node.get("public_score") or 0.0),
                 default=None,
@@ -743,7 +935,45 @@ class Engine:
                     "budget_index": i + 1,
                 },
                 rng=rng,
+                target_family=target_family,
+                deliberate_random=self._proposal_mode() == "random",
             )
+            novelty_retries = 0
+            while (
+                source == "random"
+                and expr in campaign_expressions
+                and novelty_retries < 32
+            ):
+                novelty_retries += 1
+                expr, hypo, source, proposal_meta = await propose(
+                    template,
+                    "draft",
+                    task,
+                    feedback_nodes,
+                    provider,
+                    fields=get_dsl_fields(
+                        self.task_config.get("market")
+                    ),
+                    trace_context={
+                        "experiment_id": self.exp_id,
+                        "outer_step_no": step_no,
+                        "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                        "miner_version_id": miner.id,
+                        "task_name": task["name"],
+                        "seed": seed,
+                        "budget_index": i + 1,
+                        "campaign_novelty_retry": novelty_retries,
+                    },
+                    rng=rng,
+                    target_family=target_family,
+                    deliberate_random=self._proposal_mode() == "random",
+                )
+            proposal_meta = {
+                **(proposal_meta or {}),
+                "campaign_novelty_retries": novelty_retries,
+                "campaign_exact_duplicate": expr in campaign_expressions,
+            }
+            campaign_expressions.add(expr)
 
             node = Node(
                 experiment_id=self.exp_id,
@@ -776,6 +1006,10 @@ class Engine:
                     "discovery": metrics["discovery"],
                     "protocol_version": metrics["protocol_version"],
                     "evaluation_runtime": metrics.get("runtime") or {},
+                    "training_return_path_signature": combined_training_signature(
+                        metrics["public"],
+                        metrics["gate"],
+                    ),
                 }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["discovery"].get("score") or 0.0
@@ -847,36 +1081,49 @@ class Engine:
             session_envelopes.append(envelope)
 
             self.status["inner_evals"] = self.status.get("inner_evals", 0) + 1
+            self.status["candidate_evaluations"] = (
+                int(self.status.get("candidate_evaluations") or 0) + 1
+            )
             self._touch_progress(
                 current_operation="register_factor" if node.status == "ok" else "candidate_failed",
             )
             if node.status == "ok":
                 min_icir = float(template.get("min_public_icir", 0.25))
                 await self._maybe_register_factor_v2(node, min_icir)
+                if await self._stop_if_factor_target_reached():
+                    break
                 if i % 10 == 0:
                     await self.log(
                         f"[V2 s{seed}]  内层[{task['name']}] {op}/{source} "
                         f"learn={node.public_score:.3f} "
                         f"gate={float((node.public_metrics.get('discovery') or {}).get('gate_score') or 0.0):.3f} "
+                        f"family={target_family} "
                         f"dir={int((node.public_metrics.get('discovery') or {}).get('selected_direction') or task.get('direction', 1)):+d} "
                         f"{expr[:60]}",
                         "debug",
                     )
+            if await self._stop_if_evaluation_budget_reached():
+                break
 
-        scores = list(task_best_scores.values())
-        score = round(sum(scores) / len(scores), 4) if scores else 0.0
+        score, score_detail = diversity_adjusted_score(
+            task_best_scores,
+            session_envelopes,
+            self.task_config.get("market", "us"),
+        )
         summary = combine_seed_feedback([{
             "seed": seed,
             "score": score,
             "task_best_scores": task_best_scores,
             "envelopes": session_envelopes,
         }])
+        summary["session_score_detail"] = score_detail
         return {
             "seed": seed,
             "score": score,
             "task_best_scores": task_best_scores,
             "envelopes": session_envelopes,
             "summary": summary,
+            "score_detail": score_detail,
         }
 
     async def _maybe_register_factor_v2(self, node: Node, min_icir: float) -> None:
@@ -884,10 +1131,96 @@ class Engine:
         discovery = pm.get("discovery") or {}
         if not discovery.get("passed") or (pm.get("icir") or 0) < min_icir:
             return
+        market = self.task_config.get("market", "us")
+        semantic_audit = audit_expression_semantics(node.expression, market)
+        if semantic_audit["errors"]:
+            await self.log(
+                f"  因子未入库: 字段语义审计失败 · {semantic_audit['errors'][0][:180]}",
+                "warning",
+            )
+            return
         async with SessionLocal() as s:
             exists = await s.scalar(select(Factor).where(
                 Factor.expression == node.expression, Factor.experiment_id == self.exp_id))
             if exists:
+                return
+            existing_factors = list((await s.scalars(
+                select(Factor).where(Factor.experiment_id == self.exp_id)
+            )).all())
+            nearest_structural: tuple[float, Factor] | None = None
+            nearest_behavior: tuple[float, Factor] | None = None
+            candidate_signature = pm.get("training_return_path_signature") or {}
+            for existing_factor in existing_factors:
+                try:
+                    structural = expression_similarity(
+                        node.expression,
+                        existing_factor.expression,
+                    )
+                except (SyntaxError, ValueError):
+                    structural = 0.0
+                if nearest_structural is None or structural > nearest_structural[0]:
+                    nearest_structural = (structural, existing_factor)
+                if existing_factor.task_name != node.task_name:
+                    continue
+                correlation = return_path_correlation(
+                    candidate_signature,
+                    (existing_factor.public_metrics or {}).get(
+                        "training_return_path_signature"
+                    ),
+                )
+                if correlation is not None and (
+                    nearest_behavior is None or correlation > nearest_behavior[0]
+                ):
+                    nearest_behavior = (correlation, existing_factor)
+            admission = {
+                "protocol": "factor_diversity_admission_v1",
+                "accepted": True,
+                "mechanism_family": mechanism_from_item({
+                    "expression": node.expression,
+                    "hypothesis": node.hypothesis,
+                    "proposal_meta": node.proposal_meta,
+                }),
+                "max_structural_similarity": round(
+                    nearest_structural[0] if nearest_structural else 0.0,
+                    6,
+                ),
+                "max_return_path_correlation": round(
+                    nearest_behavior[0] if nearest_behavior else 0.0,
+                    6,
+                ),
+                "structural_threshold": 0.84,
+                "return_path_threshold": 0.85,
+                "semantic_audit": semantic_audit,
+            }
+            reason = ""
+            if nearest_structural and nearest_structural[0] >= 0.84:
+                reason = (
+                    "structural_duplicate_of_factor_"
+                    f"{nearest_structural[1].id}"
+                )
+            elif nearest_behavior and nearest_behavior[0] >= 0.85:
+                reason = (
+                    "return_path_duplicate_of_factor_"
+                    f"{nearest_behavior[1].id}"
+                )
+            if reason:
+                admission.update({"accepted": False, "reason": reason})
+                db_node = await s.get(Node, node.id)
+                db_node.proposal_meta = {
+                    **(db_node.proposal_meta or {}),
+                    "factor_admission": admission,
+                }
+                db_node.feedback_summary = {
+                    **(db_node.feedback_summary or {}),
+                    "factor_admission": admission,
+                }
+                await s.commit()
+                await self.log(
+                    f"  因子未入库: {reason} · "
+                    f"structure={admission['max_structural_similarity']:.3f} "
+                    f"return_corr={admission['max_return_path_correlation']:.3f}",
+                    "info",
+                )
                 return
             n = await s.scalar(
                 select(func.count(Factor.id)).where(Factor.experiment_id == self.exp_id)) or 0
@@ -923,10 +1256,16 @@ class Engine:
                             discovery.get("direction_selection") or {}
                         ).get("trials_multiplier", 1)
                     ),
+                    "mechanism_family": admission["mechanism_family"],
+                    "factor_admission": admission,
+                    "semantic_audit": semantic_audit,
+                    "training_return_path_signature": candidate_signature,
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
-                    "source": node.source, **expression_fingerprint(node.expression),
+                    "source": node.source,
+                    "mechanism_family": admission["mechanism_family"],
+                    **expression_fingerprint(node.expression),
                 },
             ))
             await s.commit()
@@ -1144,6 +1483,22 @@ class Engine:
             )
         return int(value or 0)
 
+    async def _experiment_expressions(self) -> set[str]:
+        """Return exact same-protocol expressions for random-campaign dedupe."""
+        async with SessionLocal() as session:
+            values = await session.scalars(
+                select(Node.expression).where(
+                    Node.experiment_id == self.exp_id,
+                    Node.evaluation_protocol
+                    == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+            return {
+                str(value).strip()
+                for value in values
+                if str(value or "").strip()
+            }
+
     async def _config_v2(self) -> dict:
         async with SessionLocal() as s:
             row = await s.get(Setting, "engine_config")
@@ -1324,6 +1679,7 @@ class Engine:
                     "miner_version_id": miner.id,
                     "task_name": task["name"],
                 },
+                deliberate_random=self._proposal_mode() == "random",
             )
 
             node = Node(
@@ -1586,6 +1942,11 @@ class Engine:
             ]
 
     async def _provider(self, role: str) -> dict | None:
+        # Random campaigns must remain isolated from global provider settings.
+        # Returning None activates the deterministic, mechanism-targeted local
+        # fallback for both the inner proposer and outer template proposer.
+        if self._proposal_mode() == "random":
+            return None
         async with SessionLocal() as s:
             row = await s.get(Setting, "llm_providers")
             if not row:

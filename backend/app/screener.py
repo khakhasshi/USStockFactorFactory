@@ -25,8 +25,11 @@ class _ScreenerCache:
         self._misses = 0
         self._puts = 0
         self._evictions = 0
+        self._clears = 0
+        self._cleared_entries = 0
         self._last_hit_at: float | None = None
         self._last_put_at: float | None = None
+        self._last_clear_at: float | None = None
 
     def get(self, key: str) -> dict | None:
         with self._lock:
@@ -49,6 +52,16 @@ class _ScreenerCache:
                 self._values.popitem(last=False)
                 self._evictions += 1
 
+    def clear(self) -> int:
+        """Invalidate every cached cross-section after a panel generation swap."""
+        with self._lock:
+            removed = len(self._values)
+            self._values.clear()
+            self._clears += 1
+            self._cleared_entries += removed
+            self._last_clear_at = time.time()
+            return removed
+
     def stats(self) -> dict:
         with self._lock:
             attempts = self._hits + self._misses
@@ -59,10 +72,13 @@ class _ScreenerCache:
                 "misses": self._misses,
                 "puts": self._puts,
                 "evictions": self._evictions,
+                "clears": self._clears,
+                "cleared_entries": self._cleared_entries,
                 "hit_rate": round(self._hits / max(1, attempts), 6),
                 "started_at_epoch": self._started_at,
                 "last_hit_at_epoch": self._last_hit_at,
                 "last_put_at_epoch": self._last_put_at,
+                "last_clear_at_epoch": self._last_clear_at,
             }
 
 

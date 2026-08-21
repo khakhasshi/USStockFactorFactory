@@ -958,6 +958,14 @@ def build_slo(snapshot: dict) -> dict:
         "0 failed",
         not panel_failures if required_panels else None,
     )
+    stale_panels = [panel for panel in required_panels if panel.get("stale")]
+    objective(
+        "panel_freshness",
+        "活动面板加载代际",
+        len(stale_panels),
+        "0 stale",
+        not stale_panels if required_panels else None,
+    )
     failed = sum(row["status"] == "fail" for row in objectives)
     no_data = sum(row["status"] == "no_data" for row in objectives)
     return {
@@ -1072,6 +1080,39 @@ def build_findings(snapshot: dict) -> list[dict]:
                     or f"缺少字段: {', '.join(missing or [])}"
                 ),
                 "检查面板 glob、Parquet schema、文件权限和剩余磁盘空间。",
+            )
+        if panel.get("required", True) and panel.get("stale"):
+            if panel.get("reload_state") == "reloading":
+                add(
+                    "info",
+                    "panel_hot_reload_in_progress",
+                    f"{panel.get('market', 'unknown')} 面板正在无停机重载",
+                    (
+                        f"当前仍服务 generation {panel.get('generation')} / "
+                        f"{panel.get('loaded_identity')}，源身份为 "
+                        f"{panel.get('source_identity')}"
+                    ),
+                    "等待后台构建完成；现有请求会继续使用旧的不可变面板。",
+                )
+            else:
+                add(
+                    "warning",
+                    "panel_source_stale",
+                    f"{panel.get('market', 'unknown')} 面板源文件已变化",
+                    (
+                        f"当前 generation {panel.get('generation')} / "
+                        f"{panel.get('loaded_identity')}，源身份为 "
+                        f"{panel.get('source_identity')}"
+                    ),
+                    "等待自动热重载，或调用 POST /api/panels/reload。",
+                )
+        if panel.get("required", True) and panel.get("reload_error"):
+            add(
+                "warning",
+                "panel_hot_reload_failed",
+                f"{panel.get('market', 'unknown')} 面板热重载未完成",
+                panel.get("reload_error"),
+                "旧 generation 仍在服务；检查写入是否完成和 Parquet 数据契约后重试。",
             )
 
     for worker in snapshot.get("workers") or []:

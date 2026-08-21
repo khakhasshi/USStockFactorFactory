@@ -1124,19 +1124,21 @@ const ObservabilityView = {
       <div>
         <div class="eyebrow">RUNTIME / DATA / DATABASE / WORKERS</div>
         <h1>工程诊断台</h1>
-        <p>面向排障的只读快照。请求体与密钥不采集；复制出的快照已经过后端脱敏。</p>
+        <p>面向排障的脱敏快照；活动面板支持双缓冲热重载，构建失败时继续服务旧代际。</p>
       </div>
       <div class="ops-actions">
         <span v-if="snapshot" class="ops-health" :class="'health-' + snapshot.health">
           ● {{ healthLabel(snapshot.health) }}
         </span>
         <button class="btn" @click="togglePause">{{ paused ? '继续自动刷新' : '暂停自动刷新' }}</button>
+        <button class="btn" @click="reloadActivePanel" :disabled="panelReloading || !canReloadPanel">{{ panelReloading ? '面板重载中…' : '热重载活动面板' }}</button>
         <button class="btn primary" @click="load(true)" :disabled="loading">{{ loading ? '刷新中…' : '深度刷新' }}</button>
         <button class="btn" @click="copySnapshot" :disabled="!snapshot">{{ copied || '复制脱敏快照' }}</button>
       </div>
     </div>
 
     <div v-if="error" class="selector-error">{{ error }}</div>
+    <div v-if="panelReloadMessage" class="selector-disclaimer"><span>ⓘ</span>{{ panelReloadMessage }}</div>
     <div v-if="!snapshot && loading" class="card ops-loading"><div class="loading-ring"></div>正在采集工程快照</div>
 
     <template v-if="snapshot">
@@ -1198,11 +1200,11 @@ const ObservabilityView = {
           <small>{{ snapshot.database.pool.checked_out }}/{{ snapshot.database.pool.capacity }} checked out · {{ pct(snapshot.database.pool.utilization) }}</small>
           <small>{{ snapshot.database.driver }} · {{ snapshot.database.pool.class }}</small>
         </article>
-        <article class="metric-card">
+        <article class="metric-card" :class="{danger:snapshot.data.reload_errors}">
           <span>数据面板</span>
           <b>{{ snapshot.data.loaded }}/{{ snapshot.data.instances }} loaded</b>
-          <small>{{ snapshot.data.errors }} error · {{ formatBytes(snapshot.data.estimated_size_bytes) }} memory</small>
-          <small>{{ totalPanelFiles }} files registered</small>
+          <small>{{ snapshot.data.stale || 0 }} stale · {{ snapshot.data.reloading || 0 }} reloading · {{ snapshot.data.reload_errors || 0 }} reload error</small>
+          <small>{{ totalPanelFiles }} files · {{ formatBytes(snapshot.data.estimated_size_bytes) }} memory</small>
         </article>
         <article class="metric-card">
           <span>计算缓存</span>
@@ -1254,11 +1256,11 @@ const ObservabilityView = {
             <table>
               <tr><th>市场 / ID</th><th>状态</th><th>文件</th><th>样本</th><th>加载</th></tr>
               <tr v-for="panel in snapshot.data.panels" :key="panel.id">
-                <td><span class="tag blue">{{ panel.market }}</span><div class="sub">{{ panel.identity || panel.id }}</div></td>
-                <td><span class="tag" :class="{green:panel.schema_status==='ok', red:panel.state==='error', amber:panel.state==='loading'}">{{ panel.state }} / {{ panel.schema_status }}</span><div v-if="panel.source_error || panel.load_error || panel.schema_error" class="bad-text ops-wrap">{{ panel.source_error || panel.load_error || panel.schema_error }}</div><div v-if="panel.missing_dsl_fields?.length" class="bad-text ops-wrap">missing DSL: {{ panel.missing_dsl_fields.join(', ') }}</div></td>
+                <td><span class="tag blue">{{ panel.market }}</span><div class="sub">source {{ panel.source_identity || panel.identity || panel.id }}</div><div class="sub">loaded {{ panel.loaded_identity || '—' }}</div></td>
+                <td><span class="tag" :class="{green:panel.state==='ready' && panel.schema_status==='ok', red:panel.state==='error' || panel.reload_error, amber:panel.state==='loading' || panel.state==='stale' || panel.state==='reloading'}">{{ panel.state }} / {{ panel.schema_status }}</span><div v-if="panel.source_error || panel.load_error || panel.schema_error || panel.reload_error" class="bad-text ops-wrap">{{ panel.source_error || panel.load_error || panel.schema_error || panel.reload_error }}</div><div v-if="panel.missing_dsl_fields?.length" class="bad-text ops-wrap">missing DSL: {{ panel.missing_dsl_fields.join(', ') }}</div></td>
                 <td>{{ panel.file_count }} · {{ formatBytes(panel.total_bytes) }}<div class="sub">{{ formatDate(panel.latest_mtime) }}</div></td>
                 <td>{{ panel.rows ?? '—' }} rows<div class="sub">{{ panel.securities ?? '—' }} securities · {{ panel.date_min || '—' }} → {{ panel.date_max || '—' }}</div></td>
-                <td>{{ panel.load_duration_ms == null ? '—' : n(panel.load_duration_ms,1)+' ms' }}<div class="sub">{{ panel.load_attempts }} attempt(s) · {{ panel.available_column_count ?? '—' }} cols</div></td>
+                <td>generation {{ panel.generation ?? 0 }}<div class="sub">load {{ panel.load_duration_ms == null ? '—' : n(panel.load_duration_ms,1)+' ms' }} · reload {{ panel.reload_duration_ms == null ? '—' : n(panel.reload_duration_ms,1)+' ms' }}</div><div class="sub">{{ panel.reload_count || 0 }} reload(s) · {{ panel.available_column_count ?? '—' }} cols</div></td>
               </tr>
             </table>
           </div>
@@ -1410,12 +1412,16 @@ const ObservabilityView = {
   setup() {
     const snapshot = ref(null), error = ref(""), loading = ref(false);
     const paused = ref(false), copied = ref("");
+    const panelReloading = ref(false), panelReloadMessage = ref("");
     let timer = null, active = false;
     const clientTelemetry = computed(() => ({
       cacheEntries: responseCache.size,
       inflightGets: inflightGets.size,
       generation: apiCacheGeneration,
     }));
+    const canReloadPanel = computed(() => Boolean(
+      snapshot.value && snapshot.value.active_task && snapshot.value.active_task.experiment_id
+    ));
     const totalPanelFiles = computed(() =>
       (snapshot.value?.data?.panels || []).reduce((sum, panel) => sum + Number(panel.file_count || 0), 0)
     );
@@ -1429,6 +1435,28 @@ const ObservabilityView = {
         error.value = `诊断快照加载失败：${e.message}`;
       } finally {
         loading.value = false;
+      }
+    }
+    async function reloadActivePanel() {
+      const experimentId = Number(snapshot.value?.active_task?.experiment_id);
+      if (!experimentId || panelReloading.value) return;
+      panelReloading.value = true; panelReloadMessage.value = ""; error.value = "";
+      try {
+        const response = await api("/panels/reload", {
+          method: "POST",
+          body: { experiment_id: experimentId, force: false },
+        });
+        const result = response.result || {};
+        panelReloadMessage.value = result.status === "reloaded"
+          ? `活动面板已切换到 generation ${result.generation}，最新交易日 ${result.date_max}；旧请求未中断。`
+          : result.status === "unchanged"
+            ? `活动面板已经是最新 generation ${result.generation}。`
+            : `面板重载状态：${result.status}；${result.error || '旧 generation 继续服务。'}`;
+        await load(true);
+      } catch (e) {
+        error.value = `活动面板热重载失败：${e.message}`;
+      } finally {
+        panelReloading.value = false;
       }
     }
     function startPolling() {
@@ -1501,16 +1529,341 @@ const ObservabilityView = {
     onDeactivated(stopPolling);
     onUnmounted(stopPolling);
     return {
-      snapshot, error, loading, paused, copied, clientTelemetry, totalPanelFiles,
-      load, togglePause, copySnapshot, n, pct, formatBytes, formatDuration,
+      snapshot, error, loading, paused, copied, panelReloading,
+      panelReloadMessage, canReloadPanel, clientTelemetry, totalPanelFiles,
+      load, reloadActivePanel, togglePause, copySnapshot, n, pct, formatBytes, formatDuration,
       age, formatDate, healthLabel, sloValue, entries, pretty,
+    };
+  },
+};
+
+/* ============ 榜单版本中心 ============ */
+const LeaderboardsView = {
+  template: `
+  <section class="leaderboards-page" data-testid="leaderboards-page">
+    <div class="leaderboards-heading">
+      <div>
+        <div class="eyebrow">IMMUTABLE REPORT CATALOG / PROTOCOL-AWARE NAVIGATION</div>
+        <h1>因子榜单版本中心</h1>
+        <p>统一查看 A股、美股纯多与美股多空的历史榜和全区间榜；每个入口都保留原始协议、数据窗口与审计边界。</p>
+      </div>
+      <div class="leaderboards-heading-actions">
+        <span class="tag amber">研究用途 · 非实盘批准</span>
+        <button class="btn" @click="load(true)" :disabled="loading">{{ loading ? '扫描中…' : '重新扫描' }}</button>
+      </div>
+    </div>
+
+    <div class="leaderboard-guide-grid">
+      <article v-for="item in catalog.guidance || []" :key="item.title" class="leaderboard-guide-card">
+        <span>{{ item.title }}</span>
+        <p>{{ item.text }}</p>
+      </article>
+    </div>
+
+    <div class="leaderboard-summary-strip">
+      <div><b>{{ catalog.summary?.logical_versions ?? '—' }}</b><span>逻辑版本</span></div>
+      <div><b>{{ catalog.summary?.complete_versions ?? '—' }}</b><span>完整完成</span></div>
+      <div><b>{{ catalog.summary?.archive_copies ?? '—' }}</b><span>归档副本</span></div>
+      <div><b>{{ filteredReports.length }}</b><span>当前筛选</span></div>
+    </div>
+
+    <div class="leaderboard-toolbar card">
+      <div class="leaderboard-filter-group" aria-label="市场筛选">
+        <span>市场</span>
+        <button v-for="item in marketFilters" :key="item.id" :class="{active: marketFilter===item.id}" @click="marketFilter=item.id">{{ item.label }}</button>
+      </div>
+      <div class="leaderboard-filter-group" aria-label="模式筛选">
+        <span>组合</span>
+        <button v-for="item in modeFilters" :key="item.id" :class="{active: modeFilter===item.id}" @click="modeFilter=item.id">{{ item.label }}</button>
+      </div>
+      <div class="leaderboard-filter-group" aria-label="版本筛选">
+        <span>口径</span>
+        <button v-for="item in kindFilters" :key="item.id" :class="{active: kindFilter===item.id}" @click="kindFilter=item.id">{{ item.label }}</button>
+      </div>
+      <input v-model.trim="query" class="leaderboard-search" type="search" placeholder="搜索市场、协议、目录或版本…" aria-label="搜索榜单版本" />
+    </div>
+
+    <div v-if="error" class="selector-error">榜单目录加载失败：{{ error }}</div>
+    <div v-if="loading && !catalog.reports?.length" class="leaderboard-loading card"><div class="loading-ring"></div><span>正在读取不可变报告与协议元数据…</span></div>
+    <div v-else-if="!filteredReports.length" class="leaderboard-loading card"><span>没有符合当前筛选条件的榜单版本。</span></div>
+
+    <div v-else class="leaderboard-workbench">
+      <aside class="leaderboard-version-rail" aria-label="榜单版本列表">
+        <button v-for="report in filteredReports" :key="report.id"
+          class="leaderboard-version-card" :class="{active:selected?.id===report.id}"
+          :data-report-id="report.id" @click="selectReport(report)">
+          <div class="leaderboard-version-topline">
+            <span class="leaderboard-market" :class="report.market">{{ report.market_label }}</span>
+            <span>{{ report.mode_label }}</span>
+            <i v-if="report.is_latest_for_scope">该模式最新</i>
+          </div>
+          <strong>{{ report.protocol_label }}</strong>
+          <small>{{ windowLabel(report) }}</small>
+          <div class="leaderboard-version-meta">
+            <span>{{ report.result_count.toLocaleString() }} 方向/结果</span>
+            <span>{{ formatDate(report.generated_at) }}</span>
+          </div>
+          <div class="leaderboard-version-flags">
+            <em :class="report.status==='complete' ? 'ok' : 'warn'">{{ statusLabel(report) }}</em>
+            <em>{{ report.screening_only ? '全样本诊断' : '冻结方向' }}</em>
+            <em v-if="report.archive_copy_count">归档 ×{{ report.archive_copy_count }}</em>
+          </div>
+        </button>
+      </aside>
+
+      <main v-if="selected" class="leaderboard-viewer card" data-testid="leaderboard-viewer">
+        <div class="leaderboard-viewer-head">
+          <div>
+            <div class="eyebrow">{{ selected.protocol }}</div>
+            <h2>{{ selected.title }}</h2>
+            <p>{{ selected.description }}</p>
+          </div>
+          <a class="btn-link primary" :href="viewerUrl" target="_blank" rel="noopener">独立打开 ↗</a>
+        </div>
+
+        <div class="leaderboard-boundary" :class="selected.screening_only ? 'diagnostic' : 'holdout'">
+          <b>{{ selected.screening_only ? '全样本诊断边界' : '样本外 / Vault 边界' }}</b>
+          <span v-if="selected.screening_only">全区间参与排名，不是独立样本外；请结合事件复核与旧版 Vault 阅读。</span>
+          <span v-else>榜单期与 Vault 分层，Vault 不参与排序；底层仍为 NON-PIT 研究数据。</span>
+        </div>
+
+        <div class="leaderboard-facts">
+          <div><span>排名窗口</span><b>{{ windowLabel(selected) }}</b></div>
+          <div><span>数据截止</span><b>{{ selected.data_end || '—' }}</b></div>
+          <div><span>方向策略</span><b>{{ directionLabel(selected.direction_policy) }}</b></div>
+          <div><span>复核层</span><b>{{ selected.has_vault ? 'Vault + 事件账本' : selected.has_event_replay ? '事件账本' : '报告内审计' }}</b></div>
+          <div><span>政策标签</span><b>{{ selected.policy_label }}</b></div>
+        </div>
+
+        <nav class="leaderboard-jumpbar" aria-label="报告快速跳转">
+          <span>快速跳转</span>
+          <button v-for="link in selected.quick_links" :key="link.id" :class="{active:anchor===link.id}" @click="anchor=link.id">{{ link.label }}</button>
+          <i>点击报告中的因子行查看经济机制与公式</i>
+        </nav>
+        <iframe ref="leaderboardFrame" class="leaderboard-frame" :key="selected.id + ':' + anchor" :src="viewerUrl"
+          @load="bindLeaderboardFrame"
+          :title="selected.title" loading="lazy"></iframe>
+      </main>
+    </div>
+
+    <div v-if="factorDetail.open" class="leaderboard-detail-backdrop" @click.self="closeFactorDetail">
+      <aside class="leaderboard-detail-card" role="dialog" aria-modal="true" aria-label="榜单因子详情">
+        <header class="leaderboard-detail-head">
+          <div>
+            <div class="eyebrow">FROZEN REPORT FACTOR / STRUCTURAL INTERPRETATION</div>
+            <h2 v-if="factorDetail.data">#{{ factorDetail.data.metrics?.overall_rank ?? '—' }} · {{ factorDetail.data.identity.expression_hash }}</h2>
+            <h2 v-else>正在读取榜单快照…</h2>
+            <p>{{ selected?.title }}</p>
+          </div>
+          <button class="btn leaderboard-detail-close" type="button" aria-label="关闭因子详情" @click="closeFactorDetail">×</button>
+        </header>
+
+        <div v-if="factorDetail.loading" class="leaderboard-detail-loading"><div class="loading-ring"></div><span>读取不可变榜单行并生成结构解释…</span></div>
+        <div v-else-if="factorDetail.error" class="selector-error">详情加载失败：{{ factorDetail.error }}</div>
+        <template v-else-if="factorDetail.data">
+          <section class="leaderboard-detail-section">
+            <div class="leaderboard-detail-section-title"><h3>公式与冻结方向</h3><span>{{ factorDirectionLabel(factorDetail.data) }}</span></div>
+            <div ref="leaderboardLatexEl" class="leaderboard-detail-latex" data-testid="leaderboard-factor-latex"></div>
+            <code class="leaderboard-detail-dsl">{{ factorDetail.data.expression }}</code>
+            <p class="leaderboard-direction-note">{{ factorDetail.data.economics.direction_interpretation }}</p>
+          </section>
+
+          <section class="leaderboard-detail-section">
+            <div class="leaderboard-detail-section-title"><h3>可能的经济学含义</h3><span class="tag blue">{{ factorDetail.data.economics.mechanism_label }}</span></div>
+            <div class="leaderboard-economics-hero">
+              <span>可能收益来源</span>
+              <strong>{{ factorDetail.data.economics.possible_return_source }}</strong>
+              <p>{{ factorDetail.data.economics.rationale }}</p>
+            </div>
+            <div class="leaderboard-disclaimer">{{ factorDetail.data.economics.disclaimer }}</div>
+          </section>
+
+          <section class="leaderboard-detail-section">
+            <div class="leaderboard-detail-section-title"><h3>该榜单快照中的证据</h3><span>{{ factorDetail.data.report.screening_only ? '全窗口诊断' : '冻结样本外口径' }}</span></div>
+            <div class="leaderboard-detail-metrics">
+              <div><span>15bps {{ factorDetail.data.metrics?.portfolio_metric_basis === 'active' ? '主动' : '净' }}年化</span><b>{{ factorPct(factorDetail.data.metrics?.ranking_ann_return_bps_15) }}</b></div>
+              <div><span>15bps {{ factorDetail.data.metrics?.portfolio_metric_basis === 'active' ? '主动' : '净' }} Sharpe</span><b>{{ factorNum(factorDetail.data.metrics?.ranking_sharpe_bps_15) }}</b></div>
+              <div><span>IC / ICIR</span><b>{{ factorNum(factorDetail.data.metrics?.oos_ic_mean, 4) }} / {{ factorNum(factorDetail.data.metrics?.oos_icir) }}</b></div>
+              <div><span>RankIC / IR</span><b>{{ factorNum(factorDetail.data.metrics?.oos_rank_ic_mean, 4) }} / {{ factorNum(factorDetail.data.metrics?.oos_rank_icir) }}</b></div>
+            </div>
+            <div class="leaderboard-structure-tags">
+              <span>字段 {{ factorDetail.data.fields.join(', ') || '—' }}</span>
+              <span>算子 {{ factorDetail.data.operators.join(', ') || '—' }}</span>
+              <span>历史 {{ factorDetail.data.required_history ?? '—' }} 日</span>
+              <span>复杂度 {{ factorDetail.data.complexity ?? '—' }}</span>
+            </div>
+          </section>
+
+          <section class="leaderboard-detail-section risk">
+            <div class="leaderboard-detail-section-title"><h3>主要失效条件与实盘风险</h3><span>必须单独验证</span></div>
+            <ul><li v-for="warning in factorDetail.data.economics.failure_modes" :key="warning">{{ warning }}</li></ul>
+          </section>
+        </template>
+      </aside>
+    </div>
+  </section>`,
+  setup() {
+    const catalog = ref({ reports: [], guidance: [], summary: {} });
+    const selected = ref(null);
+    const loading = ref(false), error = ref("");
+    const marketFilter = ref("all"), modeFilter = ref("all"), kindFilter = ref("all");
+    const query = ref("");
+    const anchor = ref("overview");
+    const leaderboardFrame = ref(null), leaderboardLatexEl = ref(null);
+    const factorDetail = reactive({ open:false, loading:false, error:"", data:null, reportId:"", hash:"" });
+    const marketFilters = [
+      { id: "all", label: "全部" }, { id: "ashare", label: "A股" }, { id: "us", label: "美股" },
+    ];
+    const modeFilters = [
+      { id: "all", label: "全部" }, { id: "long_only", label: "纯多" }, { id: "long_short", label: "多空" },
+    ];
+    const kindFilters = [
+      { id: "all", label: "全部" }, { id: "holdout_event", label: "样本外事件榜" }, { id: "full_window_vector", label: "全区间双向榜" },
+    ];
+    const filteredReports = computed(() => {
+      const needle = query.value.toLowerCase();
+      return (catalog.value.reports || []).filter((report) => {
+        if (marketFilter.value !== "all" && report.market !== marketFilter.value) return false;
+        if (modeFilter.value !== "all" && report.mode !== modeFilter.value) return false;
+        if (kindFilter.value !== "all" && report.version_kind !== kindFilter.value) return false;
+        if (!needle) return true;
+        return [report.title, report.protocol, report.directory_name, report.generated_at]
+          .some((value) => String(value || "").toLowerCase().includes(needle));
+      });
+    });
+    const viewerUrl = computed(() => selected.value ? `${selected.value.file_url}#${anchor.value}` : "");
+    async function load(force = false) {
+      if (loading.value) return;
+      loading.value = true;
+      error.value = "";
+      try {
+        const suffix = force ? `?refresh=${Date.now()}` : "";
+        catalog.value = await api("/leaderboards" + suffix, { cacheTtl: force ? 0 : 3000 });
+        const saved = localStorage.getItem("factorfactory.leaderboard");
+        selected.value = catalog.value.reports.find((report) => report.id === saved)
+          || catalog.value.reports[0]
+          || null;
+      } catch (e) { error.value = e.message; }
+      finally { loading.value = false; }
+    }
+    function selectReport(report) {
+      closeFactorDetail();
+      selected.value = report;
+      anchor.value = "overview";
+      localStorage.setItem("factorfactory.leaderboard", report.id);
+    }
+    function windowLabel(report) {
+      const window = report?.ranking_window || {};
+      return window.start && window.end ? `${window.start} → ${window.end}` : "窗口未标记";
+    }
+    function formatDate(value) {
+      if (!value) return "—";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+    }
+    function statusLabel(report) {
+      return report.status === "complete" ? "完成" : report.status === "completed_with_gaps" ? "完成但有缺口" : "未完成";
+    }
+    function directionLabel(value) {
+      return ({ disabled_both_directions_forced: "正反双向强制", train_frozen: "训练期冻结方向" })[value] || value || "—";
+    }
+    async function renderLeaderboardLatex() {
+      await nextTick();
+      const detail = factorDetail.data;
+      const target = leaderboardLatexEl.value;
+      if (!detail || !target) return;
+      if (window.katex?.render) {
+        window.katex.render(detail.latex || detail.expression, target, {
+          throwOnError:false, strict:"warn", trust:false, displayMode:true,
+        });
+      } else {
+        target.textContent = detail.latex || detail.expression;
+        target.classList.add("latex-fallback");
+      }
+    }
+    async function openLeaderboardFactor(hash) {
+      const report = selected.value;
+      if (!report || !hash) return;
+      Object.assign(factorDetail, { open:true, loading:true, error:"", data:null, reportId:report.id, hash });
+      try {
+        const detail = await api(`/leaderboards/${encodeURIComponent(report.id)}/factors/${encodeURIComponent(hash)}`, { cacheTtl:30000 });
+        if (factorDetail.reportId !== report.id || factorDetail.hash !== hash) return;
+        factorDetail.data = detail;
+        factorDetail.loading = false;
+        await renderLeaderboardLatex();
+      } catch (e) {
+        if (factorDetail.reportId === report.id && factorDetail.hash === hash) factorDetail.error = e.message;
+      } finally {
+        if (factorDetail.reportId === report.id && factorDetail.hash === hash) factorDetail.loading = false;
+      }
+    }
+    function bindLeaderboardFrame() {
+      const frame = leaderboardFrame.value;
+      try {
+        const document = frame?.contentDocument;
+        if (!document) return;
+        if (frame.__factorClickDocument && frame.__factorClickHandler) {
+          frame.__factorClickDocument.removeEventListener("click", frame.__factorClickHandler, true);
+        }
+        const handler = (event) => {
+          const target = typeof event.target?.closest === "function" ? event.target.closest("[data-hash]") : null;
+          const hash = target?.dataset?.hash;
+          if (!hash) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          openLeaderboardFactor(hash);
+        };
+        document.addEventListener("click", handler, true);
+        frame.__factorClickDocument = document;
+        frame.__factorClickHandler = handler;
+      } catch (e) {
+        console.warn("leaderboard factor bridge unavailable", e);
+      }
+    }
+    function closeFactorDetail() {
+      factorDetail.open = false;
+      factorDetail.loading = false;
+      factorDetail.error = "";
+      factorDetail.data = null;
+      factorDetail.reportId = "";
+      factorDetail.hash = "";
+    }
+    function factorNum(value, digits = 2) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(digits) : "—";
+    }
+    function factorPct(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? `${(number * 100).toFixed(2)}%` : "—";
+    }
+    function factorDirectionLabel(detail) {
+      const side = Number(detail?.direction || 1) > 0 ? "+1 · 高值端" : "−1 · 低值端";
+      const mode = detail?.report?.portfolio_mode === "long_short" ? "多头 / 空头" : "纯多入选";
+      return `${side} ${mode}`;
+    }
+    watch(filteredReports, (reports) => {
+      if (reports.length && !reports.some((report) => report.id === selected.value?.id)) selectReport(reports[0]);
+    });
+    onMounted(load);
+    onUnmounted(() => {
+      const frame = leaderboardFrame.value;
+      if (frame?.__factorClickDocument && frame?.__factorClickHandler) {
+        frame.__factorClickDocument.removeEventListener("click", frame.__factorClickHandler, true);
+      }
+    });
+    return {
+      catalog, selected, loading, error, marketFilter, modeFilter, kindFilter, query, anchor,
+      leaderboardFrame, leaderboardLatexEl, factorDetail,
+      marketFilters, modeFilters, kindFilters, filteredReports, viewerUrl,
+      load, selectReport, windowLabel, formatDate, statusLabel, directionLabel,
+      bindLeaderboardFrame, closeFactorDetail, factorNum, factorPct, factorDirectionLabel,
     };
   },
 };
 
 /* ============ App ============ */
 const App = {
-  components: { Dashboard, ResearchTree, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView, ObservabilityView },
+  components: { Dashboard, ResearchTree, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView, ObservabilityView, LeaderboardsView },
   template: `
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
@@ -1526,9 +1879,9 @@ const App = {
     </select>
     <span class="state-badge" :class="engState==='running' ? 'state-running' : 'state-stopped'">● {{ engState }}</span>
   </div>
-  <div class="main">
+  <div class="main" :class="{'main-report-view': tab==='leaderboards'}">
     <div v-if="appState.switching" class="task-switch-overlay"><div class="loading-ring"></div><span>正在切换任务上下文</span></div>
-    <KeepAlive :max="8"><component :is="activeComponent" :key="tab" /></KeepAlive>
+    <KeepAlive :max="9"><component :is="activeComponent" :key="tab" /></KeepAlive>
   </div>`,
   setup() {
     const savedTab = localStorage.getItem("factorfactory.tab");
@@ -1536,7 +1889,7 @@ const App = {
     appState.activeTab = tab.value;
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
-      { id: "factors", label: "因子库" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
+      { id: "factors", label: "因子库" }, { id: "leaderboards", label: "榜单" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
       { id: "exps", label: "实验" }, { id: "diagnostics", label: "诊断" }, { id: "settings", label: "设置" },
     ];
     const engState = ref("…");
@@ -1545,7 +1898,7 @@ const App = {
     let timer = null, polling = false;
     const activeComponent = computed(() => ({
       dash: Dashboard, tree: ResearchTree, factors: FactorLibraryWorkbench,
-      screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
+      leaderboards: LeaderboardsView, screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
       diagnostics: ObservabilityView, settings: SettingsView,
     })[tab.value] || Dashboard);
     async function poll() {
@@ -1708,10 +2061,39 @@ const ScreenerView = {
             </div>
           </div>
           <div class="card result-table-card">
-            <div class="panel-title-row"><div><h2>候选清单</h2><span class="sub">点击股票查看每个因子的原值、截面名次与分数贡献</span></div><span class="tag">{{ result.date }} · 历史起点 {{ result.history_start }}</span></div>
-            <table class="result-table"><thead><tr><th>榜内名次</th><th>榜单</th><th>头部名次</th><th>尾部名次</th><th>证券</th><th>名称</th><th>原始收盘</th><th>成交额</th><th>综合分</th><th>极端程度</th></tr></thead>
-              <tbody><tr v-for="s in result.stocks" :key="s.side + ':' + s.ts_code" class="clickable" :class="{'top-pick':s.side_rank<=10,'selected-stock':selectedStock?.ts_code===s.ts_code}" @click="selectedStock=s"><td><span class="rank-number">{{ String(s.side_rank).padStart(2,"0") }}</span></td><td><span class="tag" :class="s.side==='top'?'green':'red'">{{ s.side==='top'?'头部':'尾部' }}</span></td><td>{{ s.head_rank }}</td><td>{{ s.tail_rank }}</td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td>{{ formatPrice(s.raw_close) }}</td><td>{{ compactAmount(s.amount) }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
+            <div class="panel-title-row candidate-heading"><div><h2>候选清单</h2><span class="sub">勾选任意 N 只股票计算购买比例；点击行查看因子归因</span></div><div class="candidate-actions"><span class="count-badge">已选 {{ selectedStockCount }}</span><button class="text-btn" @click="quickSelectStocks(5)">前 5</button><button class="text-btn" @click="quickSelectStocks(10)">前 10</button><button class="text-btn" @click="selectAllStocks">全选</button><button class="text-btn" @click="clearStockSelection">清空</button><span class="tag">{{ result.date }} · 历史起点 {{ result.history_start }}</span></div></div>
+            <table class="result-table"><thead><tr><th class="stock-check-column">配权</th><th>榜内名次</th><th>榜单</th><th>头部名次</th><th>尾部名次</th><th>证券</th><th>名称</th><th>原始收盘</th><th>成交额</th><th>综合分</th><th>极端程度</th></tr></thead>
+              <tbody><tr v-for="s in result.stocks" :key="s.side + ':' + s.ts_code" class="clickable" :class="{'top-pick':s.side_rank<=10,'selected-stock':selectedStock?.ts_code===s.ts_code,'portfolio-selected':isStockSelected(s.ts_code)}" @click="selectedStock=s"><td class="stock-check-column"><input type="checkbox" :checked="isStockSelected(s.ts_code)" :aria-label="'选择 ' + s.ts_code + ' 参与配权'" @click.stop @change.stop="toggleStockSelection(s.ts_code, $event.target.checked)" /></td><td><span class="rank-number">{{ String(s.side_rank).padStart(2,"0") }}</span></td><td><span class="tag" :class="s.side==='top'?'green':'red'">{{ s.side==='top'?'头部':'尾部' }}</span></td><td>{{ s.head_rank }}</td><td>{{ s.tail_rank }}</td><td><code class="ticker">{{ s.ts_code }}</code></td><td>{{ s.name || "—" }}</td><td>{{ formatPrice(s.raw_close) }}</td><td>{{ compactAmount(s.amount) }}</td><td><b>{{ formatScore(s.score) }}</b></td><td><span class="rank-bar"><i :style="{ width: rankWidth(s) }"></i></span></td></tr></tbody>
             </table>
+          </div>
+          <div class="card allocation-card" data-testid="screener-allocation">
+            <div class="panel-title-row">
+              <div><div class="eyebrow">ROBUST LONG-ONLY SIZING</div><h2>组合配权</h2><span class="sub">排名表达偏好，历史波动与相关性决定资本权重；只使用截面日及以前的数据。</span></div>
+              <span class="tag blue">绑定记录 #{{ result.run_id }}</span>
+            </div>
+            <div class="allocation-controls">
+              <label><span>配权模型</span><select v-model="allocationMethod"><option value="robust_risk_budget">稳健风险预算（推荐）</option><option value="inverse_volatility">逆波动率</option><option value="equal_weight">等权基准</option></select></label>
+              <label><span>风险窗口</span><select v-model.number="allocationLookback"><option :value="60">60 日</option><option :value="120">120 日</option><option :value="252">252 日</option></select></label>
+              <label><span>单股上限</span><select v-model.number="allocationMaxWeight"><option :value="20">20%</option><option :value="25">25%</option><option :value="35">35%</option><option :value="50">50%</option><option :value="100">不限制</option></select></label>
+              <label><span>排名倾斜</span><select v-model.number="allocationScoreTilt" :disabled="allocationMethod==='equal_weight'"><option :value="0">0 · 不倾斜</option><option :value="0.2">0.20 · 轻微</option><option :value="0.35">0.35 · 稳健</option><option :value="0.6">0.60 · 较强</option></select></label>
+              <button class="btn primary" data-testid="screener-allocation-run" @click="calculateAllocation" :disabled="allocationLoading || !selectedStockCount || !result.run_id">{{ allocationLoading ? '计算中…' : '计算购买比例' }}</button>
+            </div>
+            <div v-if="allocationError" class="selector-error allocation-error">{{ allocationError }}</div>
+            <div v-if="!selectedStockCount" class="allocation-empty">先在候选清单中勾选任意 N 只股票。</div>
+            <div v-else-if="!allocation && !allocationLoading" class="allocation-empty">已选择 {{ selectedStockCount }} 只股票，点击“计算购买比例”生成可审计的配权结果。</div>
+            <div v-if="allocationLoading" class="allocation-empty">正在估计截至 {{ result.date }} 的稳健协方差并求解风险预算…</div>
+            <template v-if="allocation && !allocationLoading">
+              <div class="metric-strip allocation-metrics">
+                <div class="metric-card"><span>选中股票</span><b>{{ allocation.selection_count }}</b><small>任意勾选集合</small></div>
+                <div class="metric-card accent"><span>组合预估年化波动</span><b>{{ formatPercent(allocation.diagnostics.portfolio_annualised_volatility) }}</b><small>等权 {{ formatPercent(allocation.diagnostics.equal_weight_annualised_volatility) }}</small></div>
+                <div class="metric-card"><span>有效持仓数</span><b>{{ Number(allocation.diagnostics.effective_holdings).toFixed(2) }}</b><small>1 / Σw²</small></div>
+                <div class="metric-card"><span>分散化比率</span><b>{{ Number(allocation.diagnostics.diversification_ratio).toFixed(2) }}</b><small>越高表示风险分散越充分</small></div>
+                <div class="metric-card"><span>平均相关性</span><b>{{ Number(allocation.diagnostics.average_correlation).toFixed(2) }}</b><small>{{ allocation.diagnostics.observations }} 个共同样本</small></div>
+              </div>
+              <div class="allocation-meta"><span>{{ allocationMethodLabel(allocation.method) }}</span><span>样本 {{ allocation.diagnostics.sample_start }} → {{ allocation.diagnostics.sample_end }}</span><span>收缩强度 {{ Number(allocation.parameters.covariance_shrinkage).toFixed(2) }}</span><span>单股有效上限 {{ formatPercent(allocation.parameters.effective_max_weight) }}</span><span v-if="allocation.panel_changed" class="amber-text">面板版本已变化</span></div>
+              <div class="allocation-table-wrap"><table class="allocation-table"><thead><tr><th>证券</th><th>榜单 / 名次</th><th>购买比例</th><th>风险贡献</th><th>目标风险预算</th><th>个股年化波动</th><th>配权强度</th></tr></thead><tbody><tr v-for="row in allocation.allocations" :key="row.ts_code"><td><code class="ticker">{{ row.ts_code }}</code><small>{{ row.name || '—' }}</small></td><td><span class="tag" :class="row.side==='top'?'green':'red'">{{ row.side==='top'?'头部':'尾部' }} #{{ row.side_rank }}</span></td><td><b class="allocation-weight">{{ formatPercent(row.purchase_weight, 2) }}</b></td><td>{{ formatPercent(row.risk_contribution, 2) }}</td><td>{{ formatPercent(row.target_risk_budget, 2) }}</td><td>{{ formatPercent(row.annualised_volatility, 1) }}</td><td><span class="weight-bar"><i :style="{width:formatPercent(row.purchase_weight)}"></i></span></td></tr></tbody></table></div>
+              <div class="allocation-warnings"><b>使用边界</b><ul><li v-for="warning in allocation.warnings" :key="warning">{{ warning }}</li></ul></div>
+            </template>
           </div>
           <div class="card contribution-card" v-if="selectedStock">
             <div class="panel-title-row"><div><h2>{{ selectedStock.ts_code }} · 排名归因</h2><span class="sub">{{ selectedStock.name }} · 综合分 {{ formatScore(selectedStock.score) }}</span></div><button class="btn" @click="selectedStock=null">关闭</button></div>
@@ -1768,6 +2150,15 @@ const ScreenerView = {
     const outputDirection = ref("top");
     const result = ref(null); const error = ref(""); const loading = ref(false);
     const selectedStock = ref(null);
+    const selectedStockSymbols = ref([]);
+    const allocation = ref(null);
+    const allocationLoading = ref(false);
+    const allocationError = ref("");
+    const allocationMethod = ref("robust_risk_budget");
+    const allocationLookback = ref(120);
+    const allocationMaxWeight = ref(35);
+    const allocationScoreTilt = ref(0.35);
+    let allocationRequestVersion = 0;
     const historyRuns = ref([]);
     const historyTotal = ref(0);
     const historyLoading = ref(false);
@@ -1776,6 +2167,7 @@ const ScreenerView = {
     const openingRunId = ref(null);
     let loadedExperimentVersion = -1;
     const enabledCount = computed(() => factors.value.filter(f=>f.enabled).length);
+    const selectedStockCount = computed(() => selectedStockSymbols.value.length);
     const canRun = computed(() => Boolean(directExpr.value.trim()) || enabledCount.value > 0);
     const totalWeight = computed(() => factors.value.filter(f=>f.enabled).reduce((sum, f) => sum + (Number(f.weight) || 0), 0));
     const topScore = computed(() => {
@@ -1803,6 +2195,10 @@ const ScreenerView = {
       });
     });
     function formatScore(value) { return value == null ? "—" : Number(value).toFixed(2); }
+    function formatPercent(value, digits=1) {
+      const number = Number(value);
+      return Number.isFinite(number) ? `${(number * 100).toFixed(digits)}%` : "—";
+    }
     function formatPrice(value) {
       if (value == null || !Number.isFinite(Number(value))) return "—";
       return Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
@@ -1843,6 +2239,34 @@ const ScreenerView = {
       return (runRow.factor_preview || [])
         .map(row => `${row.direction === -1 ? "-1" : "+1"} × ${row.weight} · ${row.expression}`)
         .join("\n");
+    }
+    function allocationMethodLabel(value) {
+      if (value === "inverse_volatility") return "逆波动率";
+      if (value === "equal_weight") return "等权基准";
+      return "稳健风险预算";
+    }
+    function resetAllocation() {
+      allocationRequestVersion += 1;
+      allocation.value = null;
+      allocationError.value = "";
+      allocationLoading.value = false;
+    }
+    function isStockSelected(symbol) {
+      return selectedStockSymbols.value.includes(symbol);
+    }
+    function toggleStockSelection(symbol, checked) {
+      const next = new Set(selectedStockSymbols.value);
+      if (checked) next.add(symbol); else next.delete(symbol);
+      selectedStockSymbols.value = [...next];
+    }
+    function quickSelectStocks(count) {
+      selectedStockSymbols.value = (result.value?.stocks || []).slice(0, count).map(row => row.ts_code);
+    }
+    function selectAllStocks() {
+      selectedStockSymbols.value = (result.value?.stocks || []).map(row => row.ts_code);
+    }
+    function clearStockSelection() {
+      selectedStockSymbols.value = [];
     }
 
     async function loadFactors() {
@@ -1923,7 +2347,7 @@ const ScreenerView = {
       if (!enabled.length && !directExpr.value.trim()) { error.value="请至少选择一个因子或输入 DSL 表达式"; return; }
       const requestedVersion = appState.experimentVersion;
       const experimentId = Number(appState.experimentId) || undefined;
-      loading.value=true; error.value=""; result.value=null; selectedStock.value=null;
+      loading.value=true; error.value=""; result.value=null; selectedStock.value=null; selectedStockSymbols.value=[]; resetAllocation();
       try {
         const r = await api("/screener", { method:"POST", body:{
           experiment_id: experimentId,
@@ -1943,6 +2367,42 @@ const ScreenerView = {
       }
       finally {
         if (requestedVersion === appState.experimentVersion) loading.value=false;
+      }
+    }
+
+    async function calculateAllocation() {
+      if (!selectedStockSymbols.value.length) {
+        allocationError.value = "请至少勾选一只股票";
+        return;
+      }
+      if (!result.value?.run_id) {
+        allocationError.value = "当前结果没有不可变记录 ID，请重新执行选股";
+        return;
+      }
+      const requestedVersion = appState.experimentVersion;
+      const requestVersion = ++allocationRequestVersion;
+      const experimentId = Number(appState.experimentId) || undefined;
+      allocationLoading.value = true;
+      allocationError.value = "";
+      allocation.value = null;
+      try {
+        const response = await api("/screener/allocate", { method: "POST", body: {
+          experiment_id: experimentId,
+          run_id: result.value.run_id,
+          symbols: selectedStockSymbols.value,
+          method: allocationMethod.value,
+          lookback: allocationLookback.value,
+          max_weight: Number(allocationMaxWeight.value) / 100,
+          score_tilt: allocationMethod.value === "equal_weight" ? 0 : allocationScoreTilt.value,
+        }});
+        if (requestedVersion !== appState.experimentVersion || requestVersion !== allocationRequestVersion) return;
+        allocation.value = response;
+      } catch (e) {
+        if (requestedVersion === appState.experimentVersion && requestVersion === allocationRequestVersion) {
+          allocationError.value = `配权失败: ${e.message}`;
+        }
+      } finally {
+        if (requestedVersion === appState.experimentVersion && requestVersion === allocationRequestVersion) allocationLoading.value = false;
       }
     }
 
@@ -1978,6 +2438,8 @@ const ScreenerView = {
         result.value = data.run.result;
         activeHistoryId.value = runRow.id;
         selectedStock.value = null;
+        selectedStockSymbols.value = [];
+        resetAllocation();
         error.value = "";
         nextTick(() => document.querySelector(".result-summary")?.scrollIntoView({ behavior: "smooth", block: "start" }));
       } catch (e) {
@@ -1990,9 +2452,13 @@ const ScreenerView = {
     }
 
     watch(directExpr, () => { dslInfo.value = null; });
+    watch(selectedStockSymbols, resetAllocation, { deep: true });
+    watch([allocationMethod, allocationLookback, allocationMaxWeight, allocationScoreTilt], resetAllocation);
     watch(() => appState.experimentVersion, () => {
       result.value=null;
       selectedStock.value=null;
+      selectedStockSymbols.value=[];
+      resetAllocation();
       loading.value=false;
       historyRuns.value=[];
       historyTotal.value=0;
@@ -2017,10 +2483,13 @@ const ScreenerView = {
       date, univN, topN, directExpr, directDirection, dslInfo, outputDirection,
       factors, groups, factorSearch, factorGroup, filteredFactors,
       result, selectedStock, error, loading, enabledCount, canRun,
+      selectedStockSymbols, selectedStockCount, allocation, allocationLoading, allocationError,
+      allocationMethod, allocationLookback, allocationMaxWeight, allocationScoreTilt,
       historyRuns, historyTotal, historyLoading, historyError, activeHistoryId, openingRunId,
-      totalWeight, topScore, tailScore, rankingTitle, formatScore, formatPrice, compactAmount,
+      totalWeight, topScore, tailScore, rankingTitle, formatScore, formatPercent, formatPrice, compactAmount,
       rankWidth, formatRecordTime, formatLatency, directionLabel, factorPreviewLabel, factorPreviewTitle,
-      selectAll, clearAll, inspectDsl, run, loadFactors, loadHistory, openHistory,
+      allocationMethodLabel, isStockSelected, toggleStockSelection, quickSelectStocks, selectAllStocks, clearStockSelection,
+      selectAll, clearAll, inspectDsl, run, calculateAllocation, loadFactors, loadHistory, openHistory,
     };
   },
 };

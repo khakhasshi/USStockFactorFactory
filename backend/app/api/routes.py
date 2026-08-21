@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from collections import OrderedDict
@@ -43,6 +44,13 @@ from ..feedback import (
     FEEDBACK_SCHEMA_VERSION,
     OUTER_REPORT_SCHEMA_VERSION,
 )
+from ..leaderboards import (
+    build_leaderboard_catalog,
+    load_leaderboard_factor_detail,
+    resolve_leaderboard_file,
+)
+from ..factors.diversity import infer_mechanism, mechanisms_for_market
+from ..factors.semantics import audit_expression_semantics, field_contract
 from ..factors.similarity import (
     build_similarity_index,
     expression_fingerprint,
@@ -72,6 +80,10 @@ from ..observability import (
     redact_value,
 )
 from ..orchestrator import EngineManager
+from ..portfolio_allocation import (
+    ALLOCATION_METHODS,
+    build_purchase_allocation,
+)
 from ..screener import SCREEN_CACHE, screen_cross_section
 
 router = APIRouter(prefix="/api")
@@ -97,6 +109,47 @@ _observability_events_cache = AsyncTTLCache(
 
 def _invalidate_observability_components() -> None:
     _observability_components_cache.clear()
+
+
+def invalidate_panel_dependents() -> dict:
+    """Invalidate derived in-process state after a panel generation swap."""
+    removed = SCREEN_CACHE.clear()
+    _invalidate_observability_components()
+    return {
+        "screener_entries_removed": removed,
+        "observability_components_invalidated": True,
+    }
+
+
+def _campaign_controls(config: dict, market: str) -> tuple[int, list[str]]:
+    try:
+        budget = int(config.get("candidate_evaluation_budget") or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            400,
+            "candidate_evaluation_budget 必须为非负整数",
+        ) from exc
+    if budget < 0:
+        raise HTTPException(
+            400,
+            "candidate_evaluation_budget 必须为非负整数",
+        )
+
+    configured = config.get("target_mechanisms") or []
+    if not isinstance(configured, list):
+        raise HTTPException(400, "target_mechanisms 必须为机制名称列表")
+    allowed = set(mechanisms_for_market(market))
+    targets: list[str] = []
+    for value in configured:
+        mechanism = str(value).strip()
+        if not mechanism or mechanism not in allowed:
+            raise HTTPException(
+                400,
+                f"收益机制 {mechanism or value} 不适用于 {market}",
+            )
+        if mechanism not in targets:
+            targets.append(mechanism)
+    return budget, targets
 
 
 async def _experiment_context(experiment_id: int | None = None) -> tuple[int, dict]:
@@ -757,6 +810,11 @@ async def factor_detail(fid: int):
         "factor": _factor_payload(f, include_validation=True),
         "audit_defaults": audit_defaults,
         "dsl": dsl_profile,
+        "semantic_audit": audit_expression_semantics(f.expression, market),
+        "mechanism_family": (f.research_meta or {}).get(
+            "mechanism_family",
+            infer_mechanism(f.expression, f.hypothesis),
+        ),
         "similarity": {
             "group_id": similarity_index["factor_to_group"].get(f.id),
             "nearest": similar,
@@ -1398,6 +1456,42 @@ async def download_backtest_statement(backtest_id: int):
     )
 
 
+# ---------- 榜单版本目录 ----------
+
+@router.get("/leaderboards")
+async def leaderboard_catalog():
+    return await asyncio.to_thread(build_leaderboard_catalog)
+
+
+@router.get("/leaderboards/{report_id}/factors/{expression_hash}")
+async def leaderboard_factor_detail(report_id: str, expression_hash: str):
+    try:
+        return await asyncio.to_thread(
+            load_leaderboard_factor_detail,
+            report_id,
+            expression_hash,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/leaderboards/{report_id}/files/{file_path:path}")
+async def leaderboard_file(report_id: str, file_path: str):
+    try:
+        path = await asyncio.to_thread(
+            resolve_leaderboard_file,
+            report_id,
+            file_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return FileResponse(path)
+
+
 # ---------- 设置 ----------
 
 @router.get("/settings")
@@ -1524,6 +1618,23 @@ async def create_experiment(req: ExperimentReq):
     direction = int(req.research_config.get("direction", 1))
     if direction not in {-1, 1}:
         raise HTTPException(400, "direction 必须为 1 或 -1")
+    proposal_mode = str(
+        req.research_config.get("proposal_mode") or "llm"
+    ).strip().lower()
+    if proposal_mode not in {"llm", "random"}:
+        raise HTTPException(400, "proposal_mode 必须为 llm 或 random")
+    try:
+        target_factor_count = int(
+            req.research_config.get("target_factor_count") or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "target_factor_count 必须为非负整数") from exc
+    if target_factor_count < 0:
+        raise HTTPException(400, "target_factor_count 必须为非负整数")
+    candidate_evaluation_budget, target_mechanisms = _campaign_controls(
+        req.research_config,
+        market,
+    )
     direction_policy = DEFAULT_RESEARCH_DIRECTION_POLICY
     try:
         resolved_evaluation = evaluation_config(
@@ -1548,6 +1659,10 @@ async def create_experiment(req: ExperimentReq):
                 "evaluation_config": resolved_evaluation,
                 "direction": direction,
                 "direction_policy": direction_policy,
+                "proposal_mode": proposal_mode,
+                "target_factor_count": target_factor_count,
+                "candidate_evaluation_budget": candidate_evaluation_budget,
+                "target_mechanisms": target_mechanisms,
             },
         )
         s.add(e)
@@ -1590,6 +1705,19 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             direction = int(merged.get("direction", 1))
             if direction not in {-1, 1}:
                 raise HTTPException(400, "direction 必须为 1 或 -1")
+            proposal_mode = str(merged.get("proposal_mode") or "llm").strip().lower()
+            if proposal_mode not in {"llm", "random"}:
+                raise HTTPException(400, "proposal_mode 必须为 llm 或 random")
+            try:
+                target_factor_count = int(merged.get("target_factor_count") or 0)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "target_factor_count 必须为非负整数") from exc
+            if target_factor_count < 0:
+                raise HTTPException(400, "target_factor_count 必须为非负整数")
+            candidate_evaluation_budget, target_mechanisms = _campaign_controls(
+                merged,
+                market,
+            )
             direction_policy = DEFAULT_RESEARCH_DIRECTION_POLICY
             market_changed = (
                 "market" in req.research_config
@@ -1616,6 +1744,10 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             merged["engine_mode"] = "v2"
             merged["direction"] = direction
             merged["direction_policy"] = direction_policy
+            merged["proposal_mode"] = proposal_mode
+            merged["target_factor_count"] = target_factor_count
+            merged["candidate_evaluation_budget"] = candidate_evaluation_budget
+            merged["target_mechanisms"] = target_mechanisms
             e.research_config = merged
             material_keys = {
                 "market",
@@ -1770,6 +1902,8 @@ async def inspect_dsl(req: DSLInspectReq):
     return {
         "valid": True,
         "market": market,
+        "semantic_audit": audit_expression_semantics(req.expression, market),
+        "mechanism_family": infer_mechanism(req.expression),
         **expression_profile(req.expression),
     }
 
@@ -1784,6 +1918,16 @@ class ScreenerReq(BaseModel):
     universe_n: int = 500
     top_n: int = 50
     direction: str = "top"  # "top" | "bottom" | "both"
+
+
+class ScreenerAllocationReq(BaseModel):
+    experiment_id: int | None = None
+    run_id: int
+    symbols: list[str] = Field(default_factory=list)
+    method: str = "robust_risk_budget"
+    lookback: int = 120
+    max_weight: float = 0.35
+    score_tilt: float = 0.35
 
 
 @router.post("/screener")
@@ -1831,7 +1975,14 @@ async def screener(req: ScreenerReq):
     ]
 
     store = PanelStore.get(panel_glob, market)
-    df = store.ensure_loaded()
+    snapshot_reader = getattr(store, "read_snapshot", None)
+    if callable(snapshot_reader):
+        df, trading_dates, loaded_identity, panel_generation = snapshot_reader()
+    else:  # Test doubles and legacy extensions keep the previous contract.
+        df = store.ensure_loaded()
+        trading_dates = tuple(store.trading_dates)
+        loaded_identity = None
+        panel_generation = 0
     import datetime as _dt
     import bisect
     requested_date = None
@@ -1840,21 +1991,21 @@ async def screener(req: ScreenerReq):
             requested_date = _dt.date.fromisoformat(req.date)
         except ValueError as exc:
             raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
-        index = bisect.bisect_right(store.trading_dates, requested_date) - 1
+        index = bisect.bisect_right(trading_dates, requested_date) - 1
         if index < 0:
             raise HTTPException(400, "请求日期早于面板首个交易日")
-        target_date = store.trading_dates[index]
+        target_date = trading_dates[index]
     else:
-        target_date = store.trading_dates[-1]
+        target_date = trading_dates[-1]
     panel_identity = (
-        f"{market}:{panel_glob or 'default'}:{df.height}:"
-        f"{store.trading_dates[-1]}"
+        f"{market}:{panel_glob or 'default'}:g{panel_generation}:"
+        f"{loaded_identity or 'legacy'}:{df.height}:{trading_dates[-1]}"
     )
     try:
         screened = await asyncio.to_thread(
             screen_cross_section,
             df=df,
-            trading_dates=store.trading_dates,
+            trading_dates=list(trading_dates),
             panel_identity=panel_identity,
             target_date=target_date,
             factors=factors,
@@ -1930,6 +2081,96 @@ async def screener(req: ScreenerReq):
             if isinstance(run.created_at, datetime)
             else str(run.created_at)
         ),
+    }
+
+
+@router.post("/screener/allocate")
+async def allocate_screener_selection(req: ScreenerAllocationReq):
+    """Size an arbitrary subset from one immutable screener snapshot."""
+
+    experiment_id, cfg = await _experiment_context(req.experiment_id)
+    if req.method not in ALLOCATION_METHODS:
+        raise HTTPException(400, f"未知配权方法: {req.method}")
+    symbols = [str(symbol).strip() for symbol in req.symbols]
+    if not 1 <= len(symbols) <= 100:
+        raise HTTPException(400, "必须选择 1 到 100 只证券")
+    if any(not symbol for symbol in symbols):
+        raise HTTPException(400, "选中证券代码不能为空")
+    if len(set(symbols)) != len(symbols):
+        raise HTTPException(400, "选中证券不能重复")
+
+    async with SessionLocal() as session:
+        row = await session.scalar(
+            select(ScreenerRun).where(
+                ScreenerRun.id == req.run_id,
+                ScreenerRun.experiment_id == experiment_id,
+            )
+        )
+    if not row:
+        raise HTTPException(404, "该任务下不存在这条选股记录")
+
+    snapshot = dict(row.result_snapshot or {})
+    snapshot_stocks = list(snapshot.get("stocks") or [])
+    stock_by_symbol = {
+        str(stock.get("ts_code")): stock
+        for stock in snapshot_stocks
+        if stock.get("ts_code")
+    }
+    unknown = [symbol for symbol in symbols if symbol not in stock_by_symbol]
+    if unknown:
+        raise HTTPException(
+            400,
+            f"所选证券不属于记录 #{row.id} 的候选清单: {', '.join(unknown)}",
+        )
+    selected = [stock_by_symbol[symbol] for symbol in symbols]
+
+    request_spec = dict(row.request_spec or {})
+    panel_glob = request_spec.get("panel_glob") or cfg.get("panel_glob")
+    store = PanelStore.get(panel_glob, row.market)
+    snapshot_reader = getattr(store, "read_snapshot", None)
+    if callable(snapshot_reader):
+        df, trading_dates, loaded_identity, panel_generation = snapshot_reader()
+    else:  # Test doubles and legacy extensions keep the previous contract.
+        df = store.ensure_loaded()
+        trading_dates = tuple(store.trading_dates)
+        loaded_identity = None
+        panel_generation = 0
+    current_panel_identity = (
+        f"{row.market}:{panel_glob or 'default'}:g{panel_generation}:"
+        f"{loaded_identity or 'legacy'}:{df.height}:{trading_dates[-1]}"
+    )
+    try:
+        allocation = await asyncio.to_thread(
+            build_purchase_allocation,
+            df=df,
+            target_date=row.target_date,
+            selected=selected,
+            lookback=req.lookback,
+            method=req.method,
+            max_weight=req.max_weight,
+            score_tilt=req.score_tilt,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    panel_changed = bool(
+        row.panel_identity
+        and current_panel_identity != row.panel_identity
+    )
+    if panel_changed:
+        allocation["warnings"].append(
+            "当前面板标识与选股快照生成时不同；候选清单保持冻结，"
+            "风险统计按当前面板中截至原截面日的数据重新计算。"
+        )
+    return {
+        "experiment_id": experiment_id,
+        "run_id": row.id,
+        "market": row.market,
+        "portfolio_mode": row.portfolio_mode,
+        "snapshot_panel_identity": row.panel_identity,
+        "current_panel_identity": current_panel_identity,
+        "panel_changed": panel_changed,
+        **allocation,
     }
 
 
@@ -2015,7 +2256,47 @@ async def meta(experiment_id: int | None = None, load_panel: bool = False):
         "evaluation_protocol": cfg.get("evaluation_protocol", "legacy"),
         "evaluation_config": evaluation_config(market, cfg.get("evaluation_config")),
         "dsl_fields": get_dsl_fields(cfg.get("market")),
+        "dsl_field_contract": field_contract(market),
+        "mechanism_families": list(mechanisms_for_market(market)),
         "operators": OPERATORS_DOC,
+    }
+
+
+class PanelReloadReq(BaseModel):
+    experiment_id: int | None = None
+    force: bool = False
+
+
+@router.post("/panels/reload")
+async def reload_panel(req: PanelReloadReq):
+    """Atomically replace one task panel while the old generation keeps serving."""
+    experiment_id, cfg = await _experiment_context(req.experiment_id)
+    market = cfg.get("market", "us")
+    panel_glob = cfg.get("panel_glob") or default_panel_glob(market)
+    store = PanelStore.get(panel_glob, market)
+    before = await asyncio.to_thread(store.diagnostics)
+    result = await asyncio.to_thread(
+        store.reload_if_changed,
+        force=req.force,
+        require_stable=False,
+    )
+    invalidation = None
+    if result.get("status") in {"loaded", "reloaded"}:
+        invalidation = invalidate_panel_dependents()
+    after = await asyncio.to_thread(store.diagnostics)
+    return {
+        "experiment_id": experiment_id,
+        "market": market,
+        "panel_glob": panel_glob,
+        "result": result,
+        "cache_invalidation": invalidation,
+        "before": before,
+        "after": after,
+        "policy": {
+            "swap": "double_buffer_atomic_generation",
+            "ongoing_requests": "retain_previous_immutable_frame",
+            "failed_reload": "continue_serving_previous_generation",
+        },
     }
 
 
@@ -2437,6 +2718,27 @@ def _artifact_observability() -> dict:
             latest_mtime = max(latest_mtime, stat.st_mtime)
         except OSError:
             stat_errors += 1
+    diversity_audit_root = (
+        root.parent / "audits" / "p0-return-source-diversity-v1"
+    )
+    diversity_audit: dict = {
+        "root": str(diversity_audit_root),
+        "exists": diversity_audit_root.exists(),
+    }
+    for filename, key in (
+        ("progress.json", "progress"),
+        ("protocol.json", "protocol"),
+        ("summary.json", "summary"),
+    ):
+        path = diversity_audit_root / filename
+        if not path.exists():
+            continue
+        try:
+            diversity_audit[key] = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            diversity_audit[f"{key}_error"] = redact_text(exc, 500)
     return {
         "root": str(root),
         "exists": True,
@@ -2452,6 +2754,7 @@ def _artifact_observability() -> dict:
         ),
         "stat_errors": stat_errors,
         "inventory_truncated": len(files) >= 10000,
+        "factor_return_source_audit": diversity_audit,
     }
 
 
@@ -2710,6 +3013,9 @@ async def health_ready():
             "instances": snapshot["data"]["instances"],
             "loaded": snapshot["data"]["loaded"],
             "errors": len(panel_errors),
+            "stale": snapshot["data"].get("stale", 0),
+            "reloading": snapshot["data"].get("reloading", 0),
+            "reload_errors": snapshot["data"].get("reload_errors", 0),
         },
         "findings": snapshot["findings"],
         "generated_at": snapshot["generated_at"],
@@ -2811,6 +3117,12 @@ async def prometheus_metrics():
         f'factorfactory_panel_errors {data["errors"]}',
         "# TYPE factorfactory_panel_memory_bytes gauge",
         f'factorfactory_panel_memory_bytes {data["estimated_size_bytes"]}',
+        "# TYPE factorfactory_panel_stale gauge",
+        f'factorfactory_panel_stale {data.get("stale", 0)}',
+        "# TYPE factorfactory_panel_reloading gauge",
+        f'factorfactory_panel_reloading {data.get("reloading", 0)}',
+        "# TYPE factorfactory_panel_reload_errors gauge",
+        f'factorfactory_panel_reload_errors {data.get("reload_errors", 0)}',
         "# TYPE factorfactory_screener_cache_requests_total counter",
         (
             'factorfactory_screener_cache_requests_total{result="hit"} '

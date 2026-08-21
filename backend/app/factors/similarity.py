@@ -14,6 +14,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from ..dsl.engine import expression_profile, normalize_hash
+from .diversity import infer_mechanism
 
 _WRAPPERS = {"rank", "zscore", "winsor"}
 _ROLLING = {"ts_mean", "ts_std", "ts_sum", "ts_min", "ts_max", "ts_rank", "ts_delta", "ts_corr", "delay"}
@@ -88,6 +89,35 @@ def _features(expression: str) -> Counter[str]:
     return features
 
 
+def _template_key(expression: str) -> str:
+    """Hash one expression skeleton while ignoring numeric parameters.
+
+    SimHash banding is intentionally approximate and can miss expressions
+    that differ only by rolling-window constants.  A second deterministic
+    blocking key keeps those cheap, economically obvious comparisons in the
+    exact weighted-Jaccard stage without falling back to all-pairs search.
+    """
+    root = _strip_equivalent_wrappers(ast.parse(expression, mode="eval").body)
+
+    class _EraseNumbers(ast.NodeTransformer):
+        def visit_Constant(self, node: ast.Constant):  # noqa: N802
+            if isinstance(node.value, (int, float)) and not isinstance(
+                node.value,
+                bool,
+            ):
+                return ast.copy_location(ast.Constant(value=0), node)
+            return node
+
+    normalized = _EraseNumbers().visit(root)
+    ast.fix_missing_locations(normalized)
+    structure = ast.dump(
+        normalized,
+        annotate_fields=False,
+        include_attributes=False,
+    )
+    return hashlib.sha1(structure.encode()).hexdigest()[:16]
+
+
 def weighted_jaccard(left: Counter[str], right: Counter[str]) -> float:
     keys = left.keys() | right.keys()
     numerator = sum(min(left[key], right[key]) for key in keys)
@@ -116,13 +146,18 @@ def expression_fingerprint(expression: str) -> dict:
     return {
         "expr_hash": normalize_hash(expression),
         "simhash64": f"{_simhash(features):016x}",
-        "family": _family(fields, operators),
+        "family": infer_mechanism(expression),
         "fields": sorted(fields),
         "operators": sorted(operators),
         "windows": profile["windows"],
         "required_history": profile["required_history"],
         "complexity": profile["complexity"],
     }
+
+
+def expression_similarity(left: str, right: str) -> float:
+    """Return the same weighted structural similarity used by the LSH index."""
+    return weighted_jaccard(_features(left), _features(right))
 
 
 @dataclass
@@ -134,6 +169,7 @@ class _Indexed:
     features: Counter[str]
     simhash: int
     family: str
+    template_key: str
 
 
 class _UnionFind:
@@ -173,7 +209,8 @@ def build_similarity_index(items: list[dict], threshold: float = 0.64) -> dict:
             score=float(item.get("score") or 0.0),
             features=features,
             simhash=_simhash(features),
-            family=_family(set(profile["fields"]), set(profile["operators"])),
+            family=infer_mechanism(item["expression"]),
+            template_key=_template_key(item["expression"]),
         ))
 
     uf = _UnionFind([item.id for item in indexed])
@@ -191,6 +228,17 @@ def build_similarity_index(items: list[dict], threshold: float = 0.64) -> dict:
             for right in ids[i + 1:]:
                 if by_id[left].family == by_id[right].family or len(ids) <= 40:
                     candidate_pairs.add((min(left, right), max(left, right)))
+
+    template_candidate_pairs: set[tuple[int, int]] = set()
+    template_buckets: dict[str, list[int]] = defaultdict(list)
+    for item in indexed:
+        template_buckets[item.template_key].append(item.id)
+    for ids in template_buckets.values():
+        for i, left in enumerate(ids):
+            for right in ids[i + 1:]:
+                pair = (min(left, right), max(left, right))
+                template_candidate_pairs.add(pair)
+                candidate_pairs.add(pair)
 
     similarities: dict[tuple[int, int], float] = {}
     for left, right in candidate_pairs:
@@ -260,7 +308,11 @@ def build_similarity_index(items: list[dict], threshold: float = 0.64) -> dict:
             "redundancy_ratio": round(redundancy, 4),
             "threshold": threshold,
             "candidate_pairs": len(candidate_pairs),
-            "algorithm": "simhash_lsh_plus_weighted_jaccard_v1",
+            "template_candidate_pairs": len(template_candidate_pairs),
+            "algorithm": (
+                "simhash_lsh_plus_numeric_agnostic_ast_template_"
+                "plus_weighted_jaccard_v2"
+            ),
         },
     }
 

@@ -35,6 +35,7 @@ from ..config import (
 )
 from ..data.panel import PanelStore
 from ..dsl.engine import parse
+from ..factors.return_path import build_return_path_signature
 from .ranking import build_live_ranking
 
 DISCOVERY_LAYERS = ["INNER_PUBLIC", "META_TRAIN"]
@@ -866,6 +867,11 @@ def _layer_metrics(
         "market_exposure": _market_exposure(net, benchmark, periods_per_year),
         "return_confidence": return_confidence,
         "absolute_return_confidence": absolute_return_confidence,
+        # Compressed and normalised; safe for training-layer correlation
+        # checks without exposing a dated return series to either LLM.
+        "return_path_signature": build_return_path_signature(
+            ranking_returns
+        ),
         # Compatibility fields used by the existing UI/search context.
         "direction": direction,
     }

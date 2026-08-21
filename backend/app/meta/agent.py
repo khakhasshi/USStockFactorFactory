@@ -422,6 +422,7 @@ async def propose_template(
     direction: int = 1,
     direction_policy: str = "both_train_select",
     trace_context: dict | None = None,
+    deliberate_random: bool = False,
 ) -> tuple[dict, str, str, dict]:
     """返回 (new_template, note, source, proposal_reflection).
 
@@ -532,6 +533,21 @@ async def propose_template(
             )
 
     t, note = random_jitter(incumbent_template)
+    if deliberate_random:
+        return (
+            t,
+            note,
+            "random",
+            {
+                "diagnosis": ["任务主动配置为随机基线，未调用外层 LLM"],
+                "lessons_applied": [],
+                "evidence_used": [],
+                "hypothesis": "对模板做结果不可知的随机扰动，用作随机搜索基线。",
+                "proposal_mode": "random",
+                "random_reason": "configured_random_mode",
+                "history_context_fingerprint": "",
+            },
+        )
     return (
         t,
         note,

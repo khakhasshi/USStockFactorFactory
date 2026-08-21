@@ -1,5 +1,6 @@
 import ipaddress
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,6 +13,17 @@ MARKET_LABEL = "A股" if _MARKET == "ashare" else "美股"
 
 HOST = os.environ.get("FF_HOST", "127.0.0.1").strip() or "127.0.0.1"
 PORT = int(os.environ.get("FF_PORT", "10010"))
+PANEL_AUTO_RELOAD = os.environ.get(
+    "FF_PANEL_AUTO_RELOAD",
+    "1",
+).strip().lower() in {"1", "true", "yes", "on"}
+try:
+    PANEL_WATCH_SECONDS = max(
+        5.0,
+        float(os.environ.get("FF_PANEL_WATCH_SECONDS", "15")),
+    )
+except ValueError:
+    PANEL_WATCH_SECONDS = 15.0
 ALLOW_REMOTE_UNAUTHENTICATED = os.environ.get(
     "FF_ALLOW_REMOTE_UNAUTHENTICATED",
     "",
@@ -27,16 +39,44 @@ DATABASE_URL = os.environ.get(
     "FF_DATABASE_URL",
     "postgresql+asyncpg://jiangjingzhe@localhost:5432/factor_factory",
 )
+FDC_ROOT = Path(os.environ.get("FDC_ROOT", "/Users/jiangjingzhe/Finance_Data_Center")).expanduser()
+FDC_DEFAULTS_ENABLED = os.environ.get(
+    "FF_DISABLE_FDC_DEFAULTS",
+    "",
+).strip().lower() not in {"1", "true", "yes", "on"}
+
+
+def _fdc_path(dataset_or_alias: str, *, member_hint: str | None = None) -> Path | None:
+    if not FDC_DEFAULTS_ENABLED:
+        return None
+    try:
+        if str(FDC_ROOT) not in sys.path:
+            sys.path.insert(0, str(FDC_ROOT))
+        from finance_data_center import FDC
+
+        return FDC(FDC_ROOT).path(dataset_or_alias, member_hint=member_hint)
+    except Exception:
+        return None
+
+
+_LEGACY_US_PANEL_ROOT = Path(
+    "/Users/jiangjingzhe/Portfolios/MultiFactorUS/data_yfinance_research"
+)
+_LEGACY_ASHARE_PANEL_ROOT = Path("/Users/jiangjingzhe/Portfolios/MultiFactorAshare/data")
+_US_PANEL_ROOT = (
+    _fdc_path("yfinance.us_equity.daily_panel", member_hint="data_yfinance_research")
+    or _LEGACY_US_PANEL_ROOT
+)
+_ASHARE_PANEL_ROOT = (
+    _fdc_path("logical__single__Portfolios__MultiFactorAshare__data")
+    or _LEGACY_ASHARE_PANEL_ROOT
+)
+US_PANEL_GLOB = str(_US_PANEL_ROOT / "processed" / "daily_panel" / "trade_year=*" / "data_0.parquet")
+ASHARE_PANEL_GLOB = str(_ASHARE_PANEL_ROOT / "trade_year=*" / "data_0.parquet")
 PANEL_GLOB = os.environ.get(
     "FF_PANEL_GLOB",
-    "/Users/jiangjingzhe/Portfolios/MultiFactorUS/data_yfinance_research/"
-    "processed/daily_panel/trade_year=*/data_0.parquet",
+    ASHARE_PANEL_GLOB if _MARKET == "ashare" else US_PANEL_GLOB,
 )
-US_PANEL_GLOB = (
-    "/Users/jiangjingzhe/Portfolios/MultiFactorUS/data_yfinance_research/"
-    "processed/daily_panel/trade_year=*/data_0.parquet"
-)
-ASHARE_PANEL_GLOB = "/Users/jiangjingzhe/Portfolios/MultiFactorAshare/data/trade_year=*/data_0.parquet"
 
 
 def is_loopback_host(host: str = HOST) -> bool:
@@ -364,7 +404,7 @@ DEFAULT_MINER_TEMPLATE = {
     # === 外层可改写 ===
     "system_prompt": (
         "你是量化因子研究员。基于当前市场日线数据设计横截面选股因子表达式。\n"
-        "可用字段: {fields} (前复权价格与量额)\n"
+        "可用字段: {fields}；字段的单位、复权口径和来源以系统硬约束块为准。\n"
         "可用算子:\n{ops}\n"
         "规则: 只能用以上字段与算子; 窗口为 1..250 整数; 表达式一行;\n"
         "目标是提高 V4 训练层保守 discovery score：费后收益与下置信界、"
@@ -402,7 +442,8 @@ DEFAULT_MINER_TEMPLATE = {
         "max_context_chars": 12000,
     },
     "diversity_instruction": (
-        "新因子必须与历史高分因子有不同经济学机制。"
+        "服从系统分配的欠覆盖收益机制；草稿不得是已有高分表达式的换窗、"
+        "换符号或 rank/zscore 包装近邻。"
     ),
     # 仅控制进入 LLM 上下文的示例优先级；不得改写权威 V4 评价分。
     "scoring_weights": {
@@ -415,7 +456,7 @@ DEFAULT_MINER_TEMPLATE = {
         "ts_corr({field1}, {field2}, {window})",
         "{-}zscore(ts_std({field}, {window}))",
         "rank((close - ts_min(low, {window})) / (ts_max(high, {window}) - ts_min(low, {window})))",
-        "ts_mean(abs(ts_delta(close,1))/(amount+1e-9), {window})",
+        "ts_mean(abs(ts_delta(close,1))/(delay(close,1)+1e-9)/(amount+1e-9), {window})",
     ],
     "min_public_icir": 0.25,
     "llm_temperature": 0.9,

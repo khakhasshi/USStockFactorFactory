@@ -289,6 +289,7 @@ class InnerOuterAgentTests(unittest.TestCase):
             return (
                 '{"expression":"-rank(ts_delta(close, 20))",'
                 '"hypothesis":"slow reversal",'
+                '"mechanism_family":"reversal",'
                 '"reflection":"reduce turnover after failed stress cost",'
                 '"targeted_failures":["实际持仓换手超过任务上限"],'
                 '"expected_effect":"improve implementability"}'
@@ -323,6 +324,7 @@ class InnerOuterAgentTests(unittest.TestCase):
                 {"name": "mock", "model": "mock-model"},
                 fields=["open", "close", "vol", "amount"],
                 trace_context={"experiment_id": 5},
+                target_family="reversal",
             ))
         finally:
             miner_agent.llm.chat = original
@@ -511,6 +513,7 @@ class InnerOuterAgentTests(unittest.TestCase):
             return (
                 '{"expression":"rank(ts_delta(close, 20))",'
                 '"hypothesis":"medium-term momentum",'
+                '"mechanism_family":"momentum",'
                 '"reflection":"retain a simple mechanism after noisy failures",'
                 '"targeted_failures":["cost stress is weak"]}'
             )
@@ -543,6 +546,7 @@ class InnerOuterAgentTests(unittest.TestCase):
                 {"name": "mock"},
                 fields=["open", "high", "low", "close", "vol", "amount"],
                 rng=random.Random(7),
+                target_family="momentum",
             ))
         finally:
             miner_agent.llm.chat = original_chat

@@ -31,21 +31,28 @@ REQUIRED_FILES = (
     "snapshot.json",
     "manifest.json",
     "protocol.json",
-    "finalists_frozen_before_vault.json",
     "vault_finalists.json",
     "finalist_ledger_audits.json",
+)
+FINALIST_FILES = (
+    "finalists_frozen_before_vault.json",
+    "finalists_frozen_before_ledger.json",
 )
 RESULT_FIELDS = (
     "overall_rank",
     "practical_pass",
     "multiple_test_pass",
     "cost_monotonic",
+    "qualification_status",
+    "absolute_quality_score",
+    "portfolio_metric_basis",
     "robust_score",
     "expression_hash",
     "oriented_expression_hash",
     "evaluation_fingerprint",
     "origin_scope",
     "origin_markets",
+    "selection_reason",
     "direction",
     "economic_representative",
     "economic_duplicate_of",
@@ -74,12 +81,27 @@ RESULT_FIELDS = (
     "sharpe_bps_5",
     "sharpe_bps_15",
     "max_drawdown_bps_15",
+    "active_ann_return_bps_0",
+    "active_ann_return_bps_5",
+    "active_ann_return_bps_15",
+    "active_sharpe_bps_0",
+    "active_sharpe_bps_5",
+    "active_sharpe_bps_15",
+    "active_max_drawdown_bps_15",
+    "ranking_ann_return_bps_15",
+    "ranking_sharpe_bps_15",
+    "ranking_max_drawdown_bps_15",
     "avg_daily_turnover_bps_15",
     "fill_rate_bps_15",
     "fills_bps_15",
     "commission_and_tax_bps_15",
     "slippage_cost_bps_15",
+    "borrow_cost_bps_15",
     "total_execution_cost_bps_15",
+    "avg_gross_exposure_bps_15",
+    "avg_net_exposure_bps_15",
+    "fee_profile_bps_15",
+    "currency_bps_15",
     "vault_status",
     "vault_ann_return_bps_15",
     "vault_sharpe_bps_15",
@@ -93,6 +115,58 @@ RESULT_FIELDS = (
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_finalist_path(report_dir: Path) -> Path:
+    for filename in FINALIST_FILES:
+        path = report_dir / filename
+        if path.is_file():
+            return path
+    raise ValueError(
+        "报告目录缺少候选冻结文件: " + " / ".join(FINALIST_FILES)
+    )
+
+
+def _best_hash(rows: list[dict], metric: str) -> str | None:
+    candidates = [
+        row
+        for row in rows
+        if row.get("economic_representative", True)
+        and isinstance(row.get(metric), (int, float))
+    ]
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda row: float(row[metric]))[
+        "expression_hash"
+    ])
+
+
+def _normalize_finalists(raw: dict, rows: list[dict]) -> dict:
+    if raw.get("hashes") and raw.get("dimension_champions"):
+        return raw
+
+    orientation_ids = [
+        str(value) for value in (raw.get("orientation_ids") or [])
+    ]
+    dimensions = (
+        "absolute_quality_score",
+        "robust_score",
+        "ann_return_bps_15",
+        "oos_icir",
+        "oos_rank_icir",
+    )
+    champions = {
+        dimension: expression_hash
+        for dimension in dimensions
+        if (expression_hash := _best_hash(rows, dimension))
+    }
+    return {
+        **raw,
+        "hashes": orientation_ids,
+        "overall_hashes": orientation_ids,
+        "dimension_champions": champions,
+        "ranking_uses_vault": False,
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -127,21 +201,267 @@ def _project_result(row: dict) -> dict:
     return projected
 
 
+def _presentation(
+    spec: dict,
+    snapshot: dict,
+    protocol_id: str = "",
+    scenario_engine: str = "",
+) -> dict:
+    market = str(
+        spec.get("market")
+        or snapshot.get("target_market")
+        or "ashare"
+    )
+    mode = str(
+        spec.get("mode")
+        or ("long_short" if market == "us" else "long_only")
+    )
+    initial_capital = float(
+        spec.get("initial_capital")
+        or (1_000_000 if market == "us" else 10_000_000)
+    )
+    vector_screen = (
+        scenario_engine == "vector_screen"
+        or "vector_screen" in protocol_id
+    )
+    if vector_screen:
+        common = {
+            "market": market,
+            "mode": mode,
+            "screening_only": True,
+            "has_vault": False,
+            "validation_label": "事件复核",
+            "initial_capital": initial_capital,
+        }
+        if market == "us":
+            borrow_bps = float(
+                spec.get("borrow_cost_bps_annual") or 0.0
+            )
+            if mode == "long_only":
+                return common | {
+                    "market_label": "美股",
+                    "mode_label": "纯多头",
+                    "title": (
+                        "FactorFactory · 美股纯多向量筛选与事件复核榜"
+                    ),
+                    "eyebrow": (
+                        "US long-only vector screen · "
+                        "top-3 step-event verification"
+                    ),
+                    "heading_html": "美股纯多因子<br>向量筛选与事件复核榜",
+                    "description": (
+                        "以 2020 年至最新交易日的完整窗口，对每个可迁移"
+                        "量价 DSL 强制测试正反两个方向；全库使用向量引擎"
+                        "比较 0 / 5 / 15 BPS，排名冻结后仅对综合前三使用 "
+                        "step_event_v1 生成逐笔交割单。"
+                    ),
+                    "boundary": (
+                        "这是非 PIT、全窗口研究筛选，不是独立样本外验证。"
+                        "向量阶段假设完整成交，纯多收益还包含市场 Beta；"
+                        "只有标记为事件复核的前三名经过成交量约束、佣金、"
+                        "滑点和现金/持仓对账。"
+                    ),
+                    "fee_summary": (
+                        "向量筛选使用 IBKR Pro Fixed 费用代理及 "
+                        "0/5/15 BPS；前三名事件复核使用每股 $0.005、"
+                        "每单最低 $1、最高成交额 1%，无借券费"
+                    ),
+                    "currency": "USD",
+                    "currency_symbol": "$",
+                    "footer": (
+                        "FactorFactory · US long-only vector screen "
+                        "with event-verified finalists"
+                    ),
+                }
+            return common | {
+                "market_label": "美股",
+                "mode_label": "多空",
+                "title": "FactorFactory · 美股多空向量筛选与事件复核榜",
+                "eyebrow": (
+                    "US long-short vector screen · "
+                    "top-3 step-event verification"
+                ),
+                "heading_html": "美股多空因子<br>向量筛选与事件复核榜",
+                "description": (
+                    "以 2020 年至最新交易日的完整窗口，对每个可迁移"
+                    "量价 DSL 强制测试正反两个方向；全库使用向量引擎"
+                    "比较 0 / 5 / 15 BPS，排名冻结后仅对综合前三使用 "
+                    "step_event_v1 生成逐笔交割单。"
+                ),
+                "boundary": (
+                    "这是非 PIT、全窗口研究筛选，不是独立样本外验证。"
+                    "向量阶段假设完整成交且借券费为固定压力代理；只有"
+                    "标记为事件复核的前三名经过成交量约束、逐笔佣金、"
+                    "滑点、借券费及现金/持仓对账，仍不包含逐日 locate、"
+                    "HTB、召回与强平历史。"
+                ),
+                "fee_summary": (
+                    "向量筛选与事件复核使用 IBKR Pro Fixed 费用规则、"
+                    f"空头借券代理年化 {borrow_bps / 100:.2f}% 及 "
+                    "0/5/15 BPS 压力场景"
+                ),
+                "currency": "USD",
+                "currency_symbol": "$",
+                "footer": (
+                    "FactorFactory · US long-short vector screen "
+                    "with event-verified finalists"
+                ),
+            }
+        return common | {
+            "market_label": "A股",
+            "mode_label": "纯多头",
+            "title": "FactorFactory · A股全任务向量筛选与事件复核榜",
+            "eyebrow": (
+                "A-share vector screen · top-3 step-event verification"
+            ),
+            "heading_html": "A股全任务因子<br>向量筛选与事件复核榜",
+            "description": (
+                "以 2020 年至最新交易日的完整窗口，对全部历史 DSL"
+                "强制测试正反两个方向；全库使用向量引擎比较 "
+                "0 / 5 / 15 BPS，排名冻结后仅对综合前三使用 "
+                "step_event_v1 生成逐笔交割单。"
+            ),
+            "boundary": (
+                "这是非 PIT、全窗口研究筛选，不是独立样本外验证。"
+                "向量阶段假设完整成交，不模拟 A 股整手、涨跌停、"
+                "成交量约束和现金排队；只有标记为事件复核的前三名"
+                "经过这些约束及逐笔费用、现金和持仓对账。"
+            ),
+            "fee_summary": (
+                "向量筛选使用万二免五、印花税、过户费代理及 "
+                "0/5/15 BPS；前三名事件复核使用同一费率并执行"
+                "成交量、整手与现金约束"
+            ),
+            "currency": "CNY",
+            "currency_symbol": "¥",
+            "footer": (
+                "FactorFactory · A-share vector screen "
+                "with event-verified finalists"
+            ),
+        }
+    if market == "us":
+        borrow_bps = float(spec.get("borrow_cost_bps_annual") or 0.0)
+        if mode == "long_only":
+            return {
+                "market": market,
+                "market_label": "美股",
+                "mode": mode,
+                "mode_label": "纯多头",
+                "title": "FactorFactory · 美股跨任务因子纯多头审计榜",
+                "eyebrow": (
+                    "US equity long-only event replay · "
+                    "portable price-volume factors"
+                ),
+                "heading_html": "美股跨任务因子<br>纯多头实战审计榜",
+                "description": (
+                    "将美股任务历史因子与 A 股任务中的纯量价可迁移因子，"
+                    "统一放入美股纯多头事件引擎；训练期冻结方向，榜单期"
+                    "只持有因子头部股票，并在 IBKR Pro 佣金之上追加 "
+                    "0 / 5 / 15 BPS 双边滑点。"
+                ),
+                "boundary": (
+                    "纯多头收益同时包含选股 Alpha、市场 Beta 与其他"
+                    "系统性暴露。当前面板还是非 PIT 当前成分股研究面板，"
+                    "因此通过榜单也不等于可以直接实盘。"
+                ),
+                "fee_summary": (
+                    "IBKR Pro Fixed 每股 $0.005、每单最低 $1、"
+                    "最高成交额 1%；纯多头无借券费；"
+                    "额外滑点 0/5/15 BPS"
+                ),
+                "currency": "USD",
+                "currency_symbol": "$",
+                "initial_capital": initial_capital,
+                "footer": (
+                    "FactorFactory · US cross-task long-only "
+                    "factor leaderboard"
+                ),
+            }
+        return {
+            "market": market,
+            "market_label": "美股",
+            "mode": mode,
+            "mode_label": "多空" if mode == "long_short" else "纯多头",
+            "title": "FactorFactory · 美股跨任务因子多空审计榜",
+            "eyebrow": "US equity long-short event replay · portable price-volume factors",
+            "heading_html": "美股跨任务因子<br>多空实战审计榜",
+            "description": (
+                "将美股任务历史因子与 A 股任务中的纯量价可迁移因子，"
+                "统一放入美股事件引擎；训练期冻结方向，榜单期同时持有"
+                "多头与空头，并在 IBKR Pro 佣金和借券压力代理之上追加 "
+                "0 / 5 / 15 BPS 双边滑点。"
+            ),
+            "boundary": (
+                "当前面板为非 PIT 当前成分股研究面板，空头借券费是固定"
+                "压力代理，并不包含逐日 locate、HTB、召回与强平历史。"
+                "通过榜单不等于可直接实盘。"
+            ),
+            "fee_summary": (
+                "IBKR Pro Fixed 每股 $0.005、每单最低 $1、最高成交额 1%；"
+                f"空头借券代理年化 {borrow_bps / 100:.2f}%；"
+                "额外滑点 0/5/15 BPS"
+            ),
+            "currency": "USD",
+            "currency_symbol": "$",
+            "initial_capital": initial_capital,
+            "footer": "FactorFactory · US cross-task long-short factor leaderboard",
+        }
+    return {
+        "market": market,
+        "market_label": "A股",
+        "mode": mode,
+        "mode_label": "纯多头",
+        "title": "FactorFactory · A股全任务因子审计榜",
+        "eyebrow": "A-share event replay · cross-task history",
+        "heading_html": "全任务历史因子<br>多维实战审计榜",
+        "description": (
+            "将 A 股与美股任务发现的全部历史 DSL 表达式，统一放入 A 股"
+            "纯多头事件引擎，在真实费税基础上追加 0 / 5 / 15 BPS 双边"
+            "滑点，并以训练定向、独立榜单期和一次性 Vault 分层验证。"
+        ),
+        "boundary": (
+            "当前面板为非 PIT 当前成分股研究面板。榜单通过意味着比较"
+            "口径可复现、成本已计入且账本自洽，不代表可以直接用于实盘。"
+        ),
+        "fee_summary": (
+            "A股万二免五，卖出印花税与双向过户费；"
+            "额外滑点 0/5/15 BPS"
+        ),
+        "currency": "CNY",
+        "currency_symbol": "¥",
+        "initial_capital": initial_capital,
+        "footer": "FactorFactory · A-share cross-task factor leaderboard",
+    }
+
+
 def _build_payload(report_dir: Path) -> dict:
     paths = {name: report_dir / name for name in REQUIRED_FILES}
     missing = [name for name, path in paths.items() if not path.is_file()]
     if missing:
         raise ValueError(f"报告目录缺少文件: {', '.join(missing)}")
+    finalist_path = _resolve_finalist_path(report_dir)
+    paths[finalist_path.name] = finalist_path
 
     leaderboard = _read_json(paths["leaderboard_full.json"])
     snapshot = _read_json(paths["snapshot.json"])
     manifest = _read_json(paths["manifest.json"])
     protocol = _read_json(paths["protocol.json"])
-    finalists = _read_json(paths["finalists_frozen_before_vault.json"])
+    finalists = _normalize_finalists(
+        _read_json(finalist_path),
+        leaderboard,
+    )
     vault = _read_json(paths["vault_finalists.json"])
     ledger_audits = _read_json(paths["finalist_ledger_audits.json"])
 
-    if len(leaderboard) != int(manifest["successful_expressions"]):
+    successful_results = manifest.get("successful_expressions")
+    if successful_results is None:
+        successful_results = manifest.get("successful_orientations")
+    failed_results = manifest.get("failed_expressions")
+    if failed_results is None:
+        failed_results = manifest.get("failed_orientations", 0)
+    if successful_results is None:
+        raise ValueError("manifest 缺少成功结果数量")
+    if len(leaderboard) != int(successful_results):
         raise ValueError("leaderboard 行数与 manifest 成功数不一致")
     representative_count = sum(
         bool(row.get("economic_representative")) for row in leaderboard
@@ -184,45 +504,138 @@ def _build_payload(report_dir: Path) -> dict:
         }
 
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    presentation = _presentation(
+        protocol["spec"],
+        snapshot,
+        protocol_id=str(
+            protocol.get("protocol") or manifest.get("protocol") or ""
+        ),
+        scenario_engine=str(manifest.get("scenario_engine") or ""),
+    )
+    valid_expressions = snapshot.get(
+        "valid_target_expressions",
+        snapshot.get(
+            f"valid_{presentation['market']}_expressions",
+            snapshot.get("valid_ashare_expressions", 0),
+        ),
+    )
+    invalid_expressions = snapshot.get(
+        "invalid_target_expressions",
+        snapshot.get(
+            f"invalid_{presentation['market']}_expressions",
+            snapshot.get("invalid_ashare_expressions", 0),
+        ),
+    )
+    projected_results = []
+    for row in leaderboard:
+        projected = _project_result(row)
+        ledger = ledger_rows.get(str(row.get("expression_hash") or ""))
+        stats = (ledger or {}).get("stats") or {}
+        integrity = (ledger or {}).get("integrity") or {}
+        projected.update({
+            "event_replay_status": (ledger or {}).get("status"),
+            "event_integrity_all_pass": integrity.get("all_pass"),
+            "event_ann_return_bps_15": stats.get("ann_ret"),
+            "event_sharpe_bps_15": stats.get("sharpe"),
+            "event_max_drawdown_bps_15": stats.get("max_dd"),
+            "event_fill_rate_bps_15": stats.get("fill_rate"),
+            "event_fills_bps_15": stats.get("fills"),
+            "event_avg_daily_turnover_bps_15": stats.get(
+                "avg_daily_turnover"
+            ),
+            "event_avg_gross_exposure_bps_15": stats.get(
+                "avg_gross_exposure"
+            ),
+            "event_avg_net_exposure_bps_15": stats.get(
+                "avg_net_exposure"
+            ),
+            "event_commission_and_tax_bps_15": stats.get(
+                "commission_and_tax"
+            ),
+            "event_slippage_cost_bps_15": stats.get("slippage_cost"),
+            "event_borrow_cost_bps_15": stats.get("borrow_cost"),
+            "event_total_execution_cost_bps_15": stats.get(
+                "total_execution_cost"
+            ),
+        })
+        projected_results.append(projected)
+
+    manifest_payload = {
+        key: manifest.get(key)
+        for key in (
+            "protocol",
+            "completed_at",
+            "duration_seconds",
+            "economic_equivalence_groups",
+            "origin_scope_counts",
+            "direction_counts",
+            "practical_pass",
+            "vault_opened_after_ranking",
+            "finalist_ledgers",
+            "result_generation_protocol",
+            "target_market",
+            "source_policy",
+            "excluded_expressions",
+            "scenario_engine",
+            "screening_only",
+            "scheduled_source_expressions",
+            "scheduled_orientations",
+            "event_verified_orientations",
+            "window_start",
+            "window_end",
+        )
+    } | {
+        "successful_expressions": int(successful_results),
+        "failed_expressions": int(failed_results or 0),
+        "vault_opened_after_ranking": int(
+            manifest.get("vault_opened_after_ranking") or 0
+        ),
+        "artifact_count": len(manifest.get("artifacts") or {}),
+    }
+
     return {
         "report_protocol": HTML_REPORT_PROTOCOL,
         "generated_at": generated_at,
-        "policy_label": "NON_PIT_RESEARCH",
+        "policy_label": manifest.get(
+            "policy_label",
+            "NON_PIT_RESEARCH",
+        ),
+        "presentation": presentation,
         "snapshot": {
             "snapshot_at": snapshot["snapshot_at_asia_shanghai"],
             "cutoffs": snapshot["cutoffs"],
             "source_rows": snapshot["source_rows"],
             "unique_expressions": snapshot["unique_expressions"],
-            "valid_expressions": snapshot["valid_ashare_expressions"],
-            "invalid_expressions": snapshot["invalid_ashare_expressions"],
+            "selected_source_rows": snapshot.get(
+                "selected_source_rows",
+                snapshot["source_rows"],
+            ),
+            "selected_unique_expressions": snapshot.get(
+                "selected_unique_expressions",
+                valid_expressions + invalid_expressions,
+            ),
+            "valid_expressions": valid_expressions,
+            "invalid_expressions": invalid_expressions,
+            "source_policy": snapshot.get("source_policy", "all"),
+            "pure_price_volume_fields": snapshot.get(
+                "pure_price_volume_fields",
+                ["amount", "close", "high", "low", "open", "vol"],
+            ),
+            "selection_counts": snapshot.get("selection_counts", {}),
         },
-        "manifest": {
-            key: manifest.get(key)
-            for key in (
-                "protocol",
-                "completed_at",
-                "duration_seconds",
-                "successful_expressions",
-                "failed_expressions",
-                "economic_equivalence_groups",
-                "origin_scope_counts",
-                "direction_counts",
-                "practical_pass",
-                "vault_opened_after_ranking",
-                "finalist_ledgers",
-                "result_generation_protocol",
-            )
-        }
-        | {"artifact_count": len(manifest.get("artifacts") or {})},
+        "manifest": manifest_payload,
         "protocol": {
             "spec": protocol["spec"],
             "panel_glob": protocol["panel_glob"],
-            "panel_identity": protocol[
-                "panel_identity_path_size_mtime_sha256"
-            ],
+            "panel_identity": protocol.get(
+                "panel_identity_path_size_mtime_sha256",
+                protocol.get("panel_identity", "unknown"),
+            ),
             "workers": protocol["workers"],
             "threads_per_worker": protocol["threads_per_worker"],
-            "ranking_uses_vault": protocol["ranking_uses_vault"],
+            "ranking_uses_vault": bool(
+                protocol.get("ranking_uses_vault", False)
+            ),
             "result_generation_protocol_file": protocol.get(
                 "result_generation_protocol_file"
             ),
@@ -231,7 +644,7 @@ def _build_payload(report_dir: Path) -> dict:
             ),
         },
         "experiments": experiments,
-        "results": [_project_result(row) for row in leaderboard],
+        "results": projected_results,
         "finalists": finalists,
         "vault": vault,
         "ledgers": ledger_rows,
@@ -264,6 +677,21 @@ def render_report(
         )
         .replace("__GENERATED_AT__", payload["generated_at"])
         .replace("__SNAPSHOT_AT__", str(payload["snapshot"]["snapshot_at"]))
+        .replace("__REPORT_TITLE__", payload["presentation"]["title"])
+        .replace("__REPORT_EYEBROW__", payload["presentation"]["eyebrow"])
+        .replace(
+            "__REPORT_HEADING__",
+            payload["presentation"]["heading_html"],
+        )
+        .replace(
+            "__REPORT_DESCRIPTION__",
+            payload["presentation"]["description"],
+        )
+        .replace(
+            "__REPORT_BOUNDARY__",
+            payload["presentation"]["boundary"],
+        )
+        .replace("__REPORT_FOOTER__", payload["presentation"]["footer"])
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
@@ -323,7 +751,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="robots" content="noindex,nofollow">
-  <title>FactorFactory · A股全任务因子审计榜</title>
+  <title>__REPORT_TITLE__</title>
   <link rel="icon" href="data:,">
   <style>
     :root {
@@ -826,7 +1254,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <a href="#overview">结论</a>
       <a href="#charts">分布</a>
       <a href="#leaderboard">全量榜单</a>
-      <a href="#vault">Vault</a>
+      <a href="#vault" id="validationNav">Vault</a>
       <a href="#audit">审计</a>
     </nav>
     <div class="top-meta">
@@ -838,9 +1266,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <main class="shell">
     <section class="hero" id="overview">
       <div class="hero-copy">
-        <div class="eyebrow">A-share event replay · cross-task history</div>
-        <h1>全任务历史因子<br>多维实战审计榜</h1>
-        <p>将 A 股与美股任务发现的全部历史 DSL 表达式，统一放入 A 股纯多头事件引擎，在真实费税基础上追加 0 / 5 / 15 BPS 双边滑点，并以训练定向、独立榜单期和一次性 Vault 分层验证。</p>
+        <div class="eyebrow">__REPORT_EYEBROW__</div>
+        <h1>__REPORT_HEADING__</h1>
+        <p>__REPORT_DESCRIPTION__</p>
         <div class="meta-line">
           <span id="heroProtocol">protocol —</span>
           <span id="heroPanel">panel —</span>
@@ -850,7 +1278,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <aside class="hero-aside">
         <div>
           <div class="boundary-title">RESEARCH BOUNDARY / 研究边界</div>
-          <p>当前面板为<strong>非 PIT 当前成分股研究面板</strong>。榜单通过意味着比较口径可复现、成本已计入且账本自洽，不代表可以直接用于实盘。</p>
+          <p>__REPORT_BOUNDARY__</p>
           <span class="badge warn">NON_PIT_RESEARCH</span>
         </div>
         <div class="mini-links">
@@ -858,6 +1286,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
           <a href="top_by_dimension.csv">维度榜</a>
           <a href="manifest.json">审计 Manifest</a>
           <a href="invalid_expressions.csv">无效表达式</a>
+          <a href="excluded_expressions.csv">未入选表达式</a>
         </div>
       </aside>
     </section>
@@ -878,7 +1307,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <div class="charts">
         <article class="card chart-card">
           <div class="card-head">
-            <div><h3>RankIC × 15bp 年化收益</h3><p>绿色为实战硬筛通过，蓝色描边为已开 Vault。</p></div>
+            <div><h3>RankIC × 15bp 年化收益</h3><p id="scatterDescription">绿色为实战硬筛通过，蓝色描边为已开 Vault。</p></div>
             <span class="pill" id="scatterCount">—</span>
           </div>
           <div class="chart-wrap">
@@ -932,12 +1361,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
                 <th class="left" data-sort="expression_hash">因子 / 表达式</th>
                 <th data-sort="origin_scope">来源</th>
                 <th data-sort="direction">方向</th>
-                <th data-sort="robust_score">稳健分</th>
+                <th data-sort="absolute_quality_score">绝对分 / 相对分</th>
                 <th data-sort="ann_return_bps_15">年化 0/5/15</th>
                 <th data-sort="sharpe_bps_15">夏普 0/5/15</th>
                 <th data-sort="oos_ic_mean">IC / ICIR</th>
                 <th data-sort="oos_rank_ic_mean">RankIC / IR</th>
-                <th data-sort="vault_ann_return_bps_15">Vault</th>
+                <th data-sort="vault_ann_return_bps_15" id="validationColumn">Vault</th>
                 <th data-sort="practical_pass">判定</th>
               </tr>
             </thead>
@@ -962,17 +1391,17 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
     <section class="section" id="vault">
       <div class="section-heading">
-        <div><h2>Vault 与维度冠军</h2><p>候选 Hash 在开 Vault 前已冻结；Vault 不参与总榜排序。</p></div>
+        <div><h2 id="validationTitle">Vault 与维度冠军</h2><p id="validationDescription">候选 Hash 在开 Vault 前已冻结；Vault 不参与总榜排序。</p></div>
         <span class="badge ok" id="vaultStatus">—</span>
       </div>
       <div class="vault-grid">
         <article class="card table-card">
           <div class="card-head">
-            <div><h3>独立期生存结果</h3><p>2025-01-01 至 2026-08-04，15 BPS。</p></div>
+            <div><h3 id="validationTableTitle">独立期生存结果</h3><p id="validationTableDescription">2025-01-01 至 2026-08-04，15 BPS。</p></div>
           </div>
           <div class="table-scroll" style="max-height:470px">
             <table class="vault-table">
-              <thead><tr>
+              <thead id="validationTableHead"><tr>
                 <th>总榜</th><th class="left">Hash</th><th>榜单年化</th><th>Vault 年化</th><th>Δ</th><th>Vault 夏普</th><th>Vault RankIC</th><th>结论</th>
               </tr></thead>
               <tbody id="vaultBody"></tbody>
@@ -994,7 +1423,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       </div>
       <div class="audit-grid">
         <article class="card">
-          <div class="card-head" style="padding:0 0 10px"><div><h3>冻结研究链</h3><p>方向、排名与 Vault 严格分层。</p></div></div>
+          <div class="card-head" style="padding:0 0 10px"><div><h3>冻结研究链</h3><p id="auditChainDescription">方向、排名与 Vault 严格分层。</p></div></div>
           <div class="timeline" id="timeline"></div>
         </article>
         <article class="card">
@@ -1008,14 +1437,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
           <span class="badge ok">hash verified</span>
         </div>
         <details>
-          <summary>查看 6 个退化表达式</summary>
+          <summary id="invalidSummary">查看无效表达式</summary>
           <div class="invalid-list" id="invalidList"></div>
         </details>
       </article>
     </section>
 
     <footer class="footer">
-      <span>FactorFactory · A-share cross-task factor leaderboard</span>
+      <span>__REPORT_FOOTER__</span>
       <span id="footerIdentity">—</span>
     </footer>
   </main>
@@ -1030,6 +1459,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
   (() => {
     "use strict";
     const report = JSON.parse(document.getElementById("report-data").textContent);
+    const presentation = report.presentation;
+    const isVectorScreen = Boolean(presentation.screening_only);
     const rows = report.results;
     const byHash = new Map(rows.map(row => [row.expression_hash, row]));
     const dimensionLabels = {
@@ -1057,7 +1488,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const finite = value => Number.isFinite(Number(value));
     const number = (value, digits=3) => finite(value) ? Number(value).toFixed(digits) : "—";
     const percent = (value, digits=2) => finite(value) ? `${(Number(value) * 100).toFixed(digits)}%` : "—";
+    const portfolioMetric = (row, metric, bps=15) => {
+      if (row.portfolio_metric_basis === "active") {
+        const active = row[`active_${metric}_bps_${bps}`];
+        if (finite(active)) return active;
+      }
+      return row[`${metric}_bps_${bps}`];
+    };
     const integer = value => finite(value) ? Number(value).toLocaleString("zh-CN") : "—";
+    const money = value => finite(value) ? `${presentation.currency_symbol}${integer(Math.round(Number(value)))}` : "—";
     const signed = (value, digits=2) => finite(value) ? `${Number(value) >= 0 ? "+" : ""}${(Number(value) * 100).toFixed(digits)}%` : "—";
     const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, char => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
@@ -1071,6 +1510,23 @@ _HTML_TEMPLATE = r"""<!doctype html>
       return number(value, dimension.endsWith("_mean") ? 4 : 3);
     };
     const classification = row => {
+      if (isVectorScreen) {
+        if (!row || row.event_replay_status !== "ok") {
+          return ["未事件复核", "neutral"];
+        }
+        if (!row.event_integrity_all_pass) return ["账本失败", "bad"];
+        const eventAnn = Number(row.event_ann_return_bps_15);
+        const vectorAnn = Number(row.ann_return_bps_15);
+        if (!Number.isFinite(eventAnn)) return ["复核缺数", "bad"];
+        if (eventAnn <= 0) return ["事件后失效", "bad"];
+        if (
+          Number.isFinite(vectorAnn)
+          && eventAnn < vectorAnn - 0.05
+        ) {
+          return ["事件后显著衰减", "warn"];
+        }
+        return ["事件账本通过", "good"];
+      }
       if (!row || row.vault_status !== "ok") return ["未开封", "neutral"];
       const ann = Number(row.vault_ann_return_bps_15);
       const ric = Number(row.vault_rank_ic_mean);
@@ -1085,14 +1541,60 @@ _HTML_TEMPLATE = r"""<!doctype html>
       $("heroProtocol").textContent = `protocol ${report.manifest.protocol}`;
       $("heroPanel").textContent = `panel ${report.protocol.panel_identity.slice(0, 12)}`;
       $("footerIdentity").textContent = `panel ${report.protocol.panel_identity.slice(0, 16)} · ${report.report_protocol}`;
+      if (isVectorScreen) {
+        $("validationNav").textContent = "事件复核";
+        $("validationColumn").textContent = "事件复核";
+        $("scatterDescription").textContent =
+          "绿色为诊断硬筛通过，蓝色描边为已完成 step_event_v1 复核。";
+        $("validationTitle").textContent = "前三事件复核与维度冠军";
+        $("validationDescription").textContent =
+          "综合前三 Hash 在事件回放前已冻结；事件结果不反向改变向量榜排名。";
+        $("validationTableTitle").textContent = "step_event_v1 生存结果";
+        $("validationTableDescription").textContent =
+          `${report.manifest.window_start} 至 ${report.manifest.window_end}，15 BPS 完整交割审计。`;
+        $("validationTableHead").innerHTML = `<tr>
+          <th>总榜</th><th class="left">Hash</th><th>向量年化</th>
+          <th>事件年化</th><th>Δ</th><th>事件夏普</th>
+          <th>成交率</th><th>结论</th>
+        </tr>`;
+        $("auditChainDescription").textContent =
+          "全窗口向量筛选、候选冻结与事件回放严格分层。";
+        $("vaultFilter").style.display = "none";
+      }
+      const experimentIds = report.experiments.map(item => Number(item.id)).filter(Number.isFinite);
+      const experimentRange = experimentIds.length
+        ? `任务 ${Math.min(...experimentIds)}–${Math.max(...experimentIds)}，节点 + 因子`
+        : "冻结任务来源";
+      const selection = report.snapshot.selection_counts || {};
       const kpis = [
-        ["来源记录", report.snapshot.source_rows, "任务 1–8，节点 + 因子"],
-        ["可执行因子", report.snapshot.valid_expressions, `${report.snapshot.invalid_expressions} 个退化式隔离`],
+        ["全库来源记录", report.snapshot.source_rows, experimentRange],
+        ["入选可执行因子", report.snapshot.valid_expressions, `${report.snapshot.selected_unique_expressions} 个入选 AST；${report.snapshot.invalid_expressions} 个隔离`],
         ["经济评估组", report.manifest.economic_equivalence_groups, "相同评估结果合并排名"],
-        ["实战硬筛", report.manifest.practical_pass, "成本、IC、BH q 同时通过"],
-        ["Vault 复核", report.manifest.vault_opened_after_ranking, "总榜前 20 + 维度冠军"],
+        [
+          isVectorScreen ? "诊断硬筛" : "实战硬筛",
+          report.manifest.practical_pass,
+          isVectorScreen
+            ? "全窗口成本、IC、BH q 同时通过"
+            : "成本、IC、BH q 同时通过"
+        ],
+        [
+          isVectorScreen ? "事件复核" : "Vault 复核",
+          isVectorScreen
+            ? report.manifest.finalist_ledgers
+            : report.manifest.vault_opened_after_ranking,
+          isVectorScreen
+            ? "综合前三 · step_event_v1"
+            : "总榜前 20 + 维度冠军"
+        ],
         ["运行失败", report.manifest.failed_expressions, `${report.manifest.artifact_count} 个产物哈希`, true]
       ];
+      if (report.snapshot.source_policy === "us_plus_ashare_price_volume") {
+        kpis.splice(2, 0, [
+          "A股纯量价 AST",
+          selection.ashare_price_volume_unique_expressions,
+          `${integer(selection.ashare_only_price_volume_unique_expressions)} 个 A股独有；${integer(selection.us_ashare_price_volume_overlap_unique_expressions)} 个与美股重复`
+        ]);
+      }
       $("kpis").innerHTML = kpis.map(([label, value, foot, accent]) => `
         <article class="kpi ${accent ? "accent" : ""}">
           <div class="kpi-label">${escapeHtml(label)}</div>
@@ -1102,12 +1604,68 @@ _HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function renderInsights() {
-      const champion = byHash.get(report.finalists.dimension_champions.robust_score) || rows[0];
+      const qualifiedChampion = rows.find(row => row.practical_pass);
+      const champion = qualifiedChampion || rows[0];
+      const championTitle = qualifiedChampion
+        ? "Qualified champion · 硬门槛综合第一"
+        : "No qualified factor · 仅诊断第一";
       const returnChampion = byHash.get(report.finalists.dimension_champions.ann_return_bps_15);
       const icirChampion = byHash.get(report.finalists.dimension_champions.oos_icir);
       const rankIcirChampion = byHash.get(report.finalists.dimension_champions.oos_rank_icir);
       const returnClass = classification(returnChampion);
       const rankClass = classification(rankIcirChampion);
+      if (isVectorScreen) {
+        const replayed = report.finalists.hashes
+          .map(hash => byHash.get(hash))
+          .filter(row => row?.event_replay_status === "ok");
+        const replayPasses = replayed.filter(
+          row => row.event_integrity_all_pass
+        ).length;
+        const eventChampion = replayed.length
+          ? replayed.reduce((best, row) =>
+              Number(row.event_ann_return_bps_15)
+                > Number(best.event_ann_return_bps_15)
+                ? row : best
+            )
+          : champion;
+        $("insights").innerHTML = `
+          <article class="card insight-card primary">
+            <div class="insight-title">${championTitle}</div>
+            <h3>#${champion.overall_rank} · ${escapeHtml(champion.expression_hash)}</h3>
+            <code class="formula">${escapeHtml(champion.expression)}</code>
+            <div class="metric-row">
+              <div class="metric-chip"><span>向量 15bp ${champion.portfolio_metric_basis === "active" ? "主动" : "净"}年化</span><b>${percent(portfolioMetric(champion,"ann_return"))}</b></div>
+              <div class="metric-chip"><span>向量 15bp ${champion.portfolio_metric_basis === "active" ? "主动" : "净"}夏普</span><b>${number(portfolioMetric(champion,"sharpe"))}</b></div>
+              <div class="metric-chip"><span>RankIC</span><b>${number(champion.oos_rank_ic_mean, 4)}</b></div>
+              <div class="metric-chip"><span>事件 15bp 年化</span><b>${percent(champion.event_ann_return_bps_15)}</b></div>
+            </div>
+          </article>
+          <article class="card insight-card">
+            <div class="insight-title">Event verification · 事件复核</div>
+            <h3>${replayPasses} / ${replayed.length} 个候选账本完整通过</h3>
+            <p>事件复核后年化最高为 <strong>${escapeHtml(eventChampion.expression_hash)}</strong>：${percent(eventChampion.event_ann_return_bps_15)}，夏普 ${number(eventChampion.event_sharpe_bps_15)}，最大回撤 ${percent(eventChampion.event_max_drawdown_bps_15)}。</p>
+            <span class="signal ${replayPasses === replayed.length ? "good" : "bad"}">step_event_v1 · 15 BPS</span>
+          </article>
+          <article class="card insight-card">
+            <div class="insight-title">Structure · 因子簇集中</div>
+            <h3>${integer(rows.length)} 行 → ${integer(report.manifest.economic_equivalence_groups)} 个经济评估组</h3>
+            <p>${integer(rows.length - report.manifest.economic_equivalence_groups)} 个方向结果与其他候选产生相同评估指纹。榜单行数不能当成独立 Alpha 数量，组合前仍需做收益相关性聚类和风险暴露残差化。</p>
+            <span class="signal warn">避免重复下注</span>
+          </article>
+          <article class="card insight-card">
+            <div class="insight-title">Return champion · 收益单项第一</div>
+            <h3>${escapeHtml(returnChampion.expression_hash)}</h3>
+            <p>向量 15bp 年化 ${percent(returnChampion.ann_return_bps_15)}、夏普 ${number(returnChampion.sharpe_bps_15)}；${returnChampion.event_replay_status === "ok" ? `事件年化 ${percent(returnChampion.event_ann_return_bps_15)}` : "不在综合前三，尚未进行事件回放"}。</p>
+            <span class="signal ${returnClass[1]}">${returnClass[0]} · 不替代综合排名</span>
+          </article>
+          <article class="card insight-card">
+            <div class="insight-title">ICIR champion · 指标边界</div>
+            <h3>${escapeHtml(icirChampion.expression_hash)}</h3>
+            <p>全窗口 ICIR ${number(icirChampion.oos_icir)}，15bp 年化 ${percent(icirChampion.ann_return_bps_15)}。这是同一全窗口内的诊断统计，不是独立样本外证据。</p>
+            <span class="signal warn">IC 高不等于可交易</span>
+          </article>`;
+        return;
+      }
       $("insights").innerHTML = `
         <article class="card insight-card primary">
           <div class="insight-title">Balanced champion · 综合第一</div>
@@ -1128,8 +1686,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
         </article>
         <article class="card insight-card">
           <div class="insight-title">Structure · 因子簇集中</div>
-          <h3>前列集中在低振幅 / 低波动</h3>
-          <p>总榜前十多数只是同一经济机制的非线性或窗口变体，不能把十行榜单当成十个独立 Alpha。组合前应再做相关性聚类和风险暴露残差化。</p>
+          <h3>${integer(rows.length)} 行 → ${integer(report.manifest.economic_equivalence_groups)} 个经济评估组</h3>
+          <p>${integer(rows.length - report.manifest.economic_equivalence_groups)} 个表达式与其他候选产生相同评估指纹。榜单行数不能直接当成独立 Alpha 数量，组合前仍需做收益相关性聚类和风险暴露残差化。</p>
           <span class="signal warn">避免重复下注</span>
         </article>
         <article class="card insight-card">
@@ -1157,7 +1715,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
         if (origin && row.origin_scope !== origin) return false;
         if (pass === "pass" && !row.practical_pass) return false;
         if (pass === "fail" && row.practical_pass) return false;
-        if (vault && row.vault_status !== vault) return false;
+        if (!isVectorScreen && vault && row.vault_status !== vault) {
+          return false;
+        }
         if (query) {
           const haystack = [
             row.expression_hash, row.expression, row.origin_scope,
@@ -1195,9 +1755,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const start = (page - 1) * pageSize;
       const slice = filtered.slice(start, start + pageSize);
       $("leaderboardBody").innerHTML = slice.map(row => {
-        const vaultText = row.vault_status === "ok"
-          ? `<span class="${tone(row.vault_ann_return_bps_15)}">${percent(row.vault_ann_return_bps_15)}</span><br><span class="neutral">${number(row.vault_sharpe_bps_15)}</span>`
-          : `<span class="neutral">未开封</span>`;
+        const rankingReturns = [0,5,15].map(bps => portfolioMetric(row,"ann_return",bps));
+        const rankingSharpes = [0,5,15].map(bps => portfolioMetric(row,"sharpe",bps));
+        const vaultText = isVectorScreen
+          ? (
+            row.event_replay_status === "ok"
+              ? `<span class="${tone(row.event_ann_return_bps_15)}">${percent(row.event_ann_return_bps_15)}</span><br><span class="neutral">${number(row.event_sharpe_bps_15)}</span>`
+              : `<span class="neutral">未复核</span>`
+          )
+          : (
+            row.vault_status === "ok"
+              ? `<span class="${tone(row.vault_ann_return_bps_15)}">${percent(row.vault_ann_return_bps_15)}</span><br><span class="neutral">${number(row.vault_sharpe_bps_15)}</span>`
+              : `<span class="neutral">未开封</span>`
+          );
         const representativeTag = row.economic_representative
           ? ""
           : `<span class="signal warn">重复 ${escapeHtml(shortHash(row.economic_duplicate_of))}</span>`;
@@ -1209,9 +1779,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
           </td>
           <td><span class="pill origin">${escapeHtml(row.origin_scope)}</span></td>
           <td class="${row.direction < 0 ? "negative" : "positive"}">${row.direction > 0 ? "+1" : "−1"}</td>
-          <td>${number(row.robust_score, 2)}</td>
-          <td>${stack([row.ann_return_bps_0,row.ann_return_bps_5,row.ann_return_bps_15], percent, true)}</td>
-          <td>${stack([row.sharpe_bps_0,row.sharpe_bps_5,row.sharpe_bps_15], value => number(value), true)}</td>
+          <td>${stack([row.absolute_quality_score,row.robust_score], value => number(value,2))}</td>
+          <td>${stack(rankingReturns, percent, true)}</td>
+          <td>${stack(rankingSharpes, value => number(value), true)}</td>
           <td><span class="${tone(row.oos_ic_mean)}">${number(row.oos_ic_mean,4)}</span><br><span class="neutral">${number(row.oos_icir)}</span></td>
           <td><span class="${tone(row.oos_rank_ic_mean)}">${number(row.oos_rank_ic_mean,4)}</span><br><span class="neutral">${number(row.oos_rank_icir)}</span></td>
           <td>${vaultText}</td>
@@ -1242,12 +1812,51 @@ _HTML_TEMPLATE = r"""<!doctype html>
         `历史 ${row.required_history}d`, `复杂度 ${row.complexity}`,
         `组大小 ${row.equivalence_group_size}`
       ];
+      const layerTable = isVectorScreen
+        ? `<div class="drawer-section">
+            <h3>全窗口向量筛选 → 冻结 → 事件复核</h3>
+            <table class="layer-table">
+              <thead><tr><th class="left">层</th><th>年化 15bp</th><th>夏普</th><th>IC</th><th>ICIR</th><th>RankIC</th><th>RankICIR</th></tr></thead>
+              <tbody>
+                <tr><td class="left">FULL_WINDOW_VECTOR</td><td>${percent(row.ann_return_bps_15)}</td><td>${number(row.sharpe_bps_15)}</td><td>${number(row.oos_ic_mean,4)}</td><td>${number(row.oos_icir)}</td><td>${number(row.oos_rank_ic_mean,4)}</td><td>${number(row.oos_rank_icir)}</td></tr>
+                <tr><td class="left">TOP3_STEP_EVENT</td><td>${percent(row.event_ann_return_bps_15)}</td><td>${number(row.event_sharpe_bps_15)}</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+              </tbody>
+            </table>
+            <p class="neutral" style="font-size:10px;margin-top:9px">两层使用同一 2020 至最新交易日窗口；事件复核验证执行可行性，不构成新的样本外证据。</p>
+          </div>`
+        : `<div class="drawer-section">
+            <h3>训练 → 榜单期 → Vault</h3>
+            <table class="layer-table">
+              <thead><tr><th class="left">层</th><th>年化 15bp</th><th>夏普</th><th>IC</th><th>ICIR</th><th>RankIC</th><th>RankICIR</th></tr></thead>
+              <tbody>
+                <tr><td class="left">META_TRAIN</td><td>—</td><td>—</td><td>${number(row.train_ic_mean,4)}</td><td>${number(row.train_icir)}</td><td>${number(row.train_rank_ic_mean,4)}</td><td>${number(row.train_rank_icir)}</td></tr>
+                <tr><td class="left">META_HOLDOUT</td><td>${percent(row.ann_return_bps_15)}</td><td>${number(row.sharpe_bps_15)}</td><td>${number(row.oos_ic_mean,4)}</td><td>${number(row.oos_icir)}</td><td>${number(row.oos_rank_ic_mean,4)}</td><td>${number(row.oos_rank_icir)}</td></tr>
+                <tr><td class="left">FACTOR_VAULT</td><td>${percent(row.vault_ann_return_bps_15)}</td><td>${number(row.vault_sharpe_bps_15)}</td><td>${number(row.vault_ic_mean,4)}</td><td>${number(row.vault_icir)}</td><td>${number(row.vault_rank_ic_mean,4)}</td><td>${number(row.vault_rank_icir)}</td></tr>
+              </tbody>
+            </table>
+          </div>`;
+      const eventExecution = (
+        isVectorScreen && row.event_replay_status === "ok"
+      );
+      const executionMetrics = [
+        ["日均换手", percent(eventExecution ? row.event_avg_daily_turnover_bps_15 : row.avg_daily_turnover_bps_15)],
+        ["成交率", percent(eventExecution ? row.event_fill_rate_bps_15 : row.fill_rate_bps_15)],
+        ["成交笔数", integer(eventExecution ? row.event_fills_bps_15 : row.fills_bps_15)],
+        ["总执行成本", money(eventExecution ? row.event_total_execution_cost_bps_15 : row.total_execution_cost_bps_15)],
+        ["佣金 / 费税", money(eventExecution ? row.event_commission_and_tax_bps_15 : row.commission_and_tax_bps_15)],
+        ["滑点", money(eventExecution ? row.event_slippage_cost_bps_15 : row.slippage_cost_bps_15)],
+        ["借券费", money(eventExecution ? row.event_borrow_cost_bps_15 : row.borrow_cost_bps_15)],
+        ["平均总敞口", percent(eventExecution ? row.event_avg_gross_exposure_bps_15 : row.avg_gross_exposure_bps_15)],
+        ["平均净敞口", percent(eventExecution ? row.event_avg_net_exposure_bps_15 : row.avg_net_exposure_bps_15)],
+        ["RankIC BH q", number(row.oos_rank_ic_bh_q,6)],
+        ["来源记录", integer(row.source_record_count)]
+      ];
       $("drawerContent").innerHTML = `
         <div class="drawer-top">
           <div>
             <div class="eyebrow">Factor detail · #${integer(row.overall_rank)}</div>
             <h2>${escapeHtml(row.expression_hash)}</h2>
-            <span class="signal ${row.practical_pass ? "good" : "bad"}">${row.practical_pass ? "PRACTICAL PASS" : "SCREENED OUT"}</span>
+            <span class="signal ${row.practical_pass ? "good" : "bad"}">${row.practical_pass ? (isVectorScreen ? "DIAGNOSTIC PASS" : "PRACTICAL PASS") : "SCREENED OUT"}</span>
             <span class="signal ${statusClass}">${statusText}</span>
           </div>
           <button class="btn drawer-close" type="button" aria-label="关闭详情">×</button>
@@ -1261,10 +1870,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
           <h3>核心指标</h3>
           <div class="metric-grid">
             ${[
-              ["稳健分", number(row.robust_score,2)],
-              ["15bp 年化", percent(row.ann_return_bps_15)],
-              ["15bp 夏普", number(row.sharpe_bps_15)],
-              ["最大回撤", percent(row.max_drawdown_bps_15)],
+              ["绝对质量分", number(row.absolute_quality_score,2)],
+              ["横截面相对分", number(row.robust_score,2)],
+              [`15bp ${row.portfolio_metric_basis === "active" ? "主动" : "净"}年化`, percent(portfolioMetric(row,"ann_return"))],
+              [`15bp ${row.portfolio_metric_basis === "active" ? "主动" : "净"}夏普`, number(portfolioMetric(row,"sharpe"))],
+              ["排名口径最大回撤", percent(portfolioMetric(row,"max_drawdown"))],
               ["IC", number(row.oos_ic_mean,4)],
               ["ICIR", number(row.oos_icir)],
               ["RankIC", number(row.oos_rank_ic_mean,4)],
@@ -1272,30 +1882,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
             ].map(([label,value]) => `<div class="detail-metric"><span>${label}</span><b>${value}</b></div>`).join("")}
           </div>
         </div>
+        ${layerTable}
         <div class="drawer-section">
-          <h3>训练 → 榜单期 → Vault</h3>
-          <table class="layer-table">
-            <thead><tr><th class="left">层</th><th>年化 15bp</th><th>夏普</th><th>IC</th><th>ICIR</th><th>RankIC</th><th>RankICIR</th></tr></thead>
-            <tbody>
-              <tr><td class="left">META_TRAIN</td><td>—</td><td>—</td><td>${number(row.train_ic_mean,4)}</td><td>${number(row.train_icir)}</td><td>${number(row.train_rank_ic_mean,4)}</td><td>${number(row.train_rank_icir)}</td></tr>
-              <tr><td class="left">META_HOLDOUT</td><td>${percent(row.ann_return_bps_15)}</td><td>${number(row.sharpe_bps_15)}</td><td>${number(row.oos_ic_mean,4)}</td><td>${number(row.oos_icir)}</td><td>${number(row.oos_rank_ic_mean,4)}</td><td>${number(row.oos_rank_icir)}</td></tr>
-              <tr><td class="left">FACTOR_VAULT</td><td>${percent(row.vault_ann_return_bps_15)}</td><td>${number(row.vault_sharpe_bps_15)}</td><td>${number(row.vault_ic_mean,4)}</td><td>${number(row.vault_icir)}</td><td>${number(row.vault_rank_ic_mean,4)}</td><td>${number(row.vault_rank_icir)}</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="drawer-section">
-          <h3>执行质量（15bp）</h3>
+          <h3>${eventExecution ? "事件执行质量（15bp）" : "向量执行代理（15bp）"}</h3>
           <div class="metric-grid">
-            ${[
-              ["日均换手", percent(row.avg_daily_turnover_bps_15)],
-              ["成交率", percent(row.fill_rate_bps_15)],
-              ["成交笔数", integer(row.fills_bps_15)],
-              ["总执行成本", finite(row.total_execution_cost_bps_15) ? `¥${integer(Math.round(row.total_execution_cost_bps_15))}` : "—"],
-              ["费税", finite(row.commission_and_tax_bps_15) ? `¥${integer(Math.round(row.commission_and_tax_bps_15))}` : "—"],
-              ["滑点", finite(row.slippage_cost_bps_15) ? `¥${integer(Math.round(row.slippage_cost_bps_15))}` : "—"],
-              ["RankIC BH q", number(row.oos_rank_ic_bh_q,6)],
-              ["来源记录", integer(row.source_record_count)]
-            ].map(([label,value]) => `<div class="detail-metric"><span>${label}</span><b>${value}</b></div>`).join("")}
+            ${executionMetrics.map(([label,value]) => `<div class="detail-metric"><span>${label}</span><b>${value}</b></div>`).join("")}
           </div>
         </div>
         <div class="drawer-section">
@@ -1319,21 +1910,46 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
     function renderVault() {
       const vaultRows = report.finalists.hashes.map(hash => byHash.get(hash)).filter(Boolean);
-      $("vaultStatus").textContent = `${vaultRows.length} / ${vaultRows.length} integrity pass`;
-      $("vaultBody").innerHTML = vaultRows.map(row => {
-        const delta = Number(row.vault_ann_return_bps_15) - Number(row.ann_return_bps_15);
-        const [label, style] = classification(row);
-        return `<tr data-hash="${escapeHtml(row.expression_hash)}">
-          <td>#${integer(row.overall_rank)}</td>
-          <td class="left"><span class="hash">${escapeHtml(row.expression_hash)}</span></td>
-          <td>${percent(row.ann_return_bps_15)}</td>
-          <td class="${tone(row.vault_ann_return_bps_15)}">${percent(row.vault_ann_return_bps_15)}</td>
-          <td class="${tone(delta)}">${signed(delta)}</td>
-          <td>${number(row.vault_sharpe_bps_15)}</td>
-          <td>${number(row.vault_rank_ic_mean,4)}</td>
-          <td><span class="signal ${style}">${label}</span></td>
-        </tr>`;
-      }).join("");
+      if (isVectorScreen) {
+        const passes = vaultRows.filter(
+          row => row.event_integrity_all_pass
+        ).length;
+        $("vaultStatus").textContent =
+          `${passes} / ${vaultRows.length} ledger integrity pass`;
+        $("vaultBody").innerHTML = vaultRows.map(row => {
+          const delta = (
+            Number(row.event_ann_return_bps_15)
+            - Number(row.ann_return_bps_15)
+          );
+          const [label, style] = classification(row);
+          return `<tr data-hash="${escapeHtml(row.expression_hash)}">
+            <td>#${integer(row.overall_rank)}</td>
+            <td class="left"><span class="hash">${escapeHtml(row.expression_hash)}</span></td>
+            <td>${percent(row.ann_return_bps_15)}</td>
+            <td class="${tone(row.event_ann_return_bps_15)}">${percent(row.event_ann_return_bps_15)}</td>
+            <td class="${tone(delta)}">${signed(delta)}</td>
+            <td>${number(row.event_sharpe_bps_15)}</td>
+            <td>${percent(row.event_fill_rate_bps_15)}</td>
+            <td><span class="signal ${style}">${label}</span></td>
+          </tr>`;
+        }).join("");
+      } else {
+        $("vaultStatus").textContent = `${vaultRows.length} / ${vaultRows.length} integrity pass`;
+        $("vaultBody").innerHTML = vaultRows.map(row => {
+          const delta = Number(row.vault_ann_return_bps_15) - Number(row.ann_return_bps_15);
+          const [label, style] = classification(row);
+          return `<tr data-hash="${escapeHtml(row.expression_hash)}">
+            <td>#${integer(row.overall_rank)}</td>
+            <td class="left"><span class="hash">${escapeHtml(row.expression_hash)}</span></td>
+            <td>${percent(row.ann_return_bps_15)}</td>
+            <td class="${tone(row.vault_ann_return_bps_15)}">${percent(row.vault_ann_return_bps_15)}</td>
+            <td class="${tone(delta)}">${signed(delta)}</td>
+            <td>${number(row.vault_sharpe_bps_15)}</td>
+            <td>${number(row.vault_rank_ic_mean,4)}</td>
+            <td><span class="signal ${style}">${label}</span></td>
+          </tr>`;
+        }).join("");
+      }
       document.querySelectorAll("#vaultBody tr").forEach(tr => tr.addEventListener("click", () => openDrawer(tr.dataset.hash)));
 
       $("champions").innerHTML = Object.entries(report.finalists.dimension_champions).map(([dimension, hash]) => {
@@ -1349,14 +1965,22 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
     function renderAudit() {
       const spec = report.protocol.spec;
-      const rows = [
-        ["META_TRAIN", "2020–2022 · 仅冻结正/反方向", "read-only direction"],
-        ["META_HOLDOUT", "2023–2024 · 排名、IC 与 0/5/15bp", "ranking"],
-        ["FREEZE", `${report.finalists.hashes.length} 个 Hash 在 Vault 前冻结`, "hash sealed"],
-        ["FACTOR_VAULT", "2025–2026 · 不进入分数", "one-time"],
-        ["LEDGER", `${report.manifest.finalist_ledgers} 个完整逐笔交割单`, "reconciled"]
-      ];
-      $("timeline").innerHTML = rows.map(([label, text, state]) => `
+      const auditRows = isVectorScreen
+        ? [
+          ["SNAPSHOT", `${report.snapshot.snapshot_at} · 表达式与数据身份冻结`, "hash sealed"],
+          ["VECTOR", `${report.manifest.window_start}–${report.manifest.window_end} · 正反方向 · 0/5/15bp`, "screening"],
+          ["FREEZE", `${report.finalists.hashes.length} 个综合候选在事件回放前冻结`, "rank sealed"],
+          ["STEP_EVENT", "同窗口 · 15bp · 真实费率与执行约束", "verification"],
+          ["LEDGER", `${report.manifest.finalist_ledgers} 个完整逐笔交割单`, "reconciled"]
+        ]
+        : [
+          ["META_TRAIN", "2020–2022 · 仅冻结正/反方向", "read-only direction"],
+          ["META_HOLDOUT", "2023–2024 · 排名、IC 与 0/5/15bp", "ranking"],
+          ["FREEZE", `${report.finalists.hashes.length} 个 Hash 在 Vault 前冻结`, "hash sealed"],
+          ["FACTOR_VAULT", "2025–2026 · 不进入分数", "one-time"],
+          ["LEDGER", `${report.manifest.finalist_ledgers} 个完整逐笔交割单`, "reconciled"]
+        ];
+      $("timeline").innerHTML = auditRows.map(([label, text, state]) => `
         <div class="timeline-row"><b>${label}</b><span>${text}</span><span class="signal good">${state}</span></div>`
       ).join("");
       $("ledgerList").innerHTML = Object.entries(report.ledgers).map(([hash, ledger]) => {
@@ -1381,7 +2005,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       }).join("");
       $("auditSummary").textContent =
         `${report.manifest.artifact_count} 个源产物哈希；${report.manifest.successful_expressions} 个结果，${report.manifest.failed_expressions} 个运行失败；` +
-        `A股万二免五，卖出印花税与双向过户费，额外滑点 0/5/15 BPS；初始资金 CNY ${integer(spec.initial_capital)}。`;
+        `${presentation.fee_summary}；初始资金 ${presentation.currency} ${integer(spec.initial_capital)}。`;
+      $("invalidSummary").textContent = `查看 ${integer(report.invalid.length)} 个无效或不可迁移表达式`;
       $("invalidList").innerHTML = report.invalid.map(row => `
         <div class="invalid-row">
           <span class="signal bad">${escapeHtml(row.validation_error)}</span>
@@ -1449,12 +2074,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
       }));
       scatterPoints.forEach(point => {
         const row = point.row;
-        const vault = row.vault_status === "ok";
+        const independentlyChecked = isVectorScreen
+          ? row.event_replay_status === "ok"
+          : row.vault_status === "ok";
         ctx.beginPath();
         ctx.arc(point.x, point.y, row.overall_rank <= 20 ? 3.2 : 2.1, 0, Math.PI*2);
         ctx.fillStyle = row.practical_pass ? "rgba(63,185,80,.62)" : "rgba(111,126,143,.30)";
         ctx.fill();
-        if (vault || row.expression_hash === selectedHash) {
+        if (independentlyChecked || row.expression_hash === selectedHash) {
           ctx.strokeStyle = row.expression_hash === selectedHash ? "#79c0ff" : "rgba(88,166,255,.70)";
           ctx.lineWidth = row.expression_hash === selectedHash ? 2 : 1;
           ctx.stroke();
@@ -1512,11 +2139,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
     function exportCsv() {
       const columns = [
-        "overall_rank","expression_hash","origin_scope","direction","practical_pass","robust_score",
+        "overall_rank","expression_hash","origin_scope","direction","practical_pass","qualification_status","absolute_quality_score","robust_score","portfolio_metric_basis",
         "ann_return_bps_0","ann_return_bps_5","ann_return_bps_15",
         "sharpe_bps_0","sharpe_bps_5","sharpe_bps_15",
         "oos_ic_mean","oos_icir","oos_rank_ic_mean","oos_rank_icir",
-        "vault_ann_return_bps_15","vault_sharpe_bps_15","expression"
+        "vault_ann_return_bps_15","vault_sharpe_bps_15",
+        "event_ann_return_bps_15","event_sharpe_bps_15",
+        "event_integrity_all_pass","expression"
       ];
       const csvCell = value => `"${String(value ?? "").replaceAll('"','""')}"`;
       const content = [columns.join(","), ...filtered.map(row => columns.map(key => csvCell(row[key])).join(","))].join("\n");
