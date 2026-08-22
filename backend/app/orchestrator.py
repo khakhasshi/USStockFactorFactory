@@ -35,6 +35,7 @@ from .config import (
     SERVICE_INSTANCE,
     get_dsl_fields,
     resolve_engine_tasks,
+    service_accepts_task,
 )
 from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
@@ -748,16 +749,15 @@ class Engine:
         async with SessionLocal() as s:
             exp = await s.get(Experiment, self.exp_id)
             self.task_config = dict(exp.research_config or {}) if exp else {}
-        task_service = str(
-            self.task_config.get("service_instance") or ""
-        ).strip()
-        if task_service and task_service != SERVICE_INSTANCE:
+        task_service = str(self.task_config.get("service_instance") or "").strip()
+        if not service_accepts_task(self.task_config):
             self.running = False
             return {
                 "ok": False,
                 "msg": (
                     f"研究任务 {self.exp_id} 绑定服务 {task_service}，"
-                    f"当前实例为 {SERVICE_INSTANCE}"
+                    f"当前实例为 {SERVICE_INSTANCE}；"
+                    "只有架构中立的统一主服务可以手动接管历史实例任务"
                 ),
             }
         if SERVICE_ARCHITECTURE in {"two_layer", "three_layer"}:
