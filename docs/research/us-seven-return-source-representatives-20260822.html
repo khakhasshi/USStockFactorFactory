@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>美股七个收益来源代表因子研究报告</title>
+  <style>
+    :root{--ink:#152237;--muted:#607087;--line:#dce3ec;--paper:#f5f7fb;--card:#fff;--blue:#2557d6;--cyan:#0e8291;--green:#17805c;--amber:#a76100;--red:#b32f3c;--navy:#0f1e36}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.68}
+    .hero{background:radial-gradient(circle at 82% 20%,#245bbd 0,transparent 35%),linear-gradient(135deg,#0b172c,#142e58 62%,#0c5661);color:#fff;padding:58px 28px 52px}.wrap{max-width:1180px;margin:auto}.eyebrow{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#8edbe2;font-weight:750}.hero h1{font-size:42px;line-height:1.16;margin:12px 0 15px;max-width:900px}.hero p{max-width:850px;color:#d7e3f4;font-size:17px}.meta{display:flex;flex-wrap:wrap;gap:9px;margin-top:25px}.pill{display:inline-flex;padding:5px 10px;border:1px solid #ffffff3b;border-radius:999px;background:#ffffff10;font-size:12px}.toc{position:sticky;top:0;z-index:5;background:#ffffffed;backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}.toc .wrap{display:flex;gap:22px;overflow:auto;padding:11px 22px}.toc a{white-space:nowrap;text-decoration:none;color:var(--muted);font-size:13px;font-weight:650}.toc a:hover{color:var(--blue)}main{padding:30px 22px 70px}section{scroll-margin-top:62px;margin:0 0 28px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px}.kpi,.card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 7px 22px #243d6920}.kpi{padding:18px}.kpi span{display:block;color:var(--muted);font-size:12px}.kpi b{display:block;font-size:27px;color:var(--navy);margin:3px 0}.kpi small{color:var(--muted)}.card{padding:24px;margin-top:14px}h2{font-size:25px;margin:0 0 12px;color:var(--navy)}h3{font-size:17px;margin:22px 0 9px;color:var(--navy)}p{margin:8px 0}.lead{font-size:17px}.callout{border-left:4px solid var(--blue);background:#edf3ff;padding:15px 17px;border-radius:9px;margin:14px 0}.callout.warn{border-color:var(--amber);background:#fff7e8}.callout.reject{border-color:var(--red);background:#fff0f1}.callout.ok{border-color:var(--green);background:#edf9f4}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:11px;margin-top:13px}table{border-collapse:collapse;width:100%;min-width:880px;background:#fff}th,td{text-align:left;vertical-align:top;padding:11px 12px;border-bottom:1px solid var(--line);font-size:13px}th{background:#eef2f8;color:#42516a;font-size:11px;text-transform:uppercase;letter-spacing:.04em}tr:last-child td{border-bottom:0}.dir-plus{color:var(--green);font-weight:750}.dir-minus{color:var(--red);font-weight:750}.code{display:block;margin-top:7px;padding:9px 10px;border-radius:8px;background:#101c30;color:#dbe8fa;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:normal;overflow-wrap:anywhere}.factor-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.factor{border:1px solid var(--line);border-radius:12px;padding:18px;background:#fff}.factor-head{display:flex;justify-content:space-between;gap:12px}.factor h3{margin:0;font-size:17px}.factor .tag{font-size:11px;border-radius:999px;padding:3px 8px;background:#eaf0fa;color:#315071;white-space:nowrap}.factor dl{display:grid;grid-template-columns:90px 1fr;gap:4px 8px;margin:12px 0;font-size:12px}.factor dt{color:var(--muted)}.factor dd{margin:0}.bar{height:7px;background:#e7ebf1;border-radius:99px;overflow:hidden;margin-top:7px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan))}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.metric-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.metric{padding:12px;border-radius:9px;background:#f2f5fa}.metric span{font-size:11px;color:var(--muted);display:block}.metric b{font-size:18px}.good{color:var(--green)}.bad{color:var(--red)}.amber{color:var(--amber)}ul{padding-left:21px}.checklist{list-style:none;padding:0}.checklist li{padding:7px 0;border-bottom:1px solid var(--line)}.checklist li:before{content:"✓";color:var(--green);font-weight:800;margin-right:9px}.checklist li.fail:before{content:"✕";color:var(--red)}footer{padding:25px 22px;background:#e9edf4;color:var(--muted);font-size:12px}.evidence{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;overflow-wrap:anywhere}.status{display:inline-block;font-weight:800;border-radius:7px;padding:4px 8px}.status.reject{color:var(--red);background:#ffe5e8}.status.research{color:var(--amber);background:#fff0d0}
+    @media(max-width:860px){.grid,.metric-row{grid-template-columns:repeat(2,1fr)}.factor-grid,.two{grid-template-columns:1fr}.hero h1{font-size:32px}}@media(max-width:520px){.grid,.metric-row{grid-template-columns:1fr}.hero{padding:40px 20px}.hero h1{font-size:28px}main{padding:22px 13px 50px}.card{padding:18px}}
+    @media print{.toc{display:none}.hero{padding:32px;background:#142e58!important;-webkit-print-color-adjust:exact}.card,.kpi{box-shadow:none;break-inside:avoid}body{background:#fff}main{padding:20px}}
+  </style>
+</head>
+<body>
+  <header class="hero"><div class="wrap">
+    <div class="eyebrow">FactorFactory · Audited Research Conclusion · 2026-08-22</div>
+    <h1>美股七个收益来源代表因子研究报告</h1>
+    <p>综合内部多空、内部纯多、外部多空、外部纯多四张Top100榜单，对收益路径去重后冻结代表表达式与方向，并用固定消融、嵌套权重和最新程序化优化复核其组合价值。</p>
+    <div class="meta"><span class="pill">市场：US</span><span class="pill">股票池：滚动流动性Top500</span><span class="pill">调仓：5日</span><span class="pill">基础成本：15 BPS</span><span class="pill">多空借券代理：300 BPS/年</span><span class="pill">NON-PIT RESEARCH</span></div>
+  </div></header>
+  <nav class="toc"><div class="wrap"><a href="#conclusion">核心结论</a><a href="#method">去重方法</a><a href="#factors">七个因子</a><a href="#round1">第一轮</a><a href="#round2">第二轮</a><a href="#latest">最新优化</a><a href="#construction">组合构造</a><a href="#limits">边界与行动</a><a href="#evidence">证据血缘</a></div></nav>
+  <main class="wrap">
+    <section id="conclusion">
+      <div class="grid">
+        <div class="kpi"><span>四榜席位</span><b>400</b><small>每榜Top100冻结</small></div>
+        <div class="kpi"><span>唯一公式</span><b>224</b><small>表达式与方向统一重放</small></div>
+        <div class="kpi"><span>全局无符号聚类</span><b>48</b><small>|ρ|≥0.80合并</small></div>
+        <div class="kpi"><span>有效收益来源</span><b>8.03</b><small>HHI倒数，不是因子数量</small></div>
+      </div>
+      <div class="card">
+        <h2>核心结论</h2>
+        <p class="lead"><strong>冻结的是7个代表因子，但它们只构成6个组合袖套。</strong>U0010与U0013都属于长周期动量/波动调整趋势袖套，不能被当成两个完全独立的经济收益来源。其余五条分别代表价格冲击流动性、低绝对振幅、股量流动性、短期反转和价格关系。</p>
+        <div class="callout ok">2020–2024固定方案实验显示，按“六袖套等权、动量袖套内部两因子各半”构造的基准，在纯多和多空中都比七因子机械等权更稳健；2024协议内测试仍支持等权袖套。</div>
+        <div class="callout reject"><strong>但最新严格嵌套优化给出 NO_COMBINATION。</strong>2010–2016训练看似有效的候选，在2017–2019验证中收益和Sharpe转负，未通过FDR、最差年度、盈利年度比例与压力成本门槛。因此当前证据支持“保留研究资产、继续复核”，不支持直接晋升为正式组合。</div>
+        <p><span class="status research">研究结论</span> 七条公式可作为多因子研究组件池；默认基准应采用六袖套等权，而不是把七条公式视为七个同权独立来源。任何“最优权重”必须在新的预声明窗口中重新验证。</p>
+      </div>
+    </section>
+
+    <section id="method" class="card">
+      <h2>一、收益来源如何去重</h2>
+      <div class="two">
+        <div><h3>审计输入</h3><ul><li>内部美股多空榜Top100</li><li>内部美股纯多榜Top100</li><li>外部A股+美股因子在美股多空榜Top100</li><li>外部A股+美股因子在美股纯多榜Top100</li></ul></div>
+        <div><h3>聚类口径</h3><ul><li>共同回放窗口：2020-01-01至2026-08-19</li><li>方向冻结后生成可交易收益路径</li><li>全局无符号相关：|ρ|≥0.80视为同源</li><li>400个席位压缩为224个唯一公式、48个聚类</li></ul></div>
+      </div>
+      <div class="callout warn">“48个相关性簇”不是“48个可靠收益来源”。大量簇是单例或小样本，且榜单选择已经使用全窗口。有效来源8.03是集中度诊断；本报告选七条代表式，是为了可操作的组合研究，不是宣称只存在七种Alpha。</div>
+    </section>
+
+    <section id="factors">
+      <div class="card"><h2>二、冻结的七个代表因子</h2><p>方向含义：<span class="dir-plus">+1</span> 表示原表达式高值侧偏多；<span class="dir-minus">-1</span> 表示原表达式低值侧偏多。下列单因子年化、Sharpe和回撤来自共同窗口代表路径，仅用于描述簇代表，不等于独立样本外证据。</p></div>
+      <div class="factor-grid">
+        <article class="factor"><div class="factor-head"><h3>U0002 · 价格冲击流动性</h3><span class="tag">簇规模 109</span></div><dl><dt>方向</dt><dd class="dir-minus">-1 · 低值偏多</dd><dt>覆盖</dt><dd>四张榜单全部出现，跨内外部/跨组合模式</dd><dt>代表表现</dt><dd>年化 5.79% · Sharpe 1.045 · 回撤 7.68%</dd><dt>经济解释</dt><dd>单位成交额对应的价格振幅越低，价格冲击和交易摩擦代理越小。</dd></dl><code class="code">rank(winsor_mad(ts_mean(((high - low) / amount), 120), 5))</code><div class="bar"><i style="width:100%"></i></div></article>
+        <article class="factor"><div class="factor-head"><h3>U0005 · 低绝对振幅</h3><span class="tag">簇规模 19</span></div><dl><dt>方向</dt><dd class="dir-plus">+1 · 高值偏多</dd><dt>覆盖</dt><dd>四张榜单全部出现，跨内外部/跨组合模式</dd><dt>代表表现</dt><dd>年化 5.17% · Sharpe 0.705 · 回撤 9.95%</dd><dt>经济解释</dt><dd>偏好60日绝对高低价差较小的股票；可能混入价格水平暴露，并非纯比例波动。</dd></dl><code class="code">rank((-ts_mean((high - low), 60)))</code><div class="bar"><i style="width:17%"></i></div></article>
+        <article class="factor"><div class="factor-head"><h3>U0010 · 长周期动量×波动</h3><span class="tag">簇规模 46</span></div><dl><dt>方向</dt><dd class="dir-plus">+1 · 高值偏多</dd><dt>袖套</dt><dd>长周期动量（与U0013共享一个袖套）</dd><dt>覆盖</dt><dd>四张榜单全部出现，跨内外部/跨组合模式</dd><dt>代表表现</dt><dd>年化 8.76% · Sharpe 0.542 · 回撤 28.96%</dd><dt>经济解释</dt><dd>252日趋势与60日波动的交互，强调高波动环境中的长趋势。</dd></dl><code class="code">zscore(winsor_mad(((-returns(close, 252)) * (-ts_std(returns(close, 1), 60))), 5))</code><div class="bar"><i style="width:42%"></i></div></article>
+        <article class="factor"><div class="factor-head"><h3>U0013 · 残差动量</h3><span class="tag">簇规模 8</span></div><dl><dt>方向</dt><dd class="dir-plus">+1 · 高值偏多</dd><dt>袖套</dt><dd>长周期动量（与U0010共享一个袖套）</dd><dt>覆盖</dt><dd>内部多空、内部纯多、外部多空</dd><dt>代表表现</dt><dd>年化 3.48% · Sharpe 0.323 · 回撤 18.29%</dd><dt>经济解释</dt><dd>250日趋势剔除近20日走势，再用长期日变化波动标准化。</dd></dl><code class="code">winsor((ts_delta(log(close), 250) - ts_delta(log(close), 20)) / ts_std(ts_delta(log(close), 1), 250))</code><div class="bar"><i style="width:7%"></i></div></article>
+        <article class="factor"><div class="factor-head"><h3>U0001 · 股量流动性</h3><span class="tag">簇规模 31</span></div><dl><dt>方向</dt><dd class="dir-minus">-1 · 低值偏多</dd><dt>覆盖</dt><dd>外部多空、外部纯多，跨组合模式</dd><dt>代表表现</dt><dd>年化 9.83% · Sharpe 1.063 · 回撤 11.46%</dd><dt>经济解释</dt><dd>close/amount近似逆成交股量代理；反向后偏好更高股量流动性。</dd></dl><code class="code">rank(ts_mean((close / ts_mean(amount, 50)), 200))</code><div class="bar"><i style="width:28%"></i></div></article>
+        <article class="factor"><div class="factor-head"><h3>U0006 · 短期反转</h3><span class="tag">簇规模 1</span></div><dl><dt>方向</dt><dd class="dir-plus">+1 · 高值偏多</dd><dt>覆盖</dt><dd>仅外部纯多，是最脆弱的单例来源</dd><dt>代表表现</dt><dd>年化 6.32% · Sharpe 0.700 · 回撤 16.29%</dd><dt>经济解释</dt><dd>过去120日相邻日收益乘积的负均值；越高表示负自相关越强。</dd></dl><code class="code">zscore(winsor_mad((-ts_mean((returns(close, 1) * delay(returns(close, 1), 1)), 120)), 5))</code><div class="bar"><i style="width:1%"></i></div></article>
+        <article class="factor"><div class="factor-head"><h3>U0012 · 价格关系</h3><span class="tag">簇规模 2</span></div><dl><dt>方向</dt><dd class="dir-plus">+1 · 高值偏多</dd><dt>覆盖</dt><dd>内部多空、内部纯多，跨组合模式</dd><dt>代表表现</dt><dd>年化 2.51% · Sharpe 0.327 · 回撤 12.88%</dd><dt>经济解释</dt><dd>价格与其60日平滑路径的相关性，代理趋势平滑度或价格路径一致性。</dd></dl><code class="code">zscore(ts_corr(close, ts_mean(close, 60), 60))</code><div class="bar"><i style="width:2%"></i></div></article>
+      </div>
+    </section>
+
+    <section id="round1" class="card">
+      <h2>三、第一轮固定方案实验（2020–2024）</h2>
+      <p>方向和七种消融方案均在实验前冻结。基准采用<strong>六袖套等权</strong>：五个单因子袖套各16.67%，长周期动量袖套16.67%，其中U0010与U0013各8.33%。这和七因子简单等权的每条14.29%不同。</p>
+      <div class="table-wrap"><table><thead><tr><th>模式</th><th>方案</th><th>主动/净年化</th><th>Sharpe</th><th>最大回撤</th><th>2020–22 Sharpe</th><th>2023–24 Sharpe</th><th>Rank ICIR</th></tr></thead><tbody>
+        <tr><td>纯多</td><td><strong>六袖套等权</strong></td><td>9.30%</td><td>1.390</td><td>6.76%</td><td>1.375</td><td>1.550</td><td>0.984</td></tr>
+        <tr><td>纯多</td><td>七因子机械等权</td><td>8.45%</td><td>1.077</td><td>8.67%</td><td>0.941</td><td>1.493</td><td>0.980</td></tr>
+        <tr><td>多空</td><td><strong>六袖套等权</strong></td><td>11.06%</td><td>0.930</td><td>13.15%</td><td>0.925</td><td>1.052</td><td>0.984</td></tr>
+        <tr><td>多空</td><td>七因子机械等权</td><td>9.45%</td><td>0.702</td><td>15.60%</td><td>0.644</td><td>0.944</td><td>0.980</td></tr>
+      </tbody></table></div>
+      <p>步进事件复测账本完整性通过：纯多基准总年化24.42%、Sharpe 1.045、最大回撤34.92%；多空基准总年化10.53%、Sharpe 0.817、最大回撤16.26%。纯多的“主动收益”和“组合总收益”口径不同，不应横向混读。</p>
+    </section>
+
+    <section id="round2" class="card">
+      <h2>四、第二轮嵌套袖套权重（2020–2024）</h2>
+      <p>2020–2022拟合、2023选择政策、2024协议内测试；所有六个袖套必须保留，学习权重向等权收缩50%，单袖套上限30%。</p>
+      <div class="two"><div><h3>纯多</h3><p>2023选择了风险/IC综合权重：验证年化4.15%、Sharpe 1.066，高于等权的3.18%与0.812。但2024最终测试中，学习权重年化11.55%、Sharpe 2.413，反而低于等权的13.56%与2.767。</p></div><div><h3>多空</h3><p>所有学习政策在2023均未通过相对等权门槛，系统回退到六袖套等权。2024最终测试净年化23.08%、Sharpe 2.852；步进复测年化20.93%、Sharpe 2.295、回撤6.46%。</p></div></div>
+      <div class="callout warn">第二轮只对“权重选择”做了局部嵌套。七个因子身份和方向来自覆盖2020–2026的榜单，所以2024并非全局未见样本，不能当作最终实盘批准。</div>
+    </section>
+
+    <section id="latest" class="card">
+      <h2>五、最新程序化组合优化：为何是 NO_COMBINATION</h2>
+      <p>任务 #3 在10010运行：2010–2016训练、2017–2019验证、2020–2026冻结评级；6211条可行路径中，训练前500名进入验证。评级只允许在验证门槛全部通过后读取。</p>
+      <div class="metric-row"><div class="metric"><span>最佳候选训练年化</span><b>3.79%</b></div><div class="metric"><span>训练 Sharpe</span><b>0.524</b></div><div class="metric"><span>验证年化</span><b class="bad">−0.35%</b></div><div class="metric"><span>验证 Sharpe</span><b class="bad">−0.042</b></div></div>
+      <h3>验证排序第一的被拒候选</h3>
+      <div class="table-wrap"><table><thead><tr><th>因子</th><th>方向</th><th>权重</th></tr></thead><tbody><tr><td>U0002 价格冲击流动性</td><td class="dir-minus">−1</td><td>20%</td></tr><tr><td>U0005 低绝对振幅</td><td class="dir-plus">+1</td><td>10%</td></tr><tr><td>U0013 残差动量</td><td class="dir-plus">+1</td><td>20%</td></tr><tr><td>U0001 股量流动性</td><td class="dir-minus">−1</td><td>40%</td></tr><tr><td>U0006 短期反转</td><td class="dir-plus">+1</td><td>10%</td></tr></tbody></table></div>
+      <div class="two"><div><h3>仍然通过</h3><ul class="checklist"><li>Rank IC方向为正</li><li>至少覆盖两个收益机制</li></ul></div><div><h3>失败门槛</h3><ul class="checklist"><li class="fail">FDR q = 0.999，未通过多重检验</li><li class="fail">最差年度Sharpe = −0.626</li><li class="fail">盈利年度比例仅33.3%</li><li class="fail">50 BPS压力年化 = −4.39%</li></ul></div></div>
+      <p>验证Rank IC为0.23%、Rank ICIR为0.216，训练至验证的泛化差0.566。冻结评级未读取，这是防止验证失败后继续“看答案”的预期行为。</p>
+    </section>
+
+    <section id="construction" class="card">
+      <h2>六、推荐的组合构造基准</h2>
+      <h3>基准A：六袖套等权（推荐作为研究对照）</h3>
+      <div class="table-wrap"><table><thead><tr><th>袖套</th><th>组件</th><th>组件权重</th><th>袖套权重</th></tr></thead><tbody><tr><td>价格冲击流动性</td><td>U0002</td><td>16.67%</td><td>16.67%</td></tr><tr><td>低绝对振幅</td><td>U0005</td><td>16.67%</td><td>16.67%</td></tr><tr><td>长周期动量</td><td>U0010 / U0013</td><td>8.33% / 8.33%</td><td>16.67%</td></tr><tr><td>股量流动性</td><td>U0001</td><td>16.67%</td><td>16.67%</td></tr><tr><td>短期反转</td><td>U0006</td><td>16.67%</td><td>16.67%</td></tr><tr><td>价格关系</td><td>U0012</td><td>16.67%</td><td>16.67%</td></tr></tbody></table></div>
+      <h3>基准B：七因子机械等权（仅作对照）</h3><p>每条因子14.29%。它会让长周期动量袖套合计获得28.57%，形成机制重复加权；第一轮表现也弱于六袖套等权，因此不建议作为默认组合。</p>
+      <div class="callout">工程实现应保存为“组件数组 + 方向 + 权重”，每个组件先在当日股票池内按冻结方向横截面排名，再加权。不要把超长DSL字符串作为权威记录；扁平表达式只适合临时回测与选股兼容。</div>
+    </section>
+
+    <section id="limits" class="card">
+      <h2>七、已知边界与下一步</h2>
+      <div class="two"><div><h3>不能忽略的边界</h3><ul><li>面板为当前成分投影，标记 NON-PIT；本项目按快速研究口径使用，但不应声称生产可交易。</li><li>共同窗口榜单参与了因子身份与方向筛选，2020–2026不是全局 untouched holdout。</li><li>U0006只是单例簇；U0012只有两个成员，稳定性证据弱。</li><li>U0005使用绝对价差，可能带价格水平暴露；U0002/U0001混合价格与成交额代理，需做尺度与容量归因。</li><li>多空结果包含300 BPS年借券代理，但不代表逐股可借、召回和拥挤成本。</li></ul></div><div><h3>科学的下一轮</h3><ol><li>冻结六袖套等权为唯一基准，不再用本报告窗口调方向。</li><li>逐袖套做规模、价格、波动、流动性和行业暴露中性化归因。</li><li>将U0006、U0012作为“待证实袖套”，分别做删除消融与替代表达式复核。</li><li>使用滚动walk-forward比较六袖套等权、风险预算与收缩权重。</li><li>只在验证门槛通过后读取冻结评级，并输出StepEvent账本与成本压力。</li></ol></div></div>
+      <div class="callout reject">当前正式判断：<strong>RESEARCH_ONLY / NO_COMBINATION</strong>。七条代表因子值得继续研究，但最新嵌套验证不支持直接采用优化权重。</div>
+    </section>
+
+    <section id="evidence" class="card">
+      <h2>八、证据与可复现路径</h2>
+      <p class="evidence">var/reports/us-four-leaderboards-top100-return-sources-20260822/{protocol.json,summary.json,global_unsigned_clusters.csv,global_unsigned_assignments.csv}</p>
+      <p class="evidence">var/reports/us-multifactor-round1-2020-2024-20260822/{protocol.json,summary.json,README.md,vector_results.csv,step_results.json}</p>
+      <p class="evidence">var/reports/us-multifactor-round2-nested-weights-20260822/{protocol.json,README.md,selection_decisions.json,fitted_policies.json,final_test_results.csv,step_results.json}</p>
+      <p class="evidence">10010 API: /api/combination-experiments/3 · snapshot 5b3c08c831fcb3f0db500d516f35645d · result 7bd6cd99df248e55945d70fb5423c7ac</p>
+      <p>数值舍入到报告显示精度。报告不改写任何原始实验工件；若源工件更新，应新建报告版本并更新目录，不覆盖历史结论。</p>
+    </section>
+  </main>
+  <footer><div class="wrap">FactorFactory Research Documents · 本报告为研究审计工件，不构成投资建议或实盘批准。</div></footer>
+</body>
+</html>

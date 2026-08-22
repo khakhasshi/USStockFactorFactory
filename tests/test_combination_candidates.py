@@ -90,7 +90,39 @@ def test_within_mechanism_training_return_path_correlation_is_rejected():
         row for row in result["excluded"] if row["component_key"] == "price:b"
     )
     assert rejected["reason"] == "training_return_path_too_correlated"
-    assert rejected["absolute_correlation"] == pytest.approx(1.0)
+    assert rejected["correlation"] == pytest.approx(1.0)
+
+
+def test_within_mechanism_negative_return_path_is_a_diversifier():
+    vector = [-2.0, -1.0, 0.5, 1.5, 2.0]
+    rows = [
+        _candidate(
+            "price:a",
+            "rank(ts_mean(close,20))",
+            "momentum",
+            score=2.0,
+            vector=vector,
+        ),
+        _candidate(
+            "price:b",
+            "rank(ts_delta(close,5))",
+            "momentum",
+            score=1.0,
+            vector=[-value for value in vector],
+        ),
+        _candidate("size", "rank(log(total_mv))", "size"),
+    ]
+
+    result = select_diverse_combination_candidates(
+        rows,
+        return_path_correlation_cap=0.80,
+    )
+
+    assert {row["component_key"] for row in result["selected"]} == {
+        "price:a",
+        "price:b",
+        "size",
+    }
 
 
 def test_round_robin_preserves_mechanism_coverage_before_depth():

@@ -200,6 +200,48 @@ class EvaluationV4RankingTests(unittest.TestCase):
         self.assertEqual(first["score_pre_vault"], second["score_pre_vault"])
         self.assertEqual(first["score"], second["score"])
 
+    def test_v43_full_history_rating_is_explicit_and_not_called_pre_vault(self):
+        layers = {
+            "public": _layer(
+                sharpe=1.0, ann_return=0.10, sharpe_lcb=0.6,
+                ann_return_lcb=0.05, return_t=4.0,
+            ),
+            "gate": _layer(
+                sharpe=0.9, ann_return=0.09, sharpe_lcb=0.5,
+                ann_return_lcb=0.04, return_t=3.8,
+            ),
+            "holdout": _layer(
+                sharpe=0.8, ann_return=0.08, sharpe_lcb=0.4,
+                ann_return_lcb=0.03, return_t=3.5,
+            ),
+            "vault": _layer(
+                sharpe=0.7, ann_return=0.07, sharpe_lcb=0.3,
+                ann_return_lcb=0.02, return_t=3.0,
+            ),
+            "rating": {
+                **_layer(
+                    sharpe=1.1, ann_return=0.11, sharpe_lcb=0.7,
+                    ann_return_lcb=0.06, return_t=4.5,
+                ),
+                "window_start": "2020-01-01",
+                "window_end": "2026-08-19",
+                "window_policy": "2020_to_latest_available",
+                "independent_out_of_sample": False,
+            },
+        }
+        result = build_live_ranking(
+            layers, _eligibility(), "long_short", self.cfg
+        )
+        self.assertIsNone(result["score_pre_vault"])
+        self.assertEqual(result["score"], result["score_frozen_rating"])
+        self.assertEqual(result["rating_window"]["start"], "2020-01-01")
+        self.assertEqual(result["rating_window"]["end"], "2026-08-19")
+        self.assertFalse(result["rating_window"]["independent_out_of_sample"])
+        self.assertEqual(
+            result["evidence"]["rating_sharpe_lcb"],
+            0.7,
+        )
+
     def test_ranking_diagnostics_detects_monotone_future_profit(self):
         rows = [
             {

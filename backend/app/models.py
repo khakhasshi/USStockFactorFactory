@@ -200,6 +200,34 @@ class ScreenerRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class CombinationExperiment(Base):
+    """Immutable component snapshot plus one auditable optimisation run."""
+
+    __tablename__ = "combination_experiments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(
+        ForeignKey("experiments.id"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(128))
+    protocol: Mapped[str] = mapped_column(
+        String(64), default="combination_lab_nested_v1", index=True
+    )
+    search_mode: Mapped[str] = mapped_column(String(24), index=True)
+    market: Mapped[str] = mapped_column(String(16), index=True)
+    portfolio_mode: Mapped[str] = mapped_column(String(24))
+    status: Mapped[str] = mapped_column(String(24), default="draft", index=True)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), index=True)
+    request_spec: Mapped[dict] = mapped_column(JSON, default=dict)
+    component_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    progress: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    llm_trace: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class EngineEvent(Base):
     __tablename__ = "engine_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

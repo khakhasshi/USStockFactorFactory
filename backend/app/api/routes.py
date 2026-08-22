@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import statistics as st
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -15,23 +16,40 @@ from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
 from ..backtest.engine import run_backtest
+from ..combination_lab import (
+    COMBINATION_LAB_PROTOCOL,
+    CombinationLabManager,
+    validate_lab_spec,
+)
 from ..config import (
     BACKTEST_ARTIFACT_ROOT,
     DATABASE_URL,
     DEFAULT_ENGINE_CONFIG,
+    DEFAULT_ENGINE_CONFIG_V2,
     DEFAULT_EVALUATION_CONFIG,
+    DEFAULT_MINER_TEMPLATE,
     DEFAULT_PORTFOLIO_MODE,
     DEFAULT_RESEARCH_DIRECTION_POLICY,
     DIRECTION_POLICY_FIXED,
     EVALUATION_PROTOCOL_VERSION,
+    FROZEN_RATING_PROTOCOL_VERSION,
+    FROZEN_RATING_WINDOW_END,
+    FROZEN_RATING_WINDOW_START,
     PANEL_GLOB,
+    SERVICE_ARCHITECTURE,
+    SERVICE_INSTANCE,
     default_panel_glob,
     evaluation_config,
     get_dsl_fields,
     resolve_engine_tasks,
 )
 from ..data.panel import PanelStore
-from ..db import SessionLocal, engine as db_engine, get_active_experiment_id
+from ..db import (
+    SessionLocal,
+    active_experiment_setting_key,
+    engine as db_engine,
+    get_active_experiment_id,
+)
 from ..dsl.engine import (
     OPERATORS_DOC,
     expression_profile,
@@ -50,14 +68,24 @@ from ..leaderboards import (
     resolve_leaderboard_file,
 )
 from ..factors.diversity import infer_mechanism, mechanisms_for_market
+from ..factors.return_source_governance import (
+    RETURN_SOURCE_GOVERNANCE_PROTOCOL,
+    resolve_return_source_governance,
+)
 from ..factors.semantics import audit_expression_semantics, field_contract
 from ..factors.similarity import (
     build_similarity_index,
     expression_fingerprint,
     nearest_factors,
 )
+from ..factor_tools import (
+    build_combination_expression,
+    factor_tool_capabilities,
+    run_factor_correlation,
+)
 from ..models import (
     Backtest,
+    CombinationExperiment,
     EngineEvent,
     Experiment,
     Factor,
@@ -69,6 +97,7 @@ from ..models import (
     Setting,
     Trial,
 )
+from ..meta.agent import propose_template
 from ..observability import (
     AsyncTTLCache,
     OBSERVABILITY,
@@ -80,10 +109,27 @@ from ..observability import (
     redact_value,
 )
 from ..orchestrator import EngineManager
+from ..runtime_identity import runtime_identity
 from ..portfolio_allocation import (
     ALLOCATION_METHODS,
     build_purchase_allocation,
 )
+from ..research_records import (
+    RESEARCH_RECORD_SCHEMA_VERSION,
+    research_record_payload,
+    task_research_summary,
+)
+from ..research_documents import (
+    research_document_catalog,
+    research_document_metadata,
+    resolve_research_document,
+)
+from ..research_architecture import (
+    RESEARCH_ARCHITECTURE_SCHEMA,
+    architecture_catalog,
+    resolve_research_architecture,
+)
+from ..search_pool import DEFAULT_SEARCH_ALGORITHMS
 from ..screener import SCREEN_CACHE, screen_cross_section
 
 router = APIRouter(prefix="/api")
@@ -121,9 +167,15 @@ def invalidate_panel_dependents() -> dict:
     }
 
 
-def _campaign_controls(config: dict, market: str) -> tuple[int, list[str]]:
+def _campaign_controls(
+    config: dict,
+    market: str,
+    *,
+    default_budget: int = 0,
+) -> tuple[int, list[str]]:
     try:
-        budget = int(config.get("candidate_evaluation_budget") or 0)
+        raw_budget = config.get("candidate_evaluation_budget", default_budget)
+        budget = int(raw_budget if raw_budget is not None else default_budget)
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             400,
@@ -190,6 +242,9 @@ def _compact_layer_metrics(metrics: dict | None) -> dict:
         key: metrics.get(key)
         for key in (
             "available",
+            "window_start",
+            "window_end",
+            "window_policy",
             "ic_mean",
             "icir",
             "hac_p_value",
@@ -226,10 +281,13 @@ def _compact_ranking(metrics: dict | None) -> dict:
         for key in (
             "available",
             "score",
+            "score_frozen_rating",
             "score_pre_vault",
+            "rating_protocol_version",
             "status",
             "vault_seal",
             "policy_label",
+            "rating_window",
         )
         if key in ranking
     }
@@ -243,16 +301,30 @@ def _compact_ranking(metrics: dict | None) -> dict:
                 "holdout_sharpe_lcb",
                 "holdout_ann_return_lcb",
                 "holdout_return_hac_t",
+                "rating_sharpe",
+                "rating_ann_return",
+                "rating_sharpe_lcb",
+                "rating_ann_return_lcb",
+                "rating_return_hac_t",
                 "cost_breakeven_bps",
                 "cost_cushion_multiple",
                 "worst_stress_sharpe",
             )
         }
+    compact["current"] = (
+        ranking.get("rating_protocol_version")
+        == FROZEN_RATING_PROTOCOL_VERSION
+    )
     return compact
 
 
 def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
     validation = f.validation_metrics or {}
+    full_ranking = dict(validation.get("ranking") or {})
+    full_ranking["current"] = (
+        full_ranking.get("rating_protocol_version")
+        == FROZEN_RATING_PROTOCOL_VERSION
+    )
     payload = {
         "id": f.id,
         "experiment_id": f.experiment_id,
@@ -277,7 +349,7 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
         "evaluation_protocol": f.evaluation_protocol or "legacy_unoriented",
         "eligibility": f.eligibility or {},
         "ranking": (
-            validation.get("ranking") or {}
+            full_ranking
             if include_validation
             else _compact_ranking(validation)
         ),
@@ -295,6 +367,18 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
 class EngineStartReq(BaseModel):
     mode: str = "v2"
     experiment_id: int | None = None
+
+
+class ServiceLLMProbeReq(BaseModel):
+    experiment_id: int
+    layer: int = Field(default=3, ge=3, le=3)
+
+
+class ThreeLayerCampaignReq(BaseModel):
+    campaign_id: str = "us-v668-three-layer-abcde-v4"
+    name_prefix: str = "美股V668-三层架构"
+    candidate_evaluation_budget: int = Field(default=120, ge=20, le=2000)
+    start: bool = True
 
 
 @router.post("/engine/start")
@@ -316,10 +400,101 @@ async def engine_stop(req: dict | None = None):
     return await EngineManager.get().stop(experiment_id)
 
 
+@router.post("/service/llm-probe")
+async def service_llm_probe(req: ServiceLLMProbeReq):
+    """Exercise the Governor path without changing research state.
+
+    The call appends a normal redacted LLM audit marked ``service_probe`` but
+    does not create a miner version, node, trial, factor, or outer step.
+    """
+    if SERVICE_ARCHITECTURE != "three_layer":
+        raise HTTPException(409, "Governor 探针仅适用于三层服务")
+    async with SessionLocal() as session:
+        experiment = await session.get(Experiment, req.experiment_id)
+        if experiment is None:
+            raise HTTPException(404, "研究任务不存在")
+        config = dict(experiment.research_config or {})
+        if (
+            str(config.get("service_instance") or "") != SERVICE_INSTANCE
+            or not config.get("layer3_enabled")
+        ):
+            raise HTTPException(409, "任务不属于当前三层服务")
+        provider_settings = await session.get(Setting, "llm_providers")
+        provider_config = dict(provider_settings.value or {}) if provider_settings else {}
+        provider_name = provider_config.get("outer_provider")
+        provider = next(
+            (
+                row
+                for row in provider_config.get("providers", [])
+                if row.get("name") == provider_name and row.get("api_key")
+            ),
+            None,
+        )
+        incumbent = await session.scalar(
+            select(MinerVersion)
+            .where(
+                MinerVersion.experiment_id == req.experiment_id,
+                MinerVersion.status == "incumbent",
+                MinerVersion.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+            )
+            .order_by(MinerVersion.id.desc())
+        )
+    if provider is None:
+        raise HTTPException(503, "outer_provider 未配置")
+    template = (
+        incumbent.harness_spec
+        if incumbent is not None and isinstance(incumbent.harness_spec, dict)
+        else DEFAULT_MINER_TEMPLATE
+    )
+    _, note, source, reflection = await propose_template(
+        template,
+        [],
+        provider,
+        market=config.get("market", "us"),
+        portfolio_mode=config.get("portfolio_mode", "long_short"),
+        direction=int(config.get("direction", 1)),
+        direction_policy=config.get("direction_policy", "both_train_select"),
+        trace_context={
+            "experiment_id": req.experiment_id,
+            "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+            "runtime_identity": runtime_identity(),
+            "architecture_layer": 3,
+            "service_probe": True,
+            "service_instance": SERVICE_INSTANCE,
+        },
+    )
+    async with SessionLocal() as session:
+        audit = await session.scalar(
+            select(LLMCallAudit)
+            .where(
+                LLMCallAudit.experiment_id == req.experiment_id,
+                LLMCallAudit.role == "outer",
+            )
+            .order_by(LLMCallAudit.id.desc())
+        )
+    return {
+        "ok": source in {"llm", "llm_rejected"},
+        "probe_only": True,
+        "service_instance": SERVICE_INSTANCE,
+        "experiment_id": req.experiment_id,
+        "layer": req.layer,
+        "source": source,
+        "note": note,
+        "reflection": reflection,
+        "audit": {
+            "id": audit.id if audit else None,
+            "status": audit.status if audit else None,
+            "provider_name": audit.provider_name if audit else None,
+            "model": audit.model if audit else None,
+            "latency_ms": audit.latency_ms if audit else None,
+        },
+    }
+
+
 @router.get("/engine/status")
-async def engine_status():
+async def engine_status(experiment_id: int | None = None):
     manager = EngineManager.get()
-    exp_id = await get_active_experiment_id()
+    exp_id = experiment_id or await get_active_experiment_id()
     async with SessionLocal() as s:
         exp = await s.get(Experiment, exp_id)
         protocol = (
@@ -400,6 +575,319 @@ async def engine_status():
         } if inc else None,
         "logs": runtime.get("logs", [])[-60:],
         "workers": manager.all_status(),
+    }
+
+
+def _three_layer_arm_configs() -> list[dict]:
+    all_algorithms = list(DEFAULT_SEARCH_ALGORITHMS)
+    return [
+        {
+            "arm": "A",
+            "label": "结构化随机",
+            "proposal_mode": "search_pool",
+            "memory_mode": "cold",
+            "layer2_enabled": False,
+            "layer3_enabled": False,
+            "search_algorithms": ["structured_random"],
+            "estimand": "随机语法基线",
+        },
+        {
+            "arm": "B",
+            "label": "第一层算法组合",
+            "proposal_mode": "search_pool",
+            "memory_mode": "cold",
+            "layer2_enabled": False,
+            "layer3_enabled": False,
+            "search_algorithms": all_algorithms,
+            "estimand": "B-A = 算法搜索池增量",
+        },
+        {
+            "arm": "C",
+            "label": "算法组合+Researcher冷记忆",
+            "proposal_mode": "llm",
+            "memory_mode": "cold",
+            "layer2_enabled": True,
+            "layer3_enabled": False,
+            "search_algorithms": all_algorithms,
+            "estimand": "C-B = 第二层LLM增量",
+        },
+        {
+            "arm": "D",
+            "label": "算法组合+Researcher连续记忆",
+            "proposal_mode": "llm",
+            "memory_mode": "adaptive",
+            "layer2_enabled": True,
+            "layer3_enabled": False,
+            "search_algorithms": all_algorithms,
+            "estimand": "D-C = 任务连续记忆增量",
+        },
+        {
+            "arm": "E",
+            "label": "完整三层+Governor",
+            "proposal_mode": "llm",
+            "memory_mode": "adaptive",
+            "layer2_enabled": True,
+            "layer3_enabled": True,
+            "search_algorithms": all_algorithms,
+            "estimand": "E-D = 第三层治理LLM增量",
+        },
+    ]
+
+
+@router.post("/campaigns/three-layer")
+async def create_three_layer_campaign(req: ThreeLayerCampaignReq):
+    """Pre-register and optionally start the five-arm three-layer ablation."""
+    campaign_id = req.campaign_id.strip()
+    if not campaign_id or len(campaign_id) > 96:
+        raise HTTPException(400, "campaign_id 必须为 1-96 字符")
+    panel_glob = default_panel_glob("us")
+    resolved_eval = evaluation_config("us", None)
+    tasks = resolve_engine_tasks(
+        DEFAULT_ENGINE_CONFIG_V2["tasks"],
+        "us",
+        "long_short",
+        1,
+        DEFAULT_RESEARCH_DIRECTION_POLICY,
+        preserve_declared_costs=True,
+    )
+    created: list[int] = []
+    experiment_rows: list[Experiment] = []
+    async with SessionLocal() as session:
+        for arm in _three_layer_arm_configs():
+            name = f"{req.name_prefix}-{arm['arm']} {arm['label']}"
+            existing = await session.scalar(
+                select(Experiment).where(Experiment.name == name)
+            )
+            if existing:
+                existing_cfg = dict(existing.research_config or {})
+                if (
+                    existing_cfg.get("campaign_id") != campaign_id
+                    or existing_cfg.get("architecture_arm") != arm["arm"]
+                ):
+                    raise HTTPException(
+                        409,
+                        f"同名任务 {name} 已存在但不属于本实验；未覆盖任何数据",
+                    )
+                experiment_rows.append(existing)
+                continue
+            config = {
+                "campaign_id": campaign_id,
+                "campaign_schema": "three_layer_abcde_v2",
+                "architecture_arm": arm["arm"],
+                "estimand": arm["estimand"],
+                "market": "us",
+                "portfolio_mode": "long_short",
+                "panel_glob": panel_glob,
+                "engine_mode": "v2",
+                "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                "evaluation_config": resolved_eval,
+                "direction": 1,
+                "direction_policy": DEFAULT_RESEARCH_DIRECTION_POLICY,
+                "proposal_mode": arm["proposal_mode"],
+                "memory_mode": arm["memory_mode"],
+                "layer1_enabled": True,
+                "layer2_enabled": arm["layer2_enabled"],
+                "layer3_enabled": arm["layer3_enabled"],
+                "search_algorithms": arm["search_algorithms"],
+                "target_factor_count": 0,
+                "candidate_evaluation_budget": req.candidate_evaluation_budget,
+                "target_mechanisms": list(mechanisms_for_market("us")),
+                "return_source_governance": resolve_return_source_governance({
+                    "protocol": RETURN_SOURCE_GOVERNANCE_PROTOCOL,
+                    "correlation_threshold": 0.85,
+                    "required_sources": 5,
+                    "meta_score_weight": 0.15,
+                    "cross_experiment_admission": False,
+                }),
+                "engine_config": {
+                    **DEFAULT_ENGINE_CONFIG_V2,
+                    "tasks": tasks,
+                    # 5 seeds x 6 candidates = 30 candidates per fixed-policy
+                    # step; 120 therefore closes on complete seed blocks.
+                    "n_seeds_per_candidate": 5,
+                    "paired_cohorts_per_comparison": 5,
+                    "max_llm_calls": 60,
+                    "max_outer_steps": 6,
+                    "max_runtime_hours": 4.0,
+                    "batch_candidates_per_call": 6,
+                },
+                "preregistration": {
+                    "primary_metric": "diversity_adjusted_training_meta_score",
+                    "secondary_metrics": [
+                        "gate_pass_rate",
+                        "valid_candidate_rate",
+                        "factor_admission_rate",
+                        "mechanism_coverage",
+                        "training_return_source_coverage",
+                        "wall_clock_seconds",
+                        "llm_calls",
+                    ],
+                    "contrasts": ["B-A", "C-B", "D-C", "E-D"],
+                    "sealed_data_in_search": False,
+                    "rating_window": "2020-01-01..latest_panel_date",
+                    "promotion_rule": "research_only_until_separate_frozen_rating",
+                    "compute_policy": "five logical workers; max two concurrent evaluations",
+                },
+            }
+            experiment = Experiment(
+                name=name,
+                description=(
+                    f"三层架构 A-E 预注册消融；{arm['estimand']}。"
+                    "搜索仅使用训练安全反馈，冻结评级不进入提示词或调度器。"
+                ),
+                status="open",
+                research_config=config,
+            )
+            session.add(experiment)
+            await session.flush()
+            created.append(experiment.id)
+            experiment_rows.append(experiment)
+        await session.commit()
+
+    starts = []
+    if req.start:
+        for experiment in experiment_rows:
+            starts.append({
+                "experiment_id": experiment.id,
+                **await EngineManager.get().start("v2", experiment.id),
+            })
+    _invalidate_observability_components()
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "created_experiment_ids": created,
+        "experiments": [
+            {
+                "id": experiment.id,
+                "name": experiment.name,
+                "arm": (experiment.research_config or {}).get("architecture_arm"),
+            }
+            for experiment in experiment_rows
+        ],
+        "starts": starts,
+        "parallel_evaluation_limit": int(
+            os.environ.get("FF_MAX_PARALLEL_EVALUATIONS", "2")
+        ),
+    }
+
+
+@router.get("/campaigns/three-layer/{campaign_id}")
+async def three_layer_campaign_status(campaign_id: str):
+    async with SessionLocal() as session:
+        all_experiments = (await session.scalars(
+            select(Experiment).order_by(Experiment.id)
+        )).all()
+        experiments = [
+            row for row in all_experiments
+            if (row.research_config or {}).get("campaign_id") == campaign_id
+        ]
+        if not experiments:
+            raise HTTPException(404, "三层实验不存在")
+        ids = [row.id for row in experiments]
+        nodes = (await session.scalars(
+            select(Node).where(Node.experiment_id.in_(ids))
+        )).all()
+        llm_calls = (await session.scalars(
+            select(LLMCallAudit).where(LLMCallAudit.experiment_id.in_(ids))
+        )).all()
+        factors = (await session.scalars(
+            select(Factor).where(Factor.experiment_id.in_(ids))
+        )).all()
+        versions = (await session.scalars(
+            select(MinerVersion).where(MinerVersion.experiment_id.in_(ids))
+        )).all()
+    payload = []
+    for experiment in experiments:
+        arm_nodes = [node for node in nodes if node.experiment_id == experiment.id]
+        arm_calls = [row for row in llm_calls if row.experiment_id == experiment.id]
+        arm_factors = [row for row in factors if row.experiment_id == experiment.id]
+        arm_versions = [row for row in versions if row.experiment_id == experiment.id]
+        valid_scores = [
+            float(node.public_score or 0.0)
+            for node in arm_nodes if node.status == "ok"
+        ]
+        seed_scores: dict[int, list[float]] = {}
+        for node in arm_nodes:
+            if node.status == "ok":
+                seed_scores.setdefault(int(node.seed or 0), []).append(
+                    float(node.public_score or 0.0)
+                )
+        latest_scored_version = max(
+            (row for row in arm_versions if row.meta_score is not None),
+            key=lambda row: row.id,
+            default=None,
+        )
+        algorithms: dict[str, int] = {}
+        for node in arm_nodes:
+            algorithm = str((node.proposal_meta or {}).get("search_algorithm") or "unknown")
+            algorithms[algorithm] = algorithms.get(algorithm, 0) + 1
+        payload.append({
+            "arm": (experiment.research_config or {}).get("architecture_arm"),
+            "experiment_id": experiment.id,
+            "name": experiment.name,
+            "candidate_budget": int(
+                (experiment.research_config or {}).get(
+                    "candidate_evaluation_budget", 0
+                ) or 0
+            ),
+            "runtime": EngineManager.get().status_for(experiment.id, include_logs=False),
+            "nodes": len(arm_nodes),
+            "valid_nodes": sum(node.status == "ok" for node in arm_nodes),
+            "llm_calls": len(arm_calls),
+            "llm_transport_errors": sum(row.status == "transport_error" for row in arm_calls),
+            "llm_semantic_rejections": sum(row.status == "rejected" for row in arm_calls),
+            "factor_count": len(arm_factors),
+            "mean_public_score": (
+                round(st.mean(valid_scores), 6) if valid_scores else None
+            ),
+            "latest_meta_score": (
+                round(float(latest_scored_version.meta_score), 6)
+                if latest_scored_version is not None else None
+            ),
+            "seed_mean_public_scores": {
+                str(seed): round(st.mean(scores), 6)
+                for seed, scores in sorted(seed_scores.items())
+            },
+            "search_algorithms": algorithms,
+        })
+    ordered = sorted(payload, key=lambda row: row["arm"])
+    contrasts = []
+    for left, right in zip(ordered, ordered[1:]):
+        left_seed = left["seed_mean_public_scores"]
+        right_seed = right["seed_mean_public_scores"]
+        shared = sorted(set(left_seed) & set(right_seed))
+        paired = [right_seed[key] - left_seed[key] for key in shared]
+        contrasts.append({
+            "contrast": f"{right['arm']}-{left['arm']}",
+            "mean_public_score_delta": (
+                round(float(right["mean_public_score"]) - float(left["mean_public_score"]), 6)
+                if right["mean_public_score"] is not None
+                and left["mean_public_score"] is not None else None
+            ),
+            "paired_seed_delta_mean": round(st.mean(paired), 6) if paired else None,
+            "paired_seed_count": len(paired),
+            "valid_rate_delta": round(
+                right["valid_nodes"] / max(1, right["nodes"])
+                - left["valid_nodes"] / max(1, left["nodes"]),
+                6,
+            ),
+            "factor_count_delta": right["factor_count"] - left["factor_count"],
+            "incremental_llm_calls": right["llm_calls"] - left["llm_calls"],
+            "final_inference_ready": bool(
+                not left["runtime"].get("running")
+                and not right["runtime"].get("running")
+                and left["nodes"] >= left["candidate_budget"] > 0
+                and right["nodes"] >= right["candidate_budget"] > 0
+            ),
+        })
+    return {
+        "campaign_id": campaign_id,
+        "arms": ordered,
+        "contrasts": contrasts,
+        "inference_warning": (
+            "运行中指标仅用于运维，不得提前选择胜者；"
+            "仅 final_inference_ready=true 后执行预注册对比。"
+        ),
     }
 
 
@@ -559,6 +1047,138 @@ async def llm_call_audits(
     }
 
 
+# ---------- 任务研究记录库（非正式因子库） ----------
+
+async def _ranked_research_records(experiment_id: int) -> list[dict]:
+    """Build one training-safe, task-ranked view over immutable search nodes."""
+    async with SessionLocal() as session:
+        nodes = (
+            await session.scalars(
+                select(Node).where(
+                    Node.experiment_id == experiment_id,
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+        ).all()
+        factors = (
+            await session.scalars(
+                select(Factor).where(
+                    Factor.experiment_id == experiment_id,
+                    Factor.node_id.is_not(None),
+                )
+            )
+        ).all()
+    factor_by_node = {int(row.node_id): row.id for row in factors if row.node_id is not None}
+    grouped: dict[str, list[Node]] = {}
+    for node in nodes:
+        grouped.setdefault(node.task_name or "unknown", []).append(node)
+    records: list[dict] = []
+    for task_nodes in grouped.values():
+        task_nodes.sort(
+            key=lambda node: (
+                node.status == "ok",
+                float(node.public_score or 0.0),
+                int(node.id or 0),
+            ),
+            reverse=True,
+        )
+        for rank, node in enumerate(task_nodes, start=1):
+            records.append(
+                research_record_payload(
+                    node,
+                    task_rank=rank,
+                    formal_factor_id=factor_by_node.get(int(node.id)),
+                )
+            )
+    records.sort(
+        key=lambda row: (
+            row.get("status") == "ok",
+            float(row.get("learning_score") or 0.0),
+            int(row.get("id") or 0),
+        ),
+        reverse=True,
+    )
+    return records
+
+
+@router.get("/research-records")
+async def list_research_records(
+    experiment_id: int | None = None,
+    task_name: str | None = None,
+    source: str | None = None,
+    passed: bool | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    offset: int = 0,
+    limit: int = 100,
+):
+    if offset < 0:
+        raise HTTPException(400, "offset 不能为负数")
+    if not 1 <= limit <= 500:
+        raise HTTPException(400, "limit 必须在 1..500")
+    exp_id = experiment_id or await get_active_experiment_id()
+    records = await _ranked_research_records(exp_id)
+    summaries = task_research_summary(records)
+    filtered = records
+    if task_name:
+        filtered = [row for row in filtered if row.get("task_name") == task_name]
+    if source:
+        filtered = [row for row in filtered if row.get("source") == source]
+    if passed is not None:
+        filtered = [row for row in filtered if row.get("discovery_passed") is passed]
+    if status:
+        filtered = [row for row in filtered if row.get("status") == status]
+    if q:
+        needle = q.casefold()
+        filtered = [
+            row for row in filtered
+            if needle in " ".join([
+                str(row.get("expression") or ""),
+                str(row.get("hypothesis") or ""),
+                str(row.get("mechanism_family") or ""),
+                str(row.get("task_name") or ""),
+            ]).casefold()
+        ]
+    return {
+        "schema_version": RESEARCH_RECORD_SCHEMA_VERSION,
+        "experiment_id": exp_id,
+        "interpretation_boundary": (
+            "training research records only; ranking is task-local and does not "
+            "grant formal factor, holdout, vault, paper, live, or production approval"
+        ),
+        "tasks": summaries,
+        "total": len(filtered),
+        "offset": offset,
+        "limit": limit,
+        "records": filtered[offset:offset + limit],
+    }
+
+
+@router.get("/research-records/{node_id}")
+async def research_record_detail(node_id: int, experiment_id: int | None = None):
+    exp_id = experiment_id or await get_active_experiment_id()
+    records = await _ranked_research_records(exp_id)
+    record = next((row for row in records if row.get("id") == node_id), None)
+    if record is None:
+        raise HTTPException(404, "研究记录不存在或不属于当前任务")
+    async with SessionLocal() as session:
+        children = (
+            await session.scalars(
+                select(Node).where(
+                    Node.experiment_id == exp_id,
+                    Node.parent_id == node_id,
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                ).order_by(Node.id.asc())
+            )
+        ).all()
+    record_by_id = {row["id"]: row for row in records}
+    return {
+        **record,
+        "parent": record_by_id.get(record.get("parent_id")),
+        "children": [record_by_id[row.id] for row in children if row.id in record_by_id],
+    }
+
+
 # ---------- 因子库 ----------
 
 @router.get("/factors")
@@ -594,6 +1214,8 @@ async def list_factors(
                 grade_number = 0
             is_current_audit = (
                 factor.evaluation_protocol == EVALUATION_PROTOCOL_VERSION
+                and ranking.get("rating_protocol_version")
+                == FROZEN_RATING_PROTOCOL_VERSION
                 and bool(ranking.get("available"))
                 and ranking.get("score") is not None
             )
@@ -619,7 +1241,7 @@ async def list_factors(
         position = 0
         for payload in payloads:
             ranking = payload.get("ranking") or {}
-            if ranking.get("available"):
+            if ranking.get("available") and ranking.get("current"):
                 position += 1
                 ranking["position"] = position
     return {
@@ -631,8 +1253,25 @@ async def list_factors(
 
 @router.get("/factors/ranking-diagnostics")
 async def factor_ranking_diagnostics(experiment_id: int | None = None):
-    """Validate the frozen V4 rank against fee-after Vault outcomes."""
+    """Explain why Vault calibration is unavailable for the V4.3 rating."""
     eid, cfg = await _experiment_context(experiment_id)
+    if FROZEN_RATING_PROTOCOL_VERSION == "v4.3":
+        return {
+            "experiment_id": eid,
+            "market": cfg.get("market", "us"),
+            "protocol_version": EVALUATION_PROTOCOL_VERSION,
+            "rating_protocol_version": FROZEN_RATING_PROTOCOL_VERSION,
+            "status": "not_applicable_full_window_rating",
+            "sample_size": 0,
+            "minimum_sample": 0,
+            "metrics": None,
+            "message": (
+                "V4.3 冻结评级覆盖 2020 至最新交易日，已包含 Vault 日期；"
+                "不能再用同一 Vault 对该评级做独立校准。HOLDOUT/Vault 仍作为硬门槛。"
+            ),
+            "basis": "full-history rating; no same-sample vault calibration",
+            "uses_vault_to_tune_score": True,
+        }
     async with SessionLocal() as s:
         rows = (
             await s.scalars(
@@ -959,7 +1598,12 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
                 "grade": audit["eligibility"]["grade"],
                 "stage": audit["eligibility"]["stage"],
                 "live_rank_score": audit["ranking"].get("score"),
+                "score_frozen_rating": audit["ranking"].get(
+                    "score_frozen_rating"
+                ),
                 "score_pre_vault": audit["ranking"].get("score_pre_vault"),
+                "rating_window": audit["ranking"].get("rating_window"),
+                "rating_protocol_version": FROZEN_RATING_PROTOCOL_VERSION,
                 "direction": direction,
                 "direction_policy": DIRECTION_POLICY_FIXED,
                 "direction_trials_multiplier": direction_trials_multiplier,
@@ -1193,6 +1837,42 @@ async def manual_evaluate(req: EvalReq):
 
 # ---------- 回测 ----------
 
+def _resolve_manual_backtest_execution(
+    requested_mode: str | None,
+    configured_mode: str,
+    market: str,
+    requested_borrow_cost: float | None,
+    configured_borrow_cost: float,
+) -> tuple[str, float]:
+    mode = requested_mode or configured_mode
+    if mode not in {"long_only", "long_short"}:
+        raise ValueError("mode 必须是 long_only 或 long_short")
+    if market == "ashare" and mode != "long_only":
+        raise ValueError("A 股手动回测仅支持 long_only")
+    if mode == "long_only":
+        return mode, 0.0
+    borrow_cost = (
+        requested_borrow_cost
+        if requested_borrow_cost is not None
+        else configured_borrow_cost
+    )
+    if borrow_cost < 0:
+        raise ValueError("年化借券成本不能为负数")
+    return mode, float(borrow_cost)
+
+class ExitPolicyReq(BaseModel):
+    fixed_stop_loss_pct: float | None = None
+    fixed_take_profit_pct: float | None = None
+    trailing_stop_pct: float | None = None
+    atr_period: int = 14
+    atr_stop_multiple: float | None = None
+    atr_take_profit_multiple: float | None = None
+    atr_trailing_multiple: float | None = None
+    break_even_activation_pct: float | None = None
+    time_stop_sessions: int | None = None
+    intrabar_conflict_policy: str = "conservative"
+
+
 class BacktestReq(BaseModel):
     expression: str
     experiment_id: int | None = None
@@ -1210,6 +1890,72 @@ class BacktestReq(BaseModel):
     slippage_bps: float | None = None
     max_volume_participation: float = 0.10
     fee_profile: str | None = None
+    account_type: str = "auto"
+    cash_buffer_fraction: float = 0.0
+    max_gross_leverage: float = 2.0
+    margin_interest_bps_annual: float = 0.0
+    position_sizing: str = "equal_weight"
+    max_positions: int = 10_000
+    max_position_weight: float = 1.0
+    min_trade_notional: float = 0.0
+    rebalance_buffer_pct: float = 0.0
+    long_gross_target: float = 1.0
+    short_gross_target: float | None = None
+    risk_per_position_fraction: float = 0.01
+    spread_bps: float = 0.0
+    impact_model: str = "fixed"
+    impact_coefficient_bps: float = 0.0
+    unfilled_order_policy: str = "cancel"
+    max_order_age_sessions: int = 1
+    max_stale_sessions: int = 20
+    liquidate_at_end: bool = False
+    portfolio_stop_drawdown_pct: float | None = None
+    portfolio_daily_loss_pct: float | None = None
+    risk_cooldown_sessions: int = 0
+    exit_policy: ExitPolicyReq = Field(default_factory=ExitPolicyReq)
+
+
+@router.get("/backtest/capabilities")
+async def backtest_capabilities():
+    return {
+        "protocol": "step_event_v2",
+        "resolution": "daily_ohlc_conservative_path",
+        "signal_timing": "t_close",
+        "default_execution": "t_plus_1_raw_open",
+        "liquidity_basis": "previous_20_session_adv",
+        "exit_rules": [
+            "fixed_stop_loss",
+            "fixed_take_profit",
+            "trailing_stop",
+            "atr_stop_loss",
+            "atr_take_profit",
+            "atr_trailing_stop",
+            "break_even_stop",
+            "time_stop",
+            "portfolio_drawdown_exit",
+            "portfolio_daily_loss_exit",
+        ],
+        "position_sizing": ["equal_weight", "inverse_volatility", "atr_risk"],
+        "impact_models": ["fixed", "linear", "square_root"],
+        "account_types": ["auto", "cash", "margin"],
+        "order_policies": ["cancel", "carry"],
+        "leverage_control": {
+            "target_semantics": "operating_target_below_hard_limit",
+            "per_fill_hard_cap": True,
+            "post_gap_auto_deleverage": True,
+            "resolved_breach_is_audited_not_failed": True,
+            "unresolved_breach_fails_integrity": True,
+        },
+        "portfolio_risk_control": {
+            "state_machine": ["armed", "liquidating", "cooldown", "rearmed"],
+            "high_water_mark_reset_after_cooldown": True,
+            "flat_book_does_not_retrigger_drawdown": True,
+        },
+        "market_constraints": {
+            "ashare": ["board_lot_buy", "t_plus_1_sell", "open_limit_proxy"],
+            "us": ["cash_or_margin", "short_borrow_cost"],
+        },
+    }
 
 
 @router.post("/backtest")
@@ -1221,21 +1967,26 @@ async def backtest(req: BacktestReq):
     err = validate(req.expression, get_dsl_fields(market))
     if err:
         raise HTTPException(400, f"表达式非法: {err}")
-    mode = req.mode or cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE)
     panel_glob = req.panel_glob or cfg.get("panel_glob")
     resolved_eval = evaluation_config(market, cfg.get("evaluation_config"))
-    borrow_cost = (
-        req.borrow_cost_bps_annual
-        if req.borrow_cost_bps_annual is not None
-        else resolved_eval["borrow_cost_bps_annual"]
-    )
+    try:
+        mode, borrow_cost = _resolve_manual_backtest_execution(
+            req.mode,
+            cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE),
+            market,
+            req.borrow_cost_bps_annual,
+            resolved_eval["borrow_cost_bps_annual"],
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     params = {
         **req.model_dump(),
+        "requested_mode": req.mode,
         "mode": mode,
         "market": market,
         "panel_glob": panel_glob,
         "borrow_cost_bps_annual": borrow_cost,
-        "protocol": "step_event_v1",
+        "protocol": "step_event_v2",
     }
     async with SessionLocal() as s:
         record = Backtest(
@@ -1268,6 +2019,29 @@ async def backtest(req: BacktestReq):
             slippage_bps=req.slippage_bps,
             max_volume_participation=req.max_volume_participation,
             fee_profile=req.fee_profile,
+            account_type=req.account_type,
+            cash_buffer_fraction=req.cash_buffer_fraction,
+            max_gross_leverage=req.max_gross_leverage,
+            margin_interest_bps_annual=req.margin_interest_bps_annual,
+            position_sizing=req.position_sizing,
+            max_positions=req.max_positions,
+            max_position_weight=req.max_position_weight,
+            min_trade_notional=req.min_trade_notional,
+            rebalance_buffer_pct=req.rebalance_buffer_pct,
+            long_gross_target=req.long_gross_target,
+            short_gross_target=req.short_gross_target,
+            risk_per_position_fraction=req.risk_per_position_fraction,
+            spread_bps=req.spread_bps,
+            impact_model=req.impact_model,
+            impact_coefficient_bps=req.impact_coefficient_bps,
+            unfilled_order_policy=req.unfilled_order_policy,
+            max_order_age_sessions=req.max_order_age_sessions,
+            max_stale_sessions=req.max_stale_sessions,
+            liquidate_at_end=req.liquidate_at_end,
+            portfolio_stop_drawdown_pct=req.portfolio_stop_drawdown_pct,
+            portfolio_daily_loss_pct=req.portfolio_daily_loss_pct,
+            risk_cooldown_sessions=req.risk_cooldown_sessions,
+            exit_policy=req.exit_policy.model_dump(),
             artifact_dir=artifact_dir,
         )
     except Exception as exc:  # noqa: BLE001 - persist failed runs as audit evidence
@@ -1290,6 +2064,7 @@ async def backtest(req: BacktestReq):
             "daily_steps",
             "integrity",
             "positions",
+            "round_trips",
             "artifacts",
         )
     }
@@ -1444,6 +2219,19 @@ async def backtest_events(backtest_id: int, offset: int = 0, limit: int = 200):
     )
 
 
+@router.get("/backtests/{backtest_id}/round-trips")
+async def backtest_round_trips(backtest_id: int, offset: int = 0, limit: int = 200):
+    if offset < 0 or not 1 <= limit <= 1000:
+        raise HTTPException(400, "offset 必须非负，limit 必须在 1..1000")
+    return await asyncio.to_thread(
+        _read_artifact_page,
+        backtest_id,
+        "round_trip_ledger.parquet",
+        offset,
+        limit,
+    )
+
+
 @router.get("/backtests/{backtest_id}/statement.csv")
 async def download_backtest_statement(backtest_id: int):
     path = _artifact_path(backtest_id, "settlement_statement.csv")
@@ -1453,6 +2241,18 @@ async def download_backtest_statement(backtest_id: int):
         path,
         media_type="text/csv",
         filename=f"backtest-{backtest_id:08d}-settlement-statement.csv",
+    )
+
+
+@router.get("/backtests/{backtest_id}/round-trips.csv")
+async def download_backtest_round_trips(backtest_id: int):
+    path = _artifact_path(backtest_id, "round_trip_statement.csv")
+    if not path.exists():
+        raise HTTPException(404, "该历史回测没有完整交易归因产物")
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=f"backtest-{backtest_id:08d}-round-trips.csv",
     )
 
 
@@ -1492,6 +2292,38 @@ async def leaderboard_file(report_id: str, file_path: str):
     return FileResponse(path)
 
 
+# ---------- 重要研究文档 ----------
+
+
+@router.get("/research-documents")
+async def list_research_documents():
+    try:
+        return await asyncio.to_thread(research_document_catalog)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"研究文档目录读取失败: {exc}") from exc
+
+
+@router.get("/research-documents/{slug}")
+async def research_document_detail(slug: str):
+    try:
+        return await asyncio.to_thread(research_document_metadata, slug)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "研究文档不存在") from exc
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"研究文档读取失败: {exc}") from exc
+
+
+@router.get("/research-documents/{slug}/html")
+async def research_document_html(slug: str):
+    try:
+        path = await asyncio.to_thread(resolve_research_document, slug)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "研究文档不存在") from exc
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"研究文档读取失败: {exc}") from exc
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
 # ---------- 设置 ----------
 
 @router.get("/settings")
@@ -1505,7 +2337,7 @@ async def get_settings():
         {**p, "api_key": (p.get("api_key", "")[:6] + "..." if p.get("api_key") else "")}
         for p in llm_val.get("providers", [])
     ]}
-    engine_value = {**DEFAULT_ENGINE_CONFIG, **(eng.value if eng else {})}
+    engine_value = {**DEFAULT_ENGINE_CONFIG_V2, **(eng.value if eng else {})}
     engine_value["tasks"] = resolve_engine_tasks(
         engine_value.get("tasks", []),
         "us",
@@ -1517,6 +2349,11 @@ async def get_settings():
         "engine_config": engine_value,
         "evaluation_protocol": {
             "version": EVALUATION_PROTOCOL_VERSION,
+            "rating_version": FROZEN_RATING_PROTOCOL_VERSION,
+            "rating_window": {
+                "start": FROZEN_RATING_WINDOW_START,
+                "end": FROZEN_RATING_WINDOW_END,
+            },
             "defaults": DEFAULT_EVALUATION_CONFIG,
             "policy_label": "NON_PIT_RESEARCH",
         },
@@ -1570,11 +2407,37 @@ class ExperimentPatchReq(BaseModel):
     research_config: dict | None = None
 
 
+@router.get("/research-architectures")
+async def research_architectures():
+    return {
+        "schema": RESEARCH_ARCHITECTURE_SCHEMA,
+        "templates": architecture_catalog(),
+        "customization": {
+            "search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+            "memory_modes": ["adaptive", "cold"],
+            "rules": [
+                "layer3_requires_layer2",
+                "layer1_requires_at_least_one_algorithm",
+                "proposal_mode_is_server_derived",
+            ],
+        },
+    }
+
+
 @router.get("/experiments")
 async def list_experiments():
     active_id = await get_active_experiment_id()
     async with SessionLocal() as s:
         rows = (await s.scalars(select(Experiment).order_by(Experiment.id))).all()
+        if SERVICE_ARCHITECTURE:
+            rows = [
+                row
+                for row in rows
+                if str(
+                    (row.research_config or {}).get("service_instance") or ""
+                )
+                == SERVICE_INSTANCE
+            ]
         factor_counts = dict((await s.execute(
             select(Factor.experiment_id, func.count(Factor.id)).group_by(Factor.experiment_id)
         )).all())
@@ -1618,11 +2481,12 @@ async def create_experiment(req: ExperimentReq):
     direction = int(req.research_config.get("direction", 1))
     if direction not in {-1, 1}:
         raise HTTPException(400, "direction 必须为 1 或 -1")
-    proposal_mode = str(
-        req.research_config.get("proposal_mode") or "llm"
-    ).strip().lower()
-    if proposal_mode not in {"llm", "random"}:
-        raise HTTPException(400, "proposal_mode 必须为 llm 或 random")
+    try:
+        architecture = resolve_research_architecture(req.research_config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    proposal_mode = architecture["proposal_mode"]
+    memory_mode = architecture["memory_mode"]
     try:
         target_factor_count = int(
             req.research_config.get("target_factor_count") or 0
@@ -1634,7 +2498,14 @@ async def create_experiment(req: ExperimentReq):
     candidate_evaluation_budget, target_mechanisms = _campaign_controls(
         req.research_config,
         market,
+        default_budget=120,
     )
+    try:
+        return_source_governance = resolve_return_source_governance(
+            req.research_config.get("return_source_governance")
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     direction_policy = DEFAULT_RESEARCH_DIRECTION_POLICY
     try:
         resolved_evaluation = evaluation_config(
@@ -1651,6 +2522,7 @@ async def create_experiment(req: ExperimentReq):
             name=req.name.strip(), description=req.description, status="open",
             research_config={
                 **req.research_config,
+                **architecture,
                 "market": market,
                 "portfolio_mode": portfolio_mode,
                 "panel_glob": req.research_config.get("panel_glob") or default_panel_glob(market),
@@ -1660,9 +2532,11 @@ async def create_experiment(req: ExperimentReq):
                 "direction": direction,
                 "direction_policy": direction_policy,
                 "proposal_mode": proposal_mode,
+                "memory_mode": memory_mode,
                 "target_factor_count": target_factor_count,
                 "candidate_evaluation_budget": candidate_evaluation_budget,
                 "target_mechanisms": target_mechanisms,
+                "return_source_governance": return_source_governance,
             },
         )
         s.add(e)
@@ -1705,9 +2579,12 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             direction = int(merged.get("direction", 1))
             if direction not in {-1, 1}:
                 raise HTTPException(400, "direction 必须为 1 或 -1")
-            proposal_mode = str(merged.get("proposal_mode") or "llm").strip().lower()
-            if proposal_mode not in {"llm", "random"}:
-                raise HTTPException(400, "proposal_mode 必须为 llm 或 random")
+            try:
+                architecture = resolve_research_architecture(merged)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            proposal_mode = architecture["proposal_mode"]
+            memory_mode = architecture["memory_mode"]
             try:
                 target_factor_count = int(merged.get("target_factor_count") or 0)
             except (TypeError, ValueError) as exc:
@@ -1718,6 +2595,12 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
                 merged,
                 market,
             )
+            try:
+                return_source_governance = resolve_return_source_governance(
+                    merged.get("return_source_governance")
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
             direction_policy = DEFAULT_RESEARCH_DIRECTION_POLICY
             market_changed = (
                 "market" in req.research_config
@@ -1744,10 +2627,13 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             merged["engine_mode"] = "v2"
             merged["direction"] = direction
             merged["direction_policy"] = direction_policy
+            merged.update(architecture)
             merged["proposal_mode"] = proposal_mode
+            merged["memory_mode"] = memory_mode
             merged["target_factor_count"] = target_factor_count
             merged["candidate_evaluation_budget"] = candidate_evaluation_budget
             merged["target_mechanisms"] = target_mechanisms
+            merged["return_source_governance"] = return_source_governance
             e.research_config = merged
             material_keys = {
                 "market",
@@ -1757,6 +2643,13 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
                 "direction_policy",
                 "evaluation_protocol",
                 "evaluation_config",
+                "return_source_governance",
+                "architecture_schema",
+                "architecture_template",
+                "layer1_enabled",
+                "layer2_enabled",
+                "layer3_enabled",
+                "search_algorithms",
             }
             if any(previous_config.get(key) != merged.get(key) for key in material_keys):
                 factors = (
@@ -1795,11 +2688,20 @@ async def activate_experiment(eid: int):
             raise HTTPException(404)
         if e.status == "archived":
             raise HTTPException(400, "实验已归档, 请先重新开放")
-        row = await s.get(Setting, "active_experiment")
+        if (
+            SERVICE_ARCHITECTURE
+            and str(
+                (e.research_config or {}).get("service_instance") or ""
+            )
+            != SERVICE_INSTANCE
+        ):
+            raise HTTPException(400, "该研究任务不属于当前服务实例")
+        setting_key = active_experiment_setting_key()
+        row = await s.get(Setting, setting_key)
         if row:
             row.value = {"id": eid}
         else:
-            s.add(Setting(key="active_experiment", value={"id": eid}))
+            s.add(Setting(key=setting_key, value={"id": eid}))
         await s.commit()
     _invalidate_observability_components()
     return {
@@ -1812,6 +2714,346 @@ async def activate_experiment(eid: int):
             "research_config": e.research_config or {},
         },
     }
+
+
+# ---------- 因子组合优化实验台 ----------
+
+
+class FactorToolComponentReq(BaseModel):
+    key: str | None = None
+    name: str | None = None
+    expression: str
+    direction: int = 1
+    weight: float = 1.0
+    mechanism: str | None = None
+
+
+class FactorCorrelationReq(BaseModel):
+    experiment_id: int | None = None
+    market: str | None = None
+    portfolio_mode: str | None = None
+    panel_glob: str | None = None
+    components: list[FactorToolComponentReq]
+    start: str = "2020-01-01"
+    end: str = "2026-12-31"
+    universe_n: int = 500
+    horizon: int = 5
+    top_fraction: float = 0.20
+    cost_bps: float = 15.0
+    borrow_cost_bps_annual: float | None = None
+    threshold: float = 0.80
+
+
+class FactorExpressionBuildReq(BaseModel):
+    market: str = "ashare"
+    components: list[FactorToolComponentReq]
+    normalization: str = "rank"
+    omit_common_scale: bool = True
+
+
+@router.get("/factor-tools/capabilities")
+async def factor_tools_capabilities(
+    market: str | None = None,
+    experiment_id: int | None = None,
+):
+    _, cfg = await _experiment_context(experiment_id)
+    resolved_market = str(market or cfg.get("market") or "us")
+    try:
+        return factor_tool_capabilities(resolved_market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/factor-tools/correlation")
+async def factor_tools_correlation(req: FactorCorrelationReq):
+    _, cfg = await _experiment_context(req.experiment_id)
+    payload = req.model_dump(exclude_none=True)
+    payload["market"] = payload.get("market") or cfg.get("market") or "us"
+    payload["portfolio_mode"] = (
+        payload.get("portfolio_mode")
+        or cfg.get("portfolio_mode")
+        or ("long_only" if payload["market"] == "ashare" else "long_short")
+    )
+    # A manually selected market must never inherit another task's panel.
+    # Reuse the active task panel only when the markets match; otherwise the
+    # factor tool resolves the market-specific default panel itself.
+    payload["panel_glob"] = payload.get("panel_glob") or (
+        cfg.get("panel_glob")
+        if str(cfg.get("market") or "us") == payload["market"]
+        else None
+    )
+    try:
+        return await asyncio.to_thread(run_factor_correlation, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"相关性检测失败: {exc}") from exc
+
+
+@router.post("/factor-tools/build-expression")
+async def factor_tools_build_expression(req: FactorExpressionBuildReq):
+    try:
+        return build_combination_expression(req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class CombinationComponentReq(BaseModel):
+    key: str | None = None
+    name: str | None = None
+    expression: str
+    direction: int = 1
+    mechanism: str | None = None
+    source: str = "manual"
+    source_ref: str = ""
+
+
+class CombinationExperimentReq(BaseModel):
+    name: str = "组合优化实验"
+    experiment_id: int | None = None
+    search_mode: str = "programmatic"
+    market: str | None = None
+    portfolio_mode: str | None = None
+    panel_glob: str | None = None
+    components: list[CombinationComponentReq]
+    min_factors: int = 2
+    max_factors: int = 5
+    min_mechanisms: int = 2
+    coarse_step: float = 0.10
+    min_weight: float = 0.05
+    max_weight: float = 0.65
+    max_mechanism_weight: float = 0.70
+    max_pair_correlation: float = 0.85
+    path_budget: int = 3000
+    validation_budget: int = 250
+    top_k: int = 10
+    universe_n: int = 500
+    top_fraction: float = 0.20
+    horizon: int = 5
+    cost_bps: float = 15.0
+    stress_cost_bps: float = 50.0
+    borrow_cost_bps_annual: float | None = None
+    train_start: str = "2010-01-01"
+    train_end: str = "2018-12-31"
+    validation_start: str = "2019-01-01"
+    validation_end: str = "2022-12-31"
+    rating_start: str = "2023-01-01"
+    rating_end: str = "2026-12-31"
+    llm_max_proposals: int = 8
+    initial_capital: float = 1_000_000.0
+    max_volume_participation: float = 0.05
+    start: bool = True
+
+
+def _combination_payload(
+    row: CombinationExperiment,
+    *,
+    include_detail: bool,
+) -> dict:
+    runtime = CombinationLabManager.get().snapshot(row.id)
+    progress = runtime or dict(row.progress or {})
+    result = dict(row.result or {})
+    payload = {
+        "id": row.id,
+        "experiment_id": row.experiment_id,
+        "name": row.name,
+        "protocol": row.protocol,
+        "search_mode": row.search_mode,
+        "market": row.market,
+        "portfolio_mode": row.portfolio_mode,
+        "status": row.status,
+        "snapshot_hash": row.snapshot_hash,
+        "component_count": len((row.component_snapshot or {}).get("components") or []),
+        "progress": progress,
+        "decision": result.get("decision"),
+        "result_hash": result.get("result_hash"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "error": row.error,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+    }
+    if include_detail:
+        payload.update({
+            "request_spec": row.request_spec or {},
+            "component_snapshot": row.component_snapshot or {},
+            "result": result,
+            "llm_trace": row.llm_trace or {},
+        })
+    return payload
+
+
+@router.get("/combination-experiments/capabilities")
+async def combination_capabilities(experiment_id: int | None = None):
+    eid, cfg = await _experiment_context(experiment_id)
+    async with SessionLocal() as session:
+        settings = await session.get(Setting, "llm_providers")
+    providers = dict(settings.value or {}) if settings else {}
+    selected = providers.get("inner_provider") or providers.get("outer_provider")
+    configured = any(
+        row.get("name") == selected
+        and row.get("api_key")
+        and row.get("base_url")
+        and row.get("model")
+        for row in providers.get("providers", [])
+    )
+    market = str(cfg.get("market") or "us")
+    portfolio_mode = str(
+        cfg.get("portfolio_mode")
+        or ("long_only" if market == "ashare" else "long_short")
+    )
+    return {
+        "protocol": COMBINATION_LAB_PROTOCOL,
+        "experiment_id": eid,
+        "market": market,
+        "portfolio_mode": portfolio_mode,
+        "panel_glob": cfg.get("panel_glob"),
+        "llm": {
+            "configured": bool(configured),
+            "provider": selected if configured else None,
+        },
+        "limits": {
+            "min_components": 2,
+            "max_components": 12,
+            "max_path_budget": 20_000,
+            "supported_horizons": [1, 5, 20],
+            "ashare_modes": ["long_only"],
+            "us_modes": ["long_only", "long_short"],
+        },
+        "defaults": {
+            "min_factors": 2,
+            "max_factors": 5,
+            "min_weight": 0.05,
+            "max_weight": 0.65,
+            "max_mechanism_weight": 0.70,
+            "max_pair_correlation": 0.85,
+            "path_budget": 3000,
+            "validation_budget": 250,
+            "universe_n": 500,
+            "top_fraction": 0.20,
+            "horizon": 5,
+            "cost_bps": 15.0,
+            "stress_cost_bps": 50.0,
+        },
+    }
+
+
+@router.post("/combination-experiments")
+async def create_combination_experiment(req: CombinationExperimentReq):
+    eid, cfg = await _experiment_context(req.experiment_id)
+    payload = req.model_dump(exclude={"start"}, exclude_none=True)
+    payload["experiment_id"] = eid
+    payload["market"] = payload.get("market") or cfg.get("market") or "us"
+    payload["portfolio_mode"] = (
+        payload.get("portfolio_mode")
+        or cfg.get("portfolio_mode")
+        or ("long_only" if payload["market"] == "ashare" else "long_short")
+    )
+    payload["panel_glob"] = payload.get("panel_glob") or cfg.get("panel_glob")
+    try:
+        canonical = validate_lab_spec(payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if canonical["search_mode"] == "llm":
+        async with SessionLocal() as session:
+            settings = await session.get(Setting, "llm_providers")
+        value = dict(settings.value or {}) if settings else {}
+        provider_name = value.get("inner_provider") or value.get("outer_provider")
+        if not any(
+            row.get("name") == provider_name and row.get("api_key")
+            for row in value.get("providers", [])
+        ):
+            raise HTTPException(409, "LLM协作模式要求先在设置中配置inner_provider或outer_provider")
+    row = CombinationExperiment(
+        experiment_id=eid,
+        name=canonical["name"],
+        protocol=COMBINATION_LAB_PROTOCOL,
+        search_mode=canonical["search_mode"],
+        market=canonical["market"],
+        portfolio_mode=canonical["portfolio_mode"],
+        status="queued" if req.start else "draft",
+        snapshot_hash=canonical["snapshot_hash"],
+        request_spec=canonical,
+        component_snapshot={
+            "schema": "combination_component_snapshot_v1",
+            "snapshot_hash": canonical["snapshot_hash"],
+            "components": canonical["components"],
+        },
+        progress={"stage": "queued" if req.start else "draft", "completed": 0, "total": 1},
+    )
+    async with SessionLocal() as session:
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    if req.start:
+        await CombinationLabManager.get().start(row.id)
+    return _combination_payload(row, include_detail=True)
+
+
+@router.get("/combination-experiments")
+async def list_combination_experiments(
+    experiment_id: int | None = None,
+    limit: int = 50,
+):
+    eid, _ = await _experiment_context(experiment_id)
+    limit = max(1, min(200, int(limit)))
+    async with SessionLocal() as session:
+        rows = list((await session.scalars(
+            select(CombinationExperiment)
+            .where(CombinationExperiment.experiment_id == eid)
+            .order_by(CombinationExperiment.id.desc())
+            .limit(limit)
+        )).all())
+        total = int(await session.scalar(
+            select(func.count()).select_from(CombinationExperiment)
+            .where(CombinationExperiment.experiment_id == eid)
+        ) or 0)
+    return {
+        "protocol": COMBINATION_LAB_PROTOCOL,
+        "experiment_id": eid,
+        "total": total,
+        "experiments": [
+            _combination_payload(row, include_detail=False) for row in rows
+        ],
+    }
+
+
+@router.get("/combination-experiments/{combination_id}")
+async def get_combination_experiment(combination_id: int):
+    async with SessionLocal() as session:
+        row = await session.get(CombinationExperiment, combination_id)
+    if row is None:
+        raise HTTPException(404, "组合实验不存在")
+    return _combination_payload(row, include_detail=True)
+
+
+@router.post("/combination-experiments/{combination_id}/start")
+async def start_combination_experiment(combination_id: int):
+    async with SessionLocal() as session:
+        row = await session.get(CombinationExperiment, combination_id)
+        if row is None:
+            raise HTTPException(404, "组合实验不存在")
+        if row.status in {"queued", "running"}:
+            return {"id": row.id, "status": row.status, "already_running": True}
+        if row.status == "done":
+            raise HTTPException(409, "已完成实验不可改写；请用相同配置创建新版本")
+        row.status = "queued"
+        row.error = ""
+        row.result = {}
+        row.progress = {"stage": "queued", "completed": 0, "total": 1}
+        row.started_at = None
+        row.completed_at = None
+        await session.commit()
+    return await CombinationLabManager.get().start(combination_id)
+
+
+@router.post("/combination-experiments/{combination_id}/stop")
+async def stop_combination_experiment(combination_id: int):
+    async with SessionLocal() as session:
+        row = await session.get(CombinationExperiment, combination_id)
+    if row is None:
+        raise HTTPException(404, "组合实验不存在")
+    return await CombinationLabManager.get().stop(combination_id)
 
 
 # ---------- 选股器 ----------
@@ -2470,9 +3712,13 @@ async def _database_observability() -> dict:
                              WHERE created_at >= NOW() - INTERVAL '1 hour'
                            ) AS calls_1h,
                            COUNT(*) FILTER (
-                             WHERE status IN ('transport_error', 'rejected')
+                             WHERE status = 'transport_error'
                                AND created_at >= NOW() - INTERVAL '1 hour'
                            ) AS errors_1h,
+                           COUNT(*) FILTER (
+                             WHERE status = 'rejected'
+                               AND created_at >= NOW() - INTERVAL '1 hour'
+                           ) AS semantic_rejections_1h,
                            AVG(latency_ms) FILTER (
                              WHERE created_at >= NOW() - INTERVAL '1 hour'
                            ) AS avg_latency_1h,
@@ -2556,6 +3802,9 @@ async def _database_observability() -> dict:
                     "total": int(llm_stats["total"] or 0),
                     "calls_1h": int(llm_stats["calls_1h"] or 0),
                     "errors_1h": int(llm_stats["errors_1h"] or 0),
+                    "semantic_rejections_1h": int(
+                        llm_stats["semantic_rejections_1h"] or 0
+                    ),
                     "avg_latency_ms_1h": (
                         round(float(llm_stats["avg_latency_1h"]), 3)
                         if llm_stats["avg_latency_1h"] is not None

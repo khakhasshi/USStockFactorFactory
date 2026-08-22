@@ -1,4 +1,5 @@
 import logging
+import os
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -122,17 +123,20 @@ async def init_db() -> None:
         await conn.execute(text(
             "UPDATE nodes SET evaluation_protocol = "
             "COALESCE(NULLIF(public_metrics->>'protocol_version', ''), 'legacy_unoriented') "
-            "WHERE evaluation_protocol = 'legacy_unoriented'"
+            "WHERE evaluation_protocol = 'legacy_unoriented' "
+            "AND NULLIF(public_metrics->>'protocol_version', '') IS NOT NULL"
         ))
         await conn.execute(text(
             "UPDATE trials SET evaluation_protocol = "
             "COALESCE(NULLIF(statistic->>'protocol_version', ''), 'legacy_unoriented') "
-            "WHERE evaluation_protocol = 'legacy_unoriented'"
+            "WHERE evaluation_protocol = 'legacy_unoriented' "
+            "AND NULLIF(statistic->>'protocol_version', '') IS NOT NULL"
         ))
         await conn.execute(text(
             "UPDATE outer_steps SET evaluation_protocol = "
             "COALESCE(NULLIF(detail->>'protocol_version', ''), 'legacy_unoriented') "
-            "WHERE evaluation_protocol = 'legacy_unoriented'"
+            "WHERE evaluation_protocol = 'legacy_unoriented' "
+            "AND NULLIF(detail->>'protocol_version', '') IS NOT NULL"
         ))
         await conn.execute(text(
             "UPDATE miner_versions AS m SET evaluation_protocol = 'v4.0' "
@@ -178,8 +182,18 @@ async def init_db() -> None:
             "ON screener_runs (experiment_id, id DESC)",
             "CREATE INDEX IF NOT EXISTS ix_screener_runs_experiment_date_desc "
             "ON screener_runs (experiment_id, target_date DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_combination_experiments_experiment_id_desc "
+            "ON combination_experiments (experiment_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_combination_experiments_status "
+            "ON combination_experiments (status, id DESC)",
         ):
             await conn.execute(text(statement))
+        await conn.execute(text(
+            "UPDATE combination_experiments SET status = 'interrupted', "
+            "error = CASE WHEN error = '' THEN 'service restarted during execution' ELSE error END, "
+            "completed_at = COALESCE(completed_at, NOW()) "
+            "WHERE status IN ('queued', 'running')"
+        ))
         # Preserve contaminated historical expressions while preventing them
         # from appearing as validated research assets.
         await conn.execute(text(
@@ -199,11 +213,17 @@ async def init_db() -> None:
         await conn.execute(text(
             "SELECT setval('experiments_id_seq', (SELECT COALESCE(MAX(id),1) FROM experiments))"
         ))
-    await _backfill_v4_feedback()
+    if os.environ.get("FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL", "0") != "1":
+        await _backfill_v4_feedback()
 
 
 async def _backfill_v4_feedback() -> int:
-    """Populate the new safe envelope for pre-migration V4 nodes only."""
+    """Populate a bounded batch of safe envelopes for pre-migration nodes.
+
+    Loading every historical JSON payload delayed each independent service
+    startup by minutes.  A bounded, idempotent batch keeps startup predictable;
+    subsequent starts continue from the remaining empty rows.
+    """
     from sqlalchemy import select, text
 
     from .config import EVALUATION_PROTOCOL_VERSION
@@ -222,6 +242,7 @@ async def _backfill_v4_feedback() -> int:
                     ),
                 )
                 .order_by(Node.id)
+                .limit(500)
             )
         ).all()
         if not nodes:
@@ -275,8 +296,51 @@ async def get_active_experiment_id() -> int:
     import os
     if override := os.environ.get("FF_EXPERIMENT_ID"):
         return int(override)
-    from .models import Setting
+    from sqlalchemy import select
+
+    from .config import SERVICE_ARCHITECTURE, SERVICE_INSTANCE
+    from .models import Experiment, Setting
 
     async with SessionLocal() as s:
-        row = await s.get(Setting, "active_experiment")
+        key = active_experiment_setting_key()
+        row = await s.get(Setting, key)
+        if row:
+            experiment_id = int(row.value.get("id", 1))
+            if not SERVICE_ARCHITECTURE:
+                return experiment_id
+            experiment = await s.get(Experiment, experiment_id)
+            if (
+                experiment is not None
+                and experiment.status == "open"
+                and str(
+                    (experiment.research_config or {}).get("service_instance")
+                    or ""
+                )
+                == SERVICE_INSTANCE
+            ):
+                return experiment_id
+        if SERVICE_ARCHITECTURE:
+            rows = list(
+                (
+                    await s.scalars(
+                        select(Experiment)
+                        .where(Experiment.status == "open")
+                        .order_by(Experiment.id)
+                    )
+                ).all()
+            )
+            for experiment in rows:
+                if str(
+                    (experiment.research_config or {}).get("service_instance")
+                    or ""
+                ) == SERVICE_INSTANCE:
+                    return experiment.id
         return int(row.value.get("id", 1)) if row else 1
+
+
+def active_experiment_setting_key() -> str:
+    from .config import SERVICE_ARCHITECTURE, SERVICE_INSTANCE
+
+    if SERVICE_ARCHITECTURE:
+        return f"active_experiment:{SERVICE_INSTANCE}"[:64]
+    return "active_experiment"

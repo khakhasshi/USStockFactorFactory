@@ -31,6 +31,8 @@ from .config import (
     DEFAULT_MINER_TEMPLATE,
     DEFAULT_PORTFOLIO_MODE,
     EVALUATION_PROTOCOL_VERSION,
+    SERVICE_ARCHITECTURE,
+    SERVICE_INSTANCE,
     get_dsl_fields,
     resolve_engine_tasks,
 )
@@ -42,6 +44,7 @@ from .feedback import (
     build_feedback_envelope,
     combine_seed_feedback,
     compare_feedback_reports,
+    enrich_feedback_with_factor_admission,
 )
 from .factors.diversity import (
     diversity_adjusted_score,
@@ -53,6 +56,9 @@ from .factors.return_path import (
     combined_training_signature,
     return_path_correlation,
 )
+from .factors.return_source_governance import (
+    resolve_return_source_governance,
+)
 from .factors.semantics import audit_expression_semantics
 from .factors.similarity import expression_fingerprint, expression_similarity
 from .meta.agent import (
@@ -61,9 +67,33 @@ from .meta.agent import (
     reflect_on_outcome,
     validate_template,
 )
-from .miner.agent import propose
-from .models import EngineEvent, Experiment, Factor, MinerVersion, Node, OuterStep, Setting, Trial
+from .miner.agent import propose, propose_batch
+from .models import (
+    EngineEvent,
+    Experiment,
+    Factor,
+    LLMCallAudit,
+    MinerVersion,
+    Node,
+    OuterStep,
+    Setting,
+    Trial,
+)
 from .observability import redact_text, redact_value, utc_now
+from .runtime_identity import runtime_identity
+from .scientific_governor import propose_scientific_directive
+from .search_pool import DEFAULT_SEARCH_ALGORITHMS, propose_search_seed
+
+
+# Five experiments may be logically live at once, but full-panel Polars
+# evaluations are the expensive shared resource.  Two concurrent evaluations
+# retain pipeline overlap without multiplying memory pressure fivefold.
+_EVALUATION_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.environ.get("FF_MAX_PARALLEL_EVALUATIONS", "2")))
+)
+_PANEL_LOAD_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.environ.get("FF_MAX_PARALLEL_PANEL_LOADS", "2")))
+)
 
 
 class Engine:
@@ -93,18 +123,27 @@ class Engine:
             "current_budget_index": None,
             "current_budget_total": None,
             "evaluation_active": False,
+            "evaluation_queued": False,
+            "evaluation_queue_seconds": None,
+            "evaluation_queue_heartbeat_count": 0,
             "evaluation_started_at": None,
             "evaluation_elapsed_seconds": None,
             "evaluation_heartbeat_count": 0,
             "evaluation_soft_deadline_seconds": None,
             "evaluation_deadline_exceeded": False,
             "last_evaluation_duration_seconds": None,
+            "llm_active": False,
+            "llm_started_at": None,
+            "llm_elapsed_seconds": None,
+            "llm_heartbeat_count": 0,
+            "last_llm_duration_seconds": None,
         }
         self._started_monotonic: float | None = None
         self._last_heartbeat_monotonic = time.monotonic()
         self.logbuf: deque[dict] = deque(maxlen=300)
         self._mode: str = "v1"  # "v1" 或 "v2"
         self.task_config: dict = {}
+        self._runtime_identity: dict = runtime_identity()
 
     @classmethod
     def get(cls) -> "Engine":
@@ -125,6 +164,60 @@ class Engine:
 
     def _touch_progress(self, **detail) -> None:
         self._set_phase(self.status.get("phase") or "running", progress=True, **detail)
+
+    async def _run_llm_with_heartbeat(
+        self,
+        awaitable,
+        *,
+        phase: str,
+        operation: str,
+        **detail,
+    ):
+        """Expose slow provider requests as live work, not stale workers."""
+        started = time.monotonic()
+        heartbeat_count = 0
+        task = asyncio.create_task(
+            awaitable,
+            name=f"research.llm.{self.exp_id}.{operation}",
+        )
+        self._set_phase(
+            phase,
+            progress=True,
+            current_operation=operation,
+            llm_active=True,
+            llm_started_at=utc_now(),
+            llm_elapsed_seconds=0.0,
+            llm_heartbeat_count=0,
+            **detail,
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=15.0)
+                elapsed = max(0.0, time.monotonic() - started)
+                if done:
+                    return task.result()
+                heartbeat_count += 1
+                self._set_phase(
+                    phase,
+                    current_operation=operation,
+                    llm_active=True,
+                    llm_elapsed_seconds=round(elapsed, 3),
+                    llm_heartbeat_count=heartbeat_count,
+                    **detail,
+                )
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            elapsed = max(0.0, time.monotonic() - started)
+            self._set_phase(
+                phase,
+                llm_active=False,
+                llm_elapsed_seconds=round(elapsed, 3),
+                llm_heartbeat_count=heartbeat_count,
+                last_llm_duration_seconds=round(elapsed, 3),
+            )
 
     async def _run_blocking_with_heartbeat(
         self,
@@ -230,6 +323,49 @@ class Engine:
                 last_evaluation_duration_seconds=round(elapsed, 3),
             )
 
+    async def _run_shared_evaluation(self, *args):
+        """Acquire global evaluation capacity with truthful queue heartbeats."""
+        queued_at = time.monotonic()
+        queue_heartbeats = 0
+        self._set_phase(
+            self.status.get("phase") or "candidate_mining",
+            current_operation="evaluation_queue",
+            evaluation_queued=True,
+            evaluation_queue_seconds=0.0,
+        )
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    await asyncio.wait_for(
+                        _EVALUATION_SEMAPHORE.acquire(), timeout=15.0
+                    )
+                    acquired = True
+                except TimeoutError:
+                    queue_heartbeats += 1
+                    self._set_phase(
+                        self.status.get("phase") or "candidate_mining",
+                        current_operation="evaluation_queue",
+                        evaluation_queued=True,
+                        evaluation_queue_seconds=round(
+                            time.monotonic() - queued_at, 3
+                        ),
+                        evaluation_queue_heartbeat_count=queue_heartbeats,
+                    )
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation="factor_evaluation",
+                evaluation_queued=False,
+                evaluation_queue_seconds=round(
+                    time.monotonic() - queued_at, 3
+                ),
+                evaluation_queue_heartbeat_count=queue_heartbeats,
+            )
+            return await self._run_blocking_with_heartbeat(evaluate, *args)
+        finally:
+            if acquired:
+                _EVALUATION_SEMAPHORE.release()
+
     async def log(self, msg: str, level: str = "info") -> None:
         now = utc_now()
         safe_msg = redact_text(msg, 4000)
@@ -282,8 +418,49 @@ class Engine:
 
     def _proposal_mode(self) -> str:
         mode = str(self.task_config.get("proposal_mode") or "llm").strip().lower()
-        if mode not in {"llm", "random"}:
-            raise ValueError("研究任务 proposal_mode 必须为 llm 或 random")
+        if mode not in {"llm", "random", "search_pool"}:
+            raise ValueError(
+                "研究任务 proposal_mode 必须为 llm、random 或 search_pool"
+            )
+        return mode
+
+    def _layer1_enabled(self) -> bool:
+        return bool(self.task_config.get("layer1_enabled", False))
+
+    def _layer2_enabled(self) -> bool:
+        return bool(
+            self.task_config.get(
+                "layer2_enabled", self._proposal_mode() == "llm"
+            )
+        )
+
+    def _layer3_enabled(self) -> bool:
+        return bool(self.task_config.get("layer3_enabled", True))
+
+    def _full_llm_architecture(self) -> bool:
+        return bool(self.task_config.get("full_llm_architecture", False))
+
+    def _scientific_governor_enabled(self) -> bool:
+        return bool(
+            self.task_config.get("scientific_governor_enabled", False)
+        )
+
+    def _search_algorithms(self) -> tuple[str, ...]:
+        configured = self.task_config.get("search_algorithms")
+        if configured is None:
+            return DEFAULT_SEARCH_ALGORITHMS
+        if not isinstance(configured, (list, tuple)):
+            raise ValueError("研究任务 search_algorithms 必须为算法名称列表")
+        algorithms = tuple(str(value).strip() for value in configured if str(value).strip())
+        unknown = sorted(set(algorithms) - set(DEFAULT_SEARCH_ALGORITHMS))
+        if not algorithms or unknown:
+            raise ValueError(f"研究任务 search_algorithms 非法: {unknown or 'empty'}")
+        return algorithms
+
+    def _memory_mode(self) -> str:
+        mode = str(self.task_config.get("memory_mode") or "adaptive").strip().lower()
+        if mode not in {"adaptive", "cold"}:
+            raise ValueError("研究任务 memory_mode 必须为 adaptive 或 cold")
         return mode
 
     def _target_factor_count(self) -> int:
@@ -294,6 +471,9 @@ class Engine:
         if target < 0:
             raise ValueError("研究任务 target_factor_count 必须为非负整数")
         return target
+
+    def _continuous_operation(self) -> bool:
+        return bool(self.task_config.get("continuous_operation", False))
 
     def _candidate_evaluation_budget(self) -> int:
         try:
@@ -328,19 +508,60 @@ class Engine:
                 targets.append(mechanism)
         return tuple(targets)
 
+    def _return_source_governance(self) -> dict:
+        """Resolve opt-in governance without changing existing V4 runs."""
+        return resolve_return_source_governance(
+            self.task_config.get("return_source_governance")
+        )
+
     def _target_family_for_attempt(
         self,
         feedback_nodes: list[dict],
         market: str,
         rng: random.Random,
+        attempt_offset: int = 0,
     ) -> str:
         targets = self._target_mechanisms()
         if not targets:
             return select_target_mechanism(feedback_nodes, market, rng)
         # Persisted candidate count is restored at startup, so round-robin
         # targeting remains balanced and reproducible across service restarts.
-        index = int(self.status.get("candidate_evaluations") or 0)
+        index = int(self.status.get("candidate_evaluations") or 0) + int(
+            attempt_offset
+        )
         return targets[index % len(targets)]
+
+    def _mechanism_schedule(
+        self,
+        template: dict,
+        market: str,
+    ) -> tuple[str, ...]:
+        allowed = tuple(self._target_mechanisms() or mechanisms_for_market(market))
+        if not self._full_llm_architecture():
+            return allowed
+        directive = template.get("_scientific_governor_directive") or {}
+        focus = [
+            str(item)
+            for item in directive.get("focus_mechanisms", [])
+            if str(item) in allowed
+        ]
+        deprioritized = {
+            str(item)
+            for item in directive.get("deprioritize_mechanisms", [])
+            if str(item) in allowed
+        }
+        focus = list(dict.fromkeys(focus))
+        remaining = [
+            item for item in allowed
+            if item not in focus and item not in deprioritized
+        ]
+        tail = [item for item in allowed if item in deprioritized]
+        try:
+            exploration_share = float(directive.get("exploration_share", 0.5))
+        except (TypeError, ValueError):
+            exploration_share = 0.5
+        focus_repeats = max(1, min(4, round((1.0 - exploration_share) * 5)))
+        return tuple(focus * focus_repeats + remaining + tail) or allowed
 
     async def _factor_count(self) -> int:
         async with SessionLocal() as session:
@@ -361,6 +582,91 @@ class Engine:
                 )
             )
         return int(value or 0)
+
+    async def _llm_call_count(self) -> int:
+        async with SessionLocal() as session:
+            value = await session.scalar(
+                select(func.count(LLMCallAudit.id)).where(
+                    LLMCallAudit.experiment_id == self.exp_id,
+                    LLMCallAudit.evaluation_protocol
+                    == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+        return int(value or 0)
+
+    async def _stop_if_scientific_budget_reached(
+        self,
+        cfg: dict,
+        *,
+        next_step_no: int,
+    ) -> bool:
+        max_outer = int(cfg["max_outer_steps"])
+        max_hours = float(cfg["max_runtime_hours"])
+        max_llm = int(cfg["max_llm_calls"])
+        llm_calls = await self._llm_call_count()
+        elapsed = (
+            max(0.0, time.monotonic() - self._started_monotonic)
+            if self._started_monotonic is not None
+            else 0.0
+        )
+        candidate_count = int(self.status.get("candidate_evaluations") or 0)
+        candidate_budget = self._candidate_evaluation_budget()
+        if self._continuous_operation():
+            self.status.update({
+                "budget_mode": "unlimited",
+                "max_outer_steps": None,
+                "max_runtime_hours": None,
+                "max_llm_calls": None,
+                "llm_calls": llm_calls,
+                "scientific_budget_progress": {},
+                "global_progress": None,
+                "estimated_remaining_seconds": None,
+                "candidate_evaluation_budget": 0,
+                "candidate_evaluation_progress": None,
+            })
+            return False
+        ratios = {
+            "outer_steps": min(1.0, max(0, next_step_no - 1) / max_outer),
+            "runtime": min(1.0, elapsed / (max_hours * 3600.0)),
+            "llm_calls": min(1.0, llm_calls / max_llm),
+        }
+        if candidate_budget > 0:
+            ratios["candidate_evaluations"] = min(
+                1.0, candidate_count / candidate_budget
+            )
+        rate = candidate_count / elapsed if elapsed > 0 and candidate_count else 0.0
+        eta = (
+            max(0.0, (candidate_budget - candidate_count) / rate)
+            if candidate_budget > candidate_count and rate > 0
+            else 0.0 if candidate_budget > 0 else None
+        )
+        self.status.update({
+            "max_outer_steps": max_outer,
+            "max_runtime_hours": max_hours,
+            "max_llm_calls": max_llm,
+            "llm_calls": llm_calls,
+            "scientific_budget_progress": {
+                key: round(value, 6) for key, value in ratios.items()
+            },
+            "global_progress": round(max(ratios.values(), default=0.0), 6),
+            "estimated_remaining_seconds": (
+                round(eta, 1) if eta is not None else None
+            ),
+        })
+        reason = None
+        if next_step_no > max_outer:
+            reason = "max_outer_steps_reached"
+        elif elapsed >= max_hours * 3600.0:
+            reason = "max_runtime_reached"
+        elif llm_calls >= max_llm:
+            reason = "max_llm_calls_reached"
+        if reason is None:
+            return False
+        if self.status.get("stop_reason") != reason:
+            self.status["stop_reason"] = reason
+            await self.log(f"科学预算自动停止: {reason}", "info")
+        self.running = False
+        return True
 
     async def _stop_if_evaluation_budget_reached(
         self,
@@ -427,6 +733,49 @@ class Engine:
         async with SessionLocal() as s:
             exp = await s.get(Experiment, self.exp_id)
             self.task_config = dict(exp.research_config or {}) if exp else {}
+        task_service = str(
+            self.task_config.get("service_instance") or ""
+        ).strip()
+        if task_service and task_service != SERVICE_INSTANCE:
+            self.running = False
+            return {
+                "ok": False,
+                "msg": (
+                    f"研究任务 {self.exp_id} 绑定服务 {task_service}，"
+                    f"当前实例为 {SERVICE_INSTANCE}"
+                ),
+            }
+        if SERVICE_ARCHITECTURE in {"two_layer", "three_layer"}:
+            expected_layer3 = SERVICE_ARCHITECTURE == "three_layer"
+            actual_layer3 = bool(self.task_config.get("layer3_enabled", False))
+            if not (
+                bool(self.task_config.get("layer1_enabled", False))
+                and bool(self.task_config.get("layer2_enabled", False))
+                and actual_layer3 == expected_layer3
+            ):
+                self.running = False
+                return {
+                    "ok": False,
+                    "msg": (
+                        f"任务架构与 {SERVICE_ARCHITECTURE} 服务不匹配"
+                    ),
+                }
+        if SERVICE_ARCHITECTURE == "full_llm_three_layer":
+            required = (
+                self._full_llm_architecture()
+                and self._scientific_governor_enabled()
+                and self._layer1_enabled()
+                and self._layer2_enabled()
+                and self._layer3_enabled()
+                and self._proposal_mode() == "llm"
+            )
+            if not required:
+                self.running = False
+                return {
+                    "ok": False,
+                    "msg": "任务不是可审计的全 LLM 三层架构，拒绝在 10013 启动",
+                }
+        self._runtime_identity = runtime_identity()
         self.status["experiment_id"] = self.exp_id
         self.running = True
         self._mode = mode
@@ -443,16 +792,52 @@ class Engine:
             "current_budget_index": None,
             "current_budget_total": None,
             "evaluation_active": False,
+            "evaluation_queued": False,
+            "evaluation_queue_seconds": None,
+            "evaluation_queue_heartbeat_count": 0,
             "evaluation_started_at": None,
             "evaluation_elapsed_seconds": None,
             "evaluation_heartbeat_count": 0,
             "evaluation_soft_deadline_seconds": None,
             "evaluation_deadline_exceeded": False,
+            "llm_active": False,
+            "llm_started_at": None,
+            "llm_elapsed_seconds": None,
+            "llm_heartbeat_count": 0,
+            "last_llm_duration_seconds": None,
             "proposal_mode": self._proposal_mode(),
+            "memory_mode": self._memory_mode(),
+            "experiment_arm": self.task_config.get("architecture_arm") or (
+                "random"
+                if self._proposal_mode() == "random"
+                else "llm_memory" if self._memory_mode() == "adaptive" else "llm_cold"
+            ),
+            "three_layer": {
+                "layer1_enabled": self._layer1_enabled(),
+                "layer2_enabled": self._layer2_enabled(),
+                "layer3_enabled": self._layer3_enabled(),
+                "search_algorithms": list(self._search_algorithms())
+                if self._layer1_enabled() else [],
+                "full_llm_architecture": self._full_llm_architecture(),
+                "scientific_governor_enabled": (
+                    self._scientific_governor_enabled()
+                ),
+                "llm_roles": (
+                    ["mechanism_scientist", "research_director", "scientific_governor"]
+                    if self._full_llm_architecture()
+                    else []
+                ),
+            },
+            "runtime_identity": self._runtime_identity,
             "target_factor_count": self._target_factor_count(),
             "candidate_evaluation_budget": self._candidate_evaluation_budget(),
             "candidate_evaluations": 0,
             "candidate_evaluation_progress": 0.0,
+            "budget_mode": (
+                "unlimited" if self._continuous_operation() else "bounded"
+            ),
+            "service_instance": SERVICE_INSTANCE,
+            "service_architecture": SERVICE_ARCHITECTURE or None,
             "target_mechanisms": list(self._target_mechanisms()),
             "factor_count": 0,
             "factor_target_progress": 0.0,
@@ -544,7 +929,8 @@ class Engine:
             await self.log(f"[V2] 引擎启动: 实验[{exp.name}] 外层可改写 MinerTemplate")
             self._set_phase("loading_panel", progress=True)
             panel = PanelStore.get(self._panel_glob(), self.task_config.get("market", "us"))
-            await asyncio.to_thread(panel.ensure_loaded)
+            async with _PANEL_LOAD_SEMAPHORE:
+                await asyncio.to_thread(panel.ensure_loaded)
             await self.log(f"面板就绪: {panel.summary()['rows']} 行 · {self.task_config.get('market', 'configured')}")
 
             self._set_phase("initializing_miner", progress=True)
@@ -558,7 +944,14 @@ class Engine:
                 return
 
             while self.running:
+                if await self._stop_if_evaluation_budget_reached(refresh=True):
+                    break
                 step_no = await self._next_step_no()
+                if await self._stop_if_scientific_budget_reached(
+                    cfg,
+                    next_step_no=step_no,
+                ):
+                    break
                 self.status["outer_step"] = step_no
                 self._set_phase(
                     "outer_step",
@@ -585,30 +978,197 @@ class Engine:
             current_operation="load_context",
             current_task=None,
         )
-        provider = await self._provider("outer_provider")
+        layer3_enabled = self._layer3_enabled()
+        provider = await self._provider("outer_provider") if layer3_enabled else None
+        if layer3_enabled and provider is None:
+            raise RuntimeError(
+                "第三层 Governor 已启用，但 outer_provider 未配置；worker 熔断"
+            )
         deliberate_random = self._proposal_mode() == "random"
         # Deliberate random baselines must not even build a feedback context;
         # otherwise provenance could imply that the random proposal learned
         # from historical scores despite the generator being outcome-agnostic.
-        history = [] if deliberate_random else await self._version_history_v2()
-
-        # 外层 LLM 提议新模板
-        inc_template = incumbent.harness_spec if isinstance(incumbent.harness_spec, dict) else DEFAULT_MINER_TEMPLATE
-        self._set_phase("outer_proposal", current_operation="llm_or_fallback")
-        cand_template, note, source, proposal_reflection = await propose_template(
-            inc_template, history, provider,
-            market=self.task_config.get("market", "us"),
-            portfolio_mode=self._portfolio_mode(),
-            direction=self._signal_direction(),
-            direction_policy=self._direction_policy(),
-            deliberate_random=deliberate_random,
-            trace_context={
-                "experiment_id": self.exp_id,
-                "outer_step_no": step_no,
-                "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
-                "miner_version_id": incumbent.id,
-            },
+        history = (
+            []
+            if deliberate_random or self._memory_mode() == "cold"
+            else await self._version_history_v2()
         )
+
+        # 第三层只治理搜索策略，不接触评价器或封存层。A-D 使用固定模板，
+        # E 才允许 Governor LLM 提出单变量模板变更。
+        inc_template = incumbent.harness_spec if isinstance(incumbent.harness_spec, dict) else DEFAULT_MINER_TEMPLATE
+        scientific_directive = deepcopy(
+            inc_template.get("_scientific_governor_directive") or {}
+        )
+        scientific_reflection: dict = {
+            "decision": "not_applicable",
+            "architecture_layer": 3,
+        }
+        if self._full_llm_architecture():
+            if not self._scientific_governor_enabled():
+                raise RuntimeError("全 LLM 三层任务未启用科学总督")
+            governor_provider = await self._provider(
+                "scientific_governor_provider"
+            )
+            if governor_provider is None:
+                raise RuntimeError("第三层科学总督 provider 未配置；worker 熔断")
+            interval = max(
+                1,
+                int(cfg.get("scientific_governor_interval_outer_steps", 3)),
+            )
+            directive_due = not scientific_directive or (step_no - 1) % interval == 0
+            if directive_due:
+                self._set_phase(
+                    "outer_proposal",
+                    current_operation="scientific_governor_llm",
+                )
+                (
+                    scientific_directive,
+                    _governor_note,
+                    _governor_source,
+                    scientific_reflection,
+                ) = await self._run_llm_with_heartbeat(
+                    propose_scientific_directive(
+                        history,
+                        governor_provider,
+                        market=self.task_config.get("market", "us"),
+                        portfolio_mode=self._portfolio_mode(),
+                        allowed_mechanisms=tuple(
+                            self._target_mechanisms()
+                            or mechanisms_for_market(
+                                self.task_config.get("market", "us")
+                            )
+                        ),
+                        previous_directive=scientific_directive,
+                        trace_context={
+                            "experiment_id": self.exp_id,
+                            "outer_step_no": step_no,
+                            "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                            "miner_version_id": incumbent.id,
+                            "runtime_identity": self._runtime_identity,
+                            "experiment_arm": self.status.get("experiment_arm"),
+                        },
+                    ),
+                    phase="outer_proposal",
+                    operation="scientific_governor_llm",
+                    current_seed=None,
+                    current_task=None,
+                )
+            else:
+                scientific_reflection = {
+                    "decision": "reuse_active_directive",
+                    "directive_id": scientific_directive.get("directive_id"),
+                    "interval_outer_steps": interval,
+                    "architecture_layer": 3,
+                    "training_safe": True,
+                }
+        evaluated_before_governor = await self._candidate_evaluation_count()
+        governor_warmup = int(cfg.get("governor_warmup_candidates", 0))
+        if layer3_enabled and evaluated_before_governor < governor_warmup:
+            cand_template = inc_template
+            note = (
+                "第三层进入确定性冷启动；完成一个完整候选 cohort 后再调用 "
+                "Governor LLM"
+            )
+            source = "governor_warmup"
+            proposal_reflection = {
+                "decision": "deterministic_warmup",
+                "evaluated_candidates": evaluated_before_governor,
+                "required_candidates": governor_warmup,
+                "architecture_layer": 2 if self._full_llm_architecture() else 3,
+                "training_safe": True,
+            }
+        elif layer3_enabled:
+            self._set_phase("outer_proposal", current_operation="governor_llm_or_fallback")
+            cand_template, note, source, proposal_reflection = (
+                await self._run_llm_with_heartbeat(
+                    propose_template(
+                        inc_template, history, provider,
+                        market=self.task_config.get("market", "us"),
+                        portfolio_mode=self._portfolio_mode(),
+                        direction=self._signal_direction(),
+                        direction_policy=self._direction_policy(),
+                        deliberate_random=deliberate_random,
+                        scientific_directive=scientific_directive,
+                        trace_context={
+                            "experiment_id": self.exp_id,
+                            "outer_step_no": step_no,
+                            "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                            "miner_version_id": incumbent.id,
+                            "runtime_identity": self._runtime_identity,
+                            "experiment_arm": self.status.get("experiment_arm"),
+                            "architecture_layer": (
+                                2 if self._full_llm_architecture() else 3
+                            ),
+                            "llm_role": (
+                                "research_director"
+                                if self._full_llm_architecture()
+                                else "outer"
+                            ),
+                        },
+                    ),
+                    phase="outer_proposal",
+                    operation="governor_llm",
+                    current_seed=None,
+                    current_task=None,
+                )
+            )
+        else:
+            cand_template = inc_template
+            note = "第三层关闭；固定同一 MinerTemplate，仅累计同预算训练证据"
+            source = "fixed_policy"
+            proposal_reflection = {
+                "decision": "layer3_disabled",
+                "history_context_fingerprint": "",
+                "architecture_layer": 2 if self._full_llm_architecture() else 3,
+                "training_safe": True,
+            }
+
+        if self._full_llm_architecture():
+            cand_template = deepcopy(cand_template)
+            cand_template["_scientific_governor_directive"] = (
+                scientific_directive
+            )
+            proposal_reflection = {
+                **proposal_reflection,
+                "research_director": deepcopy(proposal_reflection),
+                "scientific_governor": scientific_reflection,
+                "architecture_stack": [
+                    "mechanism_scientist",
+                    "research_director",
+                    "scientific_governor",
+                ],
+            }
+
+        # A changed Governor template requires a complete paired candidate and
+        # incumbent block.  Never spend the tail of the campaign on an arm
+        # that cannot reach the pre-registered acceptance test.
+        candidate_budget = self._candidate_evaluation_budget()
+        if layer3_enabled and cand_template != inc_template and candidate_budget > 0:
+            evaluated = await self._candidate_evaluation_count()
+            paired_block = int(cfg["n_seeds_per_candidate"]) * (
+                int(cfg["inner_budget_per_outer_step"])
+                + int(
+                    cfg.get(
+                        "incumbent_remeasure_budget",
+                        cfg["inner_budget_per_outer_step"],
+                    )
+                )
+            )
+            if candidate_budget - evaluated < paired_block:
+                cand_template = inc_template
+                note = (
+                    "剩余候选预算不足以完成 Governor 提案的候选/在位配对块；"
+                    "本步降级为固定模板证据积累"
+                )
+                source = "budget_guard"
+                proposal_reflection = {
+                    **proposal_reflection,
+                    "decision": "insufficient_paired_budget",
+                    "evaluated_candidates": evaluated,
+                    "remaining_candidates": candidate_budget - evaluated,
+                    "required_paired_block": paired_block,
+                }
 
         async with SessionLocal() as s:
             cand = MinerVersion(
@@ -632,6 +1192,91 @@ class Engine:
 
         await self.log(f"[V2] 外层步 {step_no}: 候选 v{cand.version_no} [{source}] {note[:100]}")
 
+        # A no-op proposal is evidence about the outer model, not a new arm.
+        # Do not spend a full candidate-versus-incumbent comparison on two
+        # identical templates.  The first no-op may still warm the baseline so
+        # the next proposal receives real, training-safe feedback.
+        if cand_template == inc_template:
+            warmup_budget = int(cfg["baseline_warmup_budget"])
+            warmup_results: list[dict] = []
+            baseline_score = float(incumbent.meta_score or 0.0)
+            baseline_report = dict(incumbent.feedback_summary or {})
+            if (incumbent.meta_score is None or not layer3_enabled) and self.running:
+                feedback_baseline = await self._feedback_baseline_v2(
+                    [task["name"] for task in cfg["tasks"]],
+                )
+                for seed in range(int(cfg["n_seeds_per_candidate"])):
+                    if not self.running:
+                        break
+                    warmup_results.append(
+                        await self._mining_session_v2(
+                            incumbent,
+                            step_no,
+                            warmup_budget,
+                            cfg,
+                            seed,
+                            feedback_baseline,
+                        )
+                    )
+                if warmup_results:
+                    baseline_score = st.mean(
+                        row["score"] for row in warmup_results
+                    )
+                    incumbent = await self._update_score(
+                        incumbent.id,
+                        baseline_score,
+                    )
+                    baseline_report = combine_seed_feedback(warmup_results)
+                    async with SessionLocal() as session:
+                        incumbent_db = await session.get(
+                            MinerVersion,
+                            incumbent.id,
+                        )
+                        incumbent_db.feedback_summary = baseline_report
+                        await session.commit()
+            async with SessionLocal() as session:
+                candidate_db = await session.get(MinerVersion, cand.id)
+                candidate_db.status = "rejected"
+                candidate_db.meta_score = None
+                candidate_db.feedback_summary = {
+                    "decision": "no_op",
+                    "reason": "candidate template equals incumbent",
+                }
+                session.add(OuterStep(
+                    experiment_id=self.exp_id,
+                    step_no=step_no,
+                    candidate_id=cand.id,
+                    incumbent_id=incumbent.id,
+                    candidate_score=None,
+                    incumbent_score=baseline_score,
+                    accepted=False,
+                    evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                    context_fingerprint=str(
+                        proposal_reflection.get(
+                            "history_context_fingerprint",
+                            "",
+                        )
+                    ),
+                    detail={
+                        "protocol_version": EVALUATION_PROTOCOL_VERSION,
+                        "mode": "v2",
+                        "decision": "no_op_baseline_warmup",
+                        "note": note,
+                        "source": source,
+                        "warmup_budget": warmup_budget,
+                        "warmup_seed_count": len(warmup_results),
+                        "incumbent_report": baseline_report,
+                        "runtime_identity": self._runtime_identity,
+                    },
+                ))
+                await session.commit()
+            await self.log(
+                f"[V2] 外层步 {step_no}: 候选模板无实质改动，"
+                f"跳过 A/B；基线={baseline_score:.4f}",
+                "info",
+            )
+            return incumbent, cfg
+
         # ---- multi-seed 内层挖掘 ----
         budget = int(cfg["inner_budget_per_outer_step"])
         n_seeds = int(cfg["n_seeds_per_candidate"])
@@ -644,6 +1289,8 @@ class Engine:
         )
         cand_seed_results = []
         for seed in range(n_seeds):
+            if not self.running:
+                break
             self._set_phase(
                 "candidate_mining",
                 progress=True,
@@ -671,18 +1318,57 @@ class Engine:
         cand_mean = st.mean(cand_scores) if cand_scores else 0.0
         cand_std = st.stdev(cand_scores) if len(cand_scores) >= 2 else 0.0
         cand_report = combine_seed_feedback(cand_seed_results)
+        if not self.running or len(cand_seed_results) != n_seeds:
+            async with SessionLocal() as session:
+                candidate_db = await session.get(MinerVersion, cand.id)
+                candidate_db.status = "rejected"
+                candidate_db.meta_score = cand_mean
+                candidate_db.feedback_summary = cand_report
+                session.add(OuterStep(
+                    experiment_id=self.exp_id,
+                    step_no=step_no,
+                    candidate_id=cand.id,
+                    incumbent_id=incumbent.id,
+                    candidate_score=cand_mean,
+                    incumbent_score=incumbent.meta_score,
+                    accepted=False,
+                    evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                    detail={
+                        "protocol_version": EVALUATION_PROTOCOL_VERSION,
+                        "mode": "v2",
+                        "decision": "incomplete_budget_stop",
+                        "completed_candidate_seeds": len(cand_seed_results),
+                        "required_candidate_seeds": n_seeds,
+                        "stop_reason": self.status.get("stop_reason"),
+                        "candidate_report": cand_report,
+                        "runtime_identity": self._runtime_identity,
+                    },
+                ))
+                await session.commit()
+            await self.log(
+                f"[V2] 外层步 {step_no}: 预算停止时仅完成 "
+                f"{len(cand_seed_results)}/{n_seeds} 个候选 seed，"
+                "不进行外层接受判定",
+                "info",
+            )
+            return incumbent, cfg
 
         # ---- 在位者重测 ----
         remeasure_every = int(cfg["incumbent_remeasure_every"])
         remeasure_budget = int(cfg.get("incumbent_remeasure_budget", budget))
         inc_seed_results = []
-        if incumbent.meta_score is None or step_no % remeasure_every == 0:
+        remeasure_required = (
+            incumbent.meta_score is None or step_no % remeasure_every == 0
+        )
+        if remeasure_required:
             for seed in range(n_seeds):
+                if not self.running:
+                    break
                 self._set_phase(
                     "incumbent_remeasure",
                     progress=True,
                     current_operation="seed",
-                    current_seed=seed + 1000,
+                    current_seed=seed,
                     current_budget_index=0,
                     current_budget_total=remeasure_budget,
                 )
@@ -691,15 +1377,16 @@ class Engine:
                     step_no,
                     remeasure_budget,
                     cfg,
-                    seed + 1000,
+                    seed,
                     feedback_baseline,
                 )
                 inc_seed_results.append(inc_seed_result)
             inc_scores = [row["score"] for row in inc_seed_results]
             inc_mean = st.mean(inc_scores) if inc_scores else 0.0
             inc_std = st.stdev(inc_scores) if len(inc_scores) >= 2 else 0.0
-            incumbent = await self._update_score(incumbent.id, inc_mean)
             inc_report = combine_seed_feedback(inc_seed_results)
+            if len(inc_seed_results) == n_seeds:
+                incumbent = await self._update_score(incumbent.id, inc_mean)
             await self.log(f"[V2]   在位重测: mean={inc_mean:.4f} std={inc_std:.4f} (n={len(inc_scores)})")
         else:
             inc_scores = []
@@ -707,11 +1394,51 @@ class Engine:
             inc_std = 0.0
             inc_report = dict(incumbent.feedback_summary or {})
 
+        if remeasure_required and len(inc_seed_results) != n_seeds:
+            async with SessionLocal() as session:
+                candidate_db = await session.get(MinerVersion, cand.id)
+                candidate_db.status = "rejected"
+                candidate_db.meta_score = cand_mean
+                candidate_db.feedback_summary = cand_report
+                session.add(OuterStep(
+                    experiment_id=self.exp_id,
+                    step_no=step_no,
+                    candidate_id=cand.id,
+                    incumbent_id=incumbent.id,
+                    candidate_score=cand_mean,
+                    incumbent_score=inc_mean,
+                    accepted=False,
+                    evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                    detail={
+                        "protocol_version": EVALUATION_PROTOCOL_VERSION,
+                        "mode": "v2",
+                        "decision": "incomplete_paired_budget_stop",
+                        "completed_candidate_seeds": len(cand_seed_results),
+                        "completed_incumbent_seeds": len(inc_seed_results),
+                        "required_seeds": n_seeds,
+                        "stop_reason": self.status.get("stop_reason"),
+                        "candidate_report": cand_report,
+                        "incumbent_report": inc_report,
+                        "runtime_identity": self._runtime_identity,
+                    },
+                ))
+                await session.commit()
+            await self.log(
+                f"[V2] 外层步 {step_no}: 在位者配对仅完成 "
+                f"{len(inc_seed_results)}/{n_seeds} seed，不进行接受判定",
+                "info",
+            )
+            return incumbent, cfg
+
         # ---- 同协议单边统计门 ----
-        test = _one_sided_score_test(
-            cand_scores,
-            inc_scores,
-            reference_mean=inc_mean,
+        test = (
+            _paired_score_test(cand_scores, inc_scores)
+            if len(cand_scores) == len(inc_scores) and len(cand_scores) >= 2
+            else _one_sided_score_test(
+                cand_scores,
+                inc_scores,
+                reference_mean=inc_mean,
+            )
         )
         p_value = test["p_value"]
         p_threshold = float(cfg["outer_accept_p_value"])
@@ -740,6 +1467,31 @@ class Engine:
             diversity_non_degrading = int(
                 cand_report.get("distinct_mechanisms") or 0
             ) >= 3
+        return_source_governance = self._return_source_governance()
+        if return_source_governance["enabled"]:
+            if int(inc_report.get("attempts") or 0) > 0:
+                return_sources_non_degrading = bool(
+                    float(
+                        cand_report.get("scoped_behavior_duplicate_rate")
+                        or 0.0
+                    )
+                    <= float(
+                        inc_report.get("scoped_behavior_duplicate_rate")
+                        or 0.0
+                    ) + 0.05
+                    and float(
+                        cand_report.get("effective_return_sources") or 0.0
+                    ) + 0.5
+                    >= float(
+                        inc_report.get("effective_return_sources") or 0.0
+                    )
+                )
+            else:
+                return_sources_non_degrading = int(
+                    cand_report.get("return_source_clusters") or 0
+                ) >= min(3, return_source_governance["required_sources"])
+        else:
+            return_sources_non_degrading = True
         accepted = bool(
             len(cand_scores) == n_seeds
             and len(cand_scores) >= 2
@@ -748,6 +1500,7 @@ class Engine:
             and gate_non_degrading
             and pass_rate_non_degrading
             and diversity_non_degrading
+            and return_sources_non_degrading
         )
         comparison = compare_feedback_reports(cand_report, inc_report)
         outcome_reflection, reflection_source = await reflect_on_outcome(
@@ -763,6 +1516,8 @@ class Engine:
                 "outer_step_no": step_no,
                 "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
                 "miner_version_id": cand.id,
+                "runtime_identity": self._runtime_identity,
+                "experiment_arm": self.status.get("experiment_arm"),
             },
         )
 
@@ -789,10 +1544,15 @@ class Engine:
                     "cand_scores": cand_scores, "cand_std": cand_std,
                     "inc_scores": inc_scores, "inc_std": inc_std,
                     "p_value": p_value, "test": test, "mode": "v2",
+                    "runtime_identity": self._runtime_identity,
                     "admission_safety": {
                         "gate_score_non_degrading": gate_non_degrading,
                         "pass_rate_non_degrading": pass_rate_non_degrading,
                         "diversity_non_degrading": diversity_non_degrading,
+                        "return_sources_non_degrading": (
+                            return_sources_non_degrading
+                        ),
+                        "return_source_governance": return_source_governance,
                     },
                     "candidate_report": cand_report,
                     "incumbent_report": inc_report,
@@ -849,35 +1609,24 @@ class Engine:
     ) -> dict:
         """Run one seed and return score plus its auditable feedback report."""
         template = miner.harness_spec if isinstance(miner.harness_spec, dict) else DEFAULT_MINER_TEMPLATE
-        provider = await self._provider("inner_provider")
+        provider = await self._provider("inner_provider") if self._layer2_enabled() else None
+        if self._layer2_enabled() and provider is None:
+            raise RuntimeError(
+                "第二层 Researcher 已启用，但 inner_provider 未配置；worker 熔断"
+            )
         tasks = cfg["tasks"]
         task_best_scores: dict[str, float] = {}
         session_envelopes: list[dict] = []
 
         # 固定种子确保可复现
-        rng = random.Random(seed * 10000 + miner.id)
+        rng = random.Random(seed * 10000 + step_no * 100)
         session_start_node_id = await self._max_node_id()
-        campaign_expressions = (
-            await self._experiment_expressions()
-            if self._proposal_mode() == "random"
-            else set()
-        )
+        campaign_expressions = await self._experiment_expressions()
+        proposal_queue: dict[int, tuple[dict, tuple[str, str, str, dict]]] = {}
+        market = self.task_config.get("market", "us")
 
-        for i in range(budget):
-            if not self.running:
-                break
-            if await self._stop_if_evaluation_budget_reached():
-                break
-            task = tasks[i % len(tasks)]
-            self._set_phase(
-                self.status.get("phase") or "candidate_mining",
-                progress=True,
-                current_task=task["name"],
-                current_operation="context_lookup",
-                current_seed=seed,
-                current_budget_index=i + 1,
-                current_budget_total=budget,
-            )
+        async def prepare_slot(slot: int) -> dict:
+            task = tasks[slot % len(tasks)]
             session_nodes = await self._feedback_nodes_v2(
                 miner.id,
                 task["name"],
@@ -888,57 +1637,238 @@ class Engine:
                 (feedback_baseline or {}).get(task["name"], []),
                 session_nodes,
             )
-            market = self.task_config.get("market", "us")
-            target_family = self._target_family_for_attempt(
-                feedback_nodes,
-                market,
-                rng,
+            proposal_feedback_nodes = (
+                feedback_nodes if self._memory_mode() == "adaptive" else []
             )
+            family_schedule = self._mechanism_schedule(template, market)
+            target_family = family_schedule[
+                (seed * budget + slot) % len(family_schedule)
+            ]
             base_node = max(
                 (
                     node
-                    for node in feedback_nodes
+                    for node in proposal_feedback_nodes
                     if node.get("status") == "ok"
                     and mechanism_from_item(node) == target_family
+                    and int(
+                        (node.get("proposal_meta") or {}).get("tree_depth", 0)
+                    ) < int(cfg["max_tree_depth"])
                 ),
                 key=lambda node: float(node.get("public_score") or 0.0),
                 default=None,
             )
-
-            # 操作选择: 根据 draft_strategy 中的指令决定 draft/improve 概率
-            improve_bias = 0.6
-            draft_strategy = template.get("draft_strategy", "")
-            if "优先" in draft_strategy and "改进" not in draft_strategy:
-                improve_bias = 0.4  # 偏探索
-            elif "改进" in draft_strategy:
-                improve_bias = 0.7  # 偏改进
-
             op = (
                 "improve"
-                if (base_node and rng.random() < improve_bias)
+                if base_node and rng.random() >= float(cfg["draft_ratio"])
                 else "draft"
+            )
+            search_seed = None
+            if self._layer1_enabled():
+                use_algorithm_inspiration = True
+                if self._full_llm_architecture():
+                    use_algorithm_inspiration = rng.random() < float(
+                        cfg.get("algorithm_inspiration_share", 0.30)
+                    )
+                if use_algorithm_inspiration:
+                    search_seed = propose_search_seed(
+                        family=target_family,
+                        fields=get_dsl_fields(self.task_config.get("market")),
+                        feedback_nodes=feedback_nodes,
+                        algorithms=self._search_algorithms(),
+                        rng=rng,
+                    )
+            return {
+                "slot": slot,
+                "task": task,
+                "feedback_nodes": proposal_feedback_nodes,
+                "target_family": target_family,
+                "base_node": base_node,
+                "op": op,
+                "request_id": f"step-{step_no}:seed-{seed}:slot-{slot + 1}",
+                "rng": rng,
+                "search_seed": search_seed,
+            }
+
+        for i in range(budget):
+            if not self.running:
+                break
+            if i not in proposal_queue and await self._stop_if_scientific_budget_reached(
+                cfg,
+                next_step_no=step_no,
+            ):
+                break
+            if await self._stop_if_evaluation_budget_reached():
+                break
+            if i not in proposal_queue:
+                assignment = await prepare_slot(i)
+                batch_size = min(
+                    int(cfg["batch_candidates_per_call"]),
+                    budget - i,
+                )
+                if self._layer1_enabled() and not self._layer2_enabled():
+                    seed_proposal = assignment["search_seed"]
+                    proposal_queue[i] = (
+                        assignment,
+                        (
+                            seed_proposal.expression,
+                            seed_proposal.hypothesis,
+                            "search_pool",
+                            {
+                                **seed_proposal.metadata,
+                                "reflection": "第一层独立候选；第二层关闭。",
+                                "targeted_failures": [],
+                                "expected_effect": "估计第一层算法组合的独立增量",
+                                "change_axis": "new_draft",
+                                "declared_family": assignment["target_family"],
+                                "family_match": True,
+                            },
+                        ),
+                    )
+                elif (
+                    provider is not None
+                    and self._proposal_mode() == "llm"
+                    and batch_size > 1
+                ):
+                    assignments = [assignment]
+                    for slot in range(i + 1, i + batch_size):
+                        assignments.append(await prepare_slot(slot))
+                    proposals = await self._run_llm_with_heartbeat(
+                        propose_batch(
+                            template,
+                            assignments,
+                            provider,
+                            fields=get_dsl_fields(self.task_config.get("market")),
+                            trace_context={
+                                "experiment_id": self.exp_id,
+                                "outer_step_no": step_no,
+                                "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                                "miner_version_id": miner.id,
+                                "seed": seed,
+                                "batch_start_index": i + 1,
+                                "runtime_identity": self._runtime_identity,
+                                "experiment_arm": self.status.get("experiment_arm"),
+                                "architecture_layer": (
+                                    1 if self._full_llm_architecture() else 2
+                                ),
+                                "llm_role": (
+                                    "mechanism_scientist"
+                                    if self._full_llm_architecture()
+                                    else "inner"
+                                ),
+                                "direct_expression_authority": (
+                                    self._full_llm_architecture()
+                                ),
+                            },
+                        ),
+                        phase="inner_proposal",
+                        operation="researcher_llm_batch",
+                        current_seed=seed,
+                        current_task=assignment["task"]["name"],
+                        current_budget_index=i + 1,
+                        current_budget_total=budget,
+                    )
+                    proposal_queue.update({
+                        row["slot"]: (row, proposal)
+                        for row, proposal in zip(assignments, proposals)
+                    })
+                else:
+                    proposal = await self._run_llm_with_heartbeat(
+                        propose(
+                            template,
+                            assignment["op"],
+                            assignment["task"],
+                            assignment["feedback_nodes"],
+                            provider,
+                            fields=get_dsl_fields(self.task_config.get("market")),
+                            trace_context={
+                                "experiment_id": self.exp_id,
+                                "outer_step_no": step_no,
+                                "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
+                                "miner_version_id": miner.id,
+                                "task_name": assignment["task"]["name"],
+                                "seed": seed,
+                                "budget_index": i + 1,
+                                "runtime_identity": self._runtime_identity,
+                                "experiment_arm": self.status.get("experiment_arm"),
+                                "cohort_id": assignment["request_id"],
+                                "architecture_layer": (
+                                    1 if self._full_llm_architecture() else 2
+                                ),
+                                "llm_role": (
+                                    "mechanism_scientist"
+                                    if self._full_llm_architecture()
+                                    else "inner"
+                                ),
+                                "direct_expression_authority": (
+                                    self._full_llm_architecture()
+                                ),
+                            },
+                            rng=rng,
+                            target_family=assignment["target_family"],
+                            deliberate_random=self._proposal_mode() == "random",
+                        ),
+                        phase="inner_proposal",
+                        operation="researcher_llm_single",
+                        current_seed=seed,
+                        current_task=assignment["task"]["name"],
+                        current_budget_index=i + 1,
+                        current_budget_total=budget,
+                    )
+                    proposal_queue[i] = (assignment, proposal)
+            assignment, proposal = proposal_queue.pop(i)
+            task = assignment["task"]
+            proposal_feedback_nodes = assignment["feedback_nodes"]
+            target_family = assignment["target_family"]
+            base_node = assignment["base_node"]
+            op = assignment["op"]
+            expr, hypo, source, proposal_meta = proposal
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                progress=True,
+                current_task=task["name"],
+                current_operation="context_lookup",
+                current_seed=seed,
+                current_budget_index=i + 1,
+                current_budget_total=budget,
             )
             self._set_phase(
                 self.status.get("phase") or "candidate_mining",
                 current_operation=f"proposal:{op}",
             )
-            expr, hypo, source, proposal_meta = await propose(
-                template, op, task, feedback_nodes, provider,
-                fields=get_dsl_fields(self.task_config.get("market")),
-                trace_context={
-                    "experiment_id": self.exp_id,
-                    "outer_step_no": step_no,
-                    "evaluation_protocol": EVALUATION_PROTOCOL_VERSION,
-                    "miner_version_id": miner.id,
-                    "task_name": task["name"],
-                    "seed": seed,
-                    "budget_index": i + 1,
-                },
-                rng=rng,
-                target_family=target_family,
-                deliberate_random=self._proposal_mode() == "random",
-            )
             novelty_retries = 0
+            while (
+                source == "search_pool"
+                and expr in campaign_expressions
+                and novelty_retries < 32
+            ):
+                novelty_retries += 1
+                replacement = propose_search_seed(
+                    family=target_family,
+                    fields=get_dsl_fields(self.task_config.get("market")),
+                    feedback_nodes=self._merge_feedback_nodes(
+                        (feedback_baseline or {}).get(task["name"], []),
+                        await self._feedback_nodes_v2(
+                            miner.id,
+                            task["name"],
+                            seed=seed,
+                            min_node_id=session_start_node_id,
+                        ),
+                    ),
+                    algorithms=self._search_algorithms(),
+                    rng=rng,
+                )
+                assignment["search_seed"] = replacement
+                expr = replacement.expression
+                hypo = replacement.hypothesis
+                proposal_meta = {
+                    **replacement.metadata,
+                    "reflection": "第一层重复候选重采样；第二层关闭。",
+                    "targeted_failures": [],
+                    "expected_effect": "保持第一层试验的表达式级新颖性",
+                    "change_axis": "new_draft",
+                    "declared_family": target_family,
+                    "family_match": True,
+                }
             while (
                 source == "random"
                 and expr in campaign_expressions
@@ -949,7 +1879,7 @@ class Engine:
                     template,
                     "draft",
                     task,
-                    feedback_nodes,
+                    proposal_feedback_nodes,
                     provider,
                     fields=get_dsl_fields(
                         self.task_config.get("market")
@@ -963,15 +1893,52 @@ class Engine:
                         "seed": seed,
                         "budget_index": i + 1,
                         "campaign_novelty_retry": novelty_retries,
+                        "runtime_identity": self._runtime_identity,
+                        "experiment_arm": self.status.get("experiment_arm"),
                     },
                     rng=rng,
                     target_family=target_family,
                     deliberate_random=self._proposal_mode() == "random",
                 )
+            seed_meta = (
+                assignment["search_seed"].metadata
+                if assignment.get("search_seed") is not None
+                else {}
+            )
             proposal_meta = {
+                **seed_meta,
                 **(proposal_meta or {}),
                 "campaign_novelty_retries": novelty_retries,
                 "campaign_exact_duplicate": expr in campaign_expressions,
+                "experiment_arm": self.status.get("experiment_arm"),
+                "memory_mode": self._memory_mode(),
+                "runtime_identity": self._runtime_identity,
+                "cohort_id": f"step-{step_no}:seed-{seed}:slot-{i + 1}",
+                "architecture_layer": (
+                    1 if self._full_llm_architecture()
+                    else (proposal_meta or {}).get("architecture_layer", 2)
+                ),
+                "llm_role": (
+                    "mechanism_scientist"
+                    if self._full_llm_architecture()
+                    else "inner"
+                ),
+                "direct_expression_authority": self._full_llm_architecture(),
+                "scientific_directive_id": (
+                    (template.get("_scientific_governor_directive") or {}).get(
+                        "directive_id"
+                    )
+                ),
+                "tree_depth": (
+                    int((base_node.get("proposal_meta") or {}).get("tree_depth", 0)) + 1
+                    if op == "improve" and base_node
+                    else 0
+                ),
+                "parent_change_axis": (
+                    (proposal_meta or {}).get("change_axis")
+                    if op == "improve"
+                    else "new_draft"
+                ),
             }
             campaign_expressions.add(expr)
 
@@ -985,20 +1952,27 @@ class Engine:
                 proposal_meta=proposal_meta,
             )
             try:
+                if source == "llm_rejected":
+                    raise ValueError(
+                        str(
+                            (proposal_meta or {}).get("validation_error")
+                            or "LLM 批量候选未通过语义验证"
+                        )
+                    )
                 self._set_phase(
                     self.status.get("phase") or "candidate_mining",
                     current_operation="factor_evaluation",
                 )
-                metrics = await self._run_blocking_with_heartbeat(
-                    evaluate, expr, task["universe_n"], task["horizon"],
-                    task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
-                    self._panel_glob(), task.get("cost_bps", 15),
-                    self.task_config.get("market", "us"),
-                    self.task_config.get("evaluation_config"),
-                    task.get(
-                        "direction_policy",
-                        self._direction_policy(),
-                    ),
+                metrics = await self._run_shared_evaluation(
+                        expr, task["universe_n"], task["horizon"],
+                        task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
+                        self._panel_glob(), task.get("cost_bps", 15),
+                        self.task_config.get("market", "us"),
+                        self.task_config.get("evaluation_config"),
+                        task.get(
+                            "direction_policy",
+                            self._direction_policy(),
+                        ),
                 )
                 node.status = "ok"
                 node.public_metrics = {
@@ -1089,7 +2063,22 @@ class Engine:
             )
             if node.status == "ok":
                 min_icir = float(template.get("min_public_icir", 0.25))
-                await self._maybe_register_factor_v2(node, min_icir)
+                admission = await self._maybe_register_factor_v2(
+                    node,
+                    min_icir,
+                    task=task,
+                )
+                if admission:
+                    envelope = enrich_feedback_with_factor_admission(
+                        envelope,
+                        admission,
+                    )
+                    session_envelopes[-1] = envelope
+                    async with SessionLocal() as s:
+                        db_node = await s.get(Node, node.id)
+                        if db_node is not None:
+                            db_node.feedback_summary = envelope
+                            await s.commit()
                 if await self._stop_if_factor_target_reached():
                     break
                 if i % 10 == 0:
@@ -1105,11 +2094,19 @@ class Engine:
             if await self._stop_if_evaluation_budget_reached():
                 break
 
+        return_source_governance = self._return_source_governance()
         score, score_detail = diversity_adjusted_score(
             task_best_scores,
             session_envelopes,
             self.task_config.get("market", "us"),
+            return_source_weight=return_source_governance[
+                "meta_score_weight"
+            ],
+            required_return_sources=return_source_governance[
+                "required_sources"
+            ],
         )
+        score_detail["return_source_governance"] = return_source_governance
         summary = combine_seed_feedback([{
             "seed": seed,
             "score": score,
@@ -1126,31 +2123,78 @@ class Engine:
             "score_detail": score_detail,
         }
 
-    async def _maybe_register_factor_v2(self, node: Node, min_icir: float) -> None:
+    async def _maybe_register_factor_v2(
+        self,
+        node: Node,
+        min_icir: float,
+        *,
+        task: dict | None = None,
+    ) -> dict | None:
         pm = node.public_metrics
         discovery = pm.get("discovery") or {}
         if not discovery.get("passed") or (pm.get("icir") or 0) < min_icir:
-            return
+            return None
         market = self.task_config.get("market", "us")
+        portfolio_mode = self._portfolio_mode()
+        governance = self._return_source_governance()
+        task = dict(task or {})
+        task_snapshot = {
+            "name": str(task.get("name") or node.task_name),
+            "market": market,
+            "portfolio_mode": portfolio_mode,
+            "universe_n": int(task.get("universe_n") or 0),
+            "horizon": int(task.get("horizon") or pm.get("horizon") or 0),
+            "cost_bps": float(task.get("cost_bps") or 0.0),
+        }
+        task_signature = "|".join(
+            str(task_snapshot[key])
+            for key in (
+                "market",
+                "portfolio_mode",
+                "universe_n",
+                "horizon",
+                "cost_bps",
+            )
+        )
         semantic_audit = audit_expression_semantics(node.expression, market)
         if semantic_audit["errors"]:
             await self.log(
                 f"  因子未入库: 字段语义审计失败 · {semantic_audit['errors'][0][:180]}",
                 "warning",
             )
-            return
+            return None
         async with SessionLocal() as s:
             exists = await s.scalar(select(Factor).where(
                 Factor.expression == node.expression, Factor.experiment_id == self.exp_id))
             if exists:
-                return
+                return None
+            factor_filters = [
+                Factor.evaluation_protocol == EVALUATION_PROTOCOL_VERSION
+            ]
+            if not governance["cross_experiment_admission"]:
+                factor_filters.append(Factor.experiment_id == self.exp_id)
             existing_factors = list((await s.scalars(
-                select(Factor).where(Factor.experiment_id == self.exp_id)
+                select(Factor).where(*factor_filters)
             )).all())
             nearest_structural: tuple[float, Factor] | None = None
             nearest_behavior: tuple[float, Factor] | None = None
             candidate_signature = pm.get("training_return_path_signature") or {}
             for existing_factor in existing_factors:
+                existing_meta = dict(existing_factor.research_meta or {})
+                existing_market = str(
+                    existing_meta.get("market")
+                    or (market if existing_factor.experiment_id == self.exp_id else "")
+                )
+                existing_mode = str(
+                    existing_meta.get("portfolio_mode")
+                    or (
+                        portfolio_mode
+                        if existing_factor.experiment_id == self.exp_id
+                        else ""
+                    )
+                )
+                if existing_market != market or existing_mode != portfolio_mode:
+                    continue
                 try:
                     structural = expression_similarity(
                         node.expression,
@@ -1160,7 +2204,12 @@ class Engine:
                     structural = 0.0
                 if nearest_structural is None or structural > nearest_structural[0]:
                     nearest_structural = (structural, existing_factor)
-                if existing_factor.task_name != node.task_name:
+                same_return_scope = (
+                    existing_factor.task_name == node.task_name
+                    if existing_factor.experiment_id == self.exp_id
+                    else existing_meta.get("task_signature") == task_signature
+                )
+                if not same_return_scope:
                     continue
                 correlation = return_path_correlation(
                     candidate_signature,
@@ -1173,7 +2222,12 @@ class Engine:
                 ):
                     nearest_behavior = (correlation, existing_factor)
             admission = {
-                "protocol": "factor_diversity_admission_v1",
+                "protocol": (
+                    "factor_diversity_admission_v2"
+                    if governance["enabled"]
+                    else "factor_diversity_admission_v1"
+                ),
+                "return_source_governance": governance,
                 "accepted": True,
                 "mechanism_family": mechanism_from_item({
                     "expression": node.expression,
@@ -1189,20 +2243,39 @@ class Engine:
                     6,
                 ),
                 "structural_threshold": 0.84,
-                "return_path_threshold": 0.85,
+                "return_path_threshold": governance[
+                    "correlation_threshold"
+                ],
+                "task_signature": task_signature,
+                "task_snapshot": task_snapshot,
                 "semantic_audit": semantic_audit,
             }
             reason = ""
+            nearest_reference = None
             if nearest_structural and nearest_structural[0] >= 0.84:
                 reason = (
                     "structural_duplicate_of_factor_"
                     f"{nearest_structural[1].id}"
                 )
-            elif nearest_behavior and nearest_behavior[0] >= 0.85:
+                nearest_reference = nearest_structural[1]
+            elif (
+                nearest_behavior
+                and nearest_behavior[0] >= governance["correlation_threshold"]
+            ):
                 reason = (
                     "return_path_duplicate_of_factor_"
                     f"{nearest_behavior[1].id}"
                 )
+                nearest_reference = nearest_behavior[1]
+            if nearest_reference is not None:
+                admission["reference"] = {
+                    "factor_id": nearest_reference.id,
+                    "experiment_id": nearest_reference.experiment_id,
+                    "task_name": nearest_reference.task_name,
+                    "cross_experiment": (
+                        nearest_reference.experiment_id != self.exp_id
+                    ),
+                }
             if reason:
                 admission.update({"accepted": False, "reason": reason})
                 db_node = await s.get(Node, node.id)
@@ -1221,7 +2294,7 @@ class Engine:
                     f"return_corr={admission['max_return_path_correlation']:.3f}",
                     "info",
                 )
-                return
+                return admission
             n = await s.scalar(
                 select(func.count(Factor.id)).where(Factor.experiment_id == self.exp_id)) or 0
             s.add(Factor(
@@ -1260,6 +2333,9 @@ class Engine:
                     "factor_admission": admission,
                     "semantic_audit": semantic_audit,
                     "training_return_path_signature": candidate_signature,
+                    "task_signature": task_signature,
+                    "task_snapshot": task_snapshot,
+                    "return_source_governance": governance,
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
@@ -1269,6 +2345,7 @@ class Engine:
                 },
             ))
             await s.commit()
+            return admission
 
     # ================================================================
     # V2 辅助方法
@@ -1506,6 +2583,62 @@ class Engine:
             task_cfg = self.task_config.get("engine_config", {})
             local_tasks = task_cfg.get("tasks")
             cfg.update(task_cfg)
+            positive_ints = (
+                "inner_budget_per_outer_step",
+                "n_seeds_per_candidate",
+                "paired_cohorts_per_comparison",
+                "incumbent_remeasure_every",
+                "incumbent_remeasure_budget",
+                "baseline_warmup_budget",
+                "max_outer_steps",
+                "max_llm_calls",
+                "batch_candidates_per_call",
+                "max_tree_depth",
+                "governor_warmup_candidates",
+            )
+            for key in positive_ints:
+                try:
+                    cfg[key] = int(cfg[key])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"engine_config.{key} 必须为正整数") from exc
+                if key == "governor_warmup_candidates":
+                    if cfg[key] < 0:
+                        raise ValueError(
+                            "engine_config.governor_warmup_candidates 必须为非负整数"
+                        )
+                elif cfg[key] <= 0:
+                    raise ValueError(f"engine_config.{key} 必须为正整数")
+            try:
+                cfg["scientific_governor_interval_outer_steps"] = int(
+                    cfg.get("scientific_governor_interval_outer_steps", 3)
+                )
+                cfg["algorithm_inspiration_share"] = float(
+                    cfg.get("algorithm_inspiration_share", 0.30)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("全 LLM 三层控制参数非法") from exc
+            if cfg["scientific_governor_interval_outer_steps"] <= 0:
+                raise ValueError(
+                    "engine_config.scientific_governor_interval_outer_steps 必须为正整数"
+                )
+            if not 0.0 <= cfg["algorithm_inspiration_share"] <= 1.0:
+                raise ValueError(
+                    "engine_config.algorithm_inspiration_share 必须在 0..1"
+                )
+            cfg["n_seeds_per_candidate"] = min(
+                cfg["n_seeds_per_candidate"],
+                cfg["paired_cohorts_per_comparison"],
+            )
+            try:
+                cfg["max_runtime_hours"] = float(cfg["max_runtime_hours"])
+                cfg["draft_ratio"] = float(cfg["draft_ratio"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("引擎小数控制参数非法") from exc
+            if cfg["max_runtime_hours"] <= 0:
+                raise ValueError("engine_config.max_runtime_hours 必须为正数")
+            if not 0.0 <= cfg["draft_ratio"] <= 1.0:
+                raise ValueError("engine_config.draft_ratio 必须在 0..1")
+            cfg["memory_mode"] = self._memory_mode()
             cfg["tasks"] = resolve_engine_tasks(
                 local_tasks or cfg.get("tasks", []),
                 self.task_config.get("market", "us"),
@@ -1945,7 +3078,16 @@ class Engine:
         # Random campaigns must remain isolated from global provider settings.
         # Returning None activates the deterministic, mechanism-targeted local
         # fallback for both the inner proposer and outer template proposer.
-        if self._proposal_mode() == "random":
+        if self._proposal_mode() in {"random", "search_pool"}:
+            return None
+        if role == "inner_provider" and not self._layer2_enabled():
+            return None
+        if role == "outer_provider" and not self._layer3_enabled():
+            return None
+        if (
+            role == "scientific_governor_provider"
+            and not self._scientific_governor_enabled()
+        ):
             return None
         async with SessionLocal() as s:
             row = await s.get(Setting, "llm_providers")
@@ -1953,6 +3095,10 @@ class Engine:
                 return None
             conf = row.value
             name = conf.get(role)
+            if role == "scientific_governor_provider" and not name:
+                # 10013 can run immediately with the audited outer provider;
+                # operators may later assign a dedicated governor model.
+                name = conf.get("outer_provider")
             for p in conf.get("providers", []):
                 if p.get("name") == name and p.get("api_key"):
                     return p
@@ -2031,6 +3177,7 @@ class EngineManager:
             "current_budget_total": None,
             "log_counts": {},
             "task_config": {},
+            "runtime_identity": runtime_identity(),
             "observed_at": now,
         }
         if include_logs:
@@ -2150,6 +3297,58 @@ def _student_t_survival(t_stat: float, degrees_of_freedom: float) -> float:
         0.5,
     )
     return right_tail if t_stat >= 0 else 1.0 - right_tail
+
+
+def _paired_score_test(
+    candidate_scores: list[float],
+    incumbent_scores: list[float],
+) -> dict:
+    """Exact one-sided paired sign-flip test for predeclared seed cohorts."""
+    if len(candidate_scores) != len(incumbent_scores) or len(candidate_scores) < 2:
+        return {
+            "type": "invalid_paired_cohort",
+            "p_value": 1.0,
+            "candidate_n": len(candidate_scores),
+            "incumbent_n": len(incumbent_scores),
+        }
+    differences = [
+        float(candidate) - float(incumbent)
+        for candidate, incumbent in zip(candidate_scores, incumbent_scores)
+    ]
+    observed = st.mean(differences)
+    if observed <= 0:
+        p_value = 1.0
+    elif len(differences) <= 16:
+        extreme = 0
+        total = 1 << len(differences)
+        for mask in range(total):
+            permuted = st.mean(
+                value if mask & (1 << index) else -value
+                for index, value in enumerate(differences)
+            )
+            if permuted >= observed - 1e-12:
+                extreme += 1
+        p_value = extreme / total
+    else:
+        spread = st.stdev(differences)
+        if spread <= 1e-12:
+            p_value = 0.0
+        else:
+            t_stat = observed / (spread / math.sqrt(len(differences)))
+            p_value = _student_t_survival(
+                t_stat,
+                float(len(differences) - 1),
+            )
+    return {
+        "type": "paired_seed_sign_flip_one_sided",
+        "candidate_n": len(candidate_scores),
+        "incumbent_n": len(incumbent_scores),
+        "candidate_mean": round(st.mean(candidate_scores), 6),
+        "incumbent_mean": round(st.mean(incumbent_scores), 6),
+        "difference": round(observed, 6),
+        "paired_differences": [round(value, 6) for value in differences],
+        "p_value": round(max(0.0, min(1.0, p_value)), 8),
+    }
 
 
 def _one_sided_score_test(

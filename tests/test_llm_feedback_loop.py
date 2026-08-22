@@ -13,12 +13,17 @@ from backend.app.feedback import (
     build_inner_feedback_context,
     combine_seed_feedback,
     compare_feedback_reports,
+    enrich_feedback_with_factor_admission,
     ensure_training_safe,
     feedback_priority,
 )
 from backend.app.meta import agent as meta_agent
 from backend.app.miner import agent as miner_agent
-from backend.app.orchestrator import Engine, _one_sided_score_test
+from backend.app.orchestrator import (
+    Engine,
+    _one_sided_score_test,
+    _paired_score_test,
+)
 
 
 def _public_metrics(
@@ -235,6 +240,29 @@ class FeedbackContractTests(unittest.TestCase):
         )
         # Context priority must not mutate the evaluator's persisted score.
         self.assertEqual(high_predictive["outcome"]["score"], 1.4)
+
+    def test_admission_rejection_closes_feedback_loop_without_rescoring(self):
+        original = _envelope(51, score=1.7, passed=True)
+        enriched = enrich_feedback_with_factor_admission(
+            original,
+            {
+                "protocol": "factor_diversity_admission_v2",
+                "accepted": False,
+                "reason": "return_path_duplicate_of_factor_9",
+                "max_return_path_correlation": 0.93,
+                "reference": {"factor_id": 9, "experiment_id": 3},
+            },
+        )
+
+        self.assertEqual(enriched["outcome"]["score"], 1.7)
+        self.assertTrue(enriched["outcome"]["passed"])
+        self.assertFalse(enriched["outcome"]["factor_library_admitted"])
+        self.assertIn("收益路径", "".join(enriched["failure_reasons"]))
+        self.assertNotEqual(
+            enriched["feedback_fingerprint"],
+            original["feedback_fingerprint"],
+        )
+        ensure_training_safe(enriched)
 
     def test_cross_seed_report_and_comparison_are_auditable(self):
         seed_a = {
@@ -564,6 +592,55 @@ class InnerOuterAgentTests(unittest.TestCase):
             ["expected_effect_derived_from_targeted_failures"],
         )
 
+    def test_batch_proposal_keeps_invalid_member_as_llm_rejected(self):
+        original_chat = miner_agent.llm.chat
+        original_mark = miner_agent.llm.mark_validation
+        validation = {}
+
+        async def batch_response(*args, **kwargs):
+            return (
+                '{"candidates":['
+                '{"request_id":"r1","expression":"rank(ts_delta(close, 20))",'
+                '"hypothesis":"momentum","mechanism_family":"momentum",'
+                '"change_axis":"new_draft","reflection":"simple momentum",'
+                '"targeted_failures":[],"expected_effect":"stable IC"},'
+                '{"request_id":"r2","expression":"rank(ts_delta(close, 5))",'
+                '"hypothesis":"wrong family","mechanism_family":"momentum",'
+                '"change_axis":"new_draft","reflection":"test",'
+                '"targeted_failures":[],"expected_effect":"test"}'
+                ']}'
+            )
+
+        async def capture_validation(*args, **kwargs):
+            validation.update(kwargs)
+
+        task = {
+            "name": "T1", "market": "us", "mode": "long_short",
+            "direction": 1, "universe_n": 500, "horizon": 5,
+        }
+        requests = [
+            {"request_id": "r1", "task": task, "op": "draft", "target_family": "momentum", "feedback_nodes": [], "base_node": None},
+            {"request_id": "r2", "task": task, "op": "draft", "target_family": "reversal", "feedback_nodes": [], "base_node": None},
+        ]
+        miner_agent.llm.chat = batch_response
+        miner_agent.llm.mark_validation = capture_validation
+        try:
+            results = asyncio.run(miner_agent.propose_batch(
+                DEFAULT_MINER_TEMPLATE,
+                requests,
+                {"name": "mock"},
+                fields=["open", "high", "low", "close", "vol", "amount"],
+            ))
+        finally:
+            miner_agent.llm.chat = original_chat
+            miner_agent.llm.mark_validation = original_mark
+
+        self.assertEqual(results[0][2], "llm")
+        self.assertEqual(results[1][2], "llm_rejected")
+        self.assertNotEqual(results[1][2], "random")
+        self.assertEqual(validation["trace_meta_updates"]["valid_candidates"], 1)
+        self.assertEqual(validation["trace_meta_updates"]["rejected_candidates"], 1)
+
     def test_outer_test_and_default_start_mode_are_explicit(self):
         self.assertEqual(EngineStartReq().mode, "v2")
         legacy_start = asyncio.run(Engine().start(mode="v1"))
@@ -595,6 +672,18 @@ class InnerOuterAgentTests(unittest.TestCase):
         self.assertAlmostEqual(known["p_value"], 0.25, places=6)
         self.assertEqual(weak["type"], "insufficient_seeds")
         self.assertEqual(weak["p_value"], 1.0)
+
+    def test_paired_seed_test_uses_exact_sign_flip_distribution(self):
+        result = _paired_score_test(
+            [1.1, 1.3, 1.2, 1.5, 1.4, 1.6],
+            [0.9, 1.0, 1.0, 1.2, 1.1, 1.2],
+        )
+        self.assertEqual(result["type"], "paired_seed_sign_flip_one_sided")
+        self.assertEqual(result["candidate_n"], 6)
+        self.assertAlmostEqual(result["p_value"], 1 / 64)
+
+        losing = _paired_score_test([0.8, 0.9], [1.0, 1.1])
+        self.assertEqual(losing["p_value"], 1.0)
 
 
 if __name__ == "__main__":

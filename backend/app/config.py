@@ -13,6 +13,18 @@ MARKET_LABEL = "A股" if _MARKET == "ashare" else "美股"
 
 HOST = os.environ.get("FF_HOST", "127.0.0.1").strip() or "127.0.0.1"
 PORT = int(os.environ.get("FF_PORT", "10010"))
+SERVICE_INSTANCE = (
+    os.environ.get("FF_SERVICE_INSTANCE", f"factorfactory-{PORT}").strip()
+    or f"factorfactory-{PORT}"
+)
+SERVICE_ARCHITECTURE = os.environ.get(
+    "FF_SERVICE_ARCHITECTURE",
+    "",
+).strip().lower()
+AUTOSTART_RESEARCH = os.environ.get(
+    "FF_AUTOSTART_RESEARCH",
+    "",
+).strip().lower() in {"1", "true", "yes", "on"}
 PANEL_AUTO_RELOAD = os.environ.get(
     "FF_PANEL_AUTO_RELOAD",
     "1",
@@ -157,12 +169,18 @@ def get_dsl_fields(market: str | None = None) -> list[str]:
     return list(ASHARE_DSL_FIELDS if market == "ashare" else US_DSL_FIELDS if market == "us" else DSL_FIELDS)
 
 
-# ---- Evaluation Protocol V4.2 ----
+# ---- Evaluation Protocol V4.2 + Frozen Rating V4.3 ----
 # V4.1 separated the hard admission gate from a continuous failure-aware
 # learning score.  V4.2 additionally evaluates both signal orientations on
 # training-safe layers, pays a two-sided search penalty, then freezes the
-# selected direction before any HOLDOUT/VAULT access.
+# selected direction before any HOLDOUT/VAULT access.  Frozen Rating V4.3 keeps
+# those isolation layers intact and adds a separate, explicit full-history
+# view.  It is calculated only after direction freeze and is never returned to
+# either LLM research loop.
 EVALUATION_PROTOCOL_VERSION = "v4.2"
+FROZEN_RATING_PROTOCOL_VERSION = "v4.3"
+FROZEN_RATING_WINDOW_START = "2020-01-01"
+FROZEN_RATING_WINDOW_END = "latest_available"
 DIRECTION_POLICY_BOTH = "both_train_select"
 DIRECTION_POLICY_FIXED = "fixed"
 DEFAULT_RESEARCH_DIRECTION_POLICY = DIRECTION_POLICY_BOTH
@@ -471,13 +489,26 @@ DEFAULT_MINER_TEMPLATE = {
     },
 }
 
-# ---- 新版引擎配置 (B组: 高预算 + 多种子) ----
+# ---- 新版引擎配置 (B组: 有界预算 + 配对多种子) ----
 DEFAULT_ENGINE_CONFIG_V2 = {
-    "inner_budget_per_outer_step": 20,    # 快速验证: 20 (完整实验: 50)
-    "n_seeds_per_candidate": 2,            # 快速验证: 2 (完整实验: 3)
-    "outer_accept_p_value": 0.10,          # 单边 Student/Welch t 检验接受阈值
-    "incumbent_remeasure_every": 3,        # 每 3 步重测在位者
-    "incumbent_remeasure_budget": 30,      # 重测时用 30 次评估 (节省算力)
+    "inner_budget_per_outer_step": 6,
+    "n_seeds_per_candidate": 6,
+    "paired_cohorts_per_comparison": 6,
+    "outer_accept_p_value": 0.10,
+    "incumbent_remeasure_every": 1,
+    "incumbent_remeasure_budget": 6,
+    "baseline_warmup_budget": 6,
+    "max_outer_steps": 6,
+    "max_runtime_hours": 4.0,
+    "max_llm_calls": 60,
+    "batch_candidates_per_call": 6,
+    "draft_ratio": 0.50,
+    "max_tree_depth": 3,
+    # Continuous services use a deterministic warm-up cohort before the
+    # low-frequency Governor receives any feedback.  One complete cohort is
+    # 5 seeds x 6 candidates in the ideal service profiles.
+    "governor_warmup_candidates": 30,
+    "memory_mode": "adaptive",
     "tasks": [
         {"name": "T1_liquid500_5d", "universe_n": 500, "horizon": 5, "cost_bps": 15, "cost_bps_by_market": {"ashare": 20, "us": 15}, "mode": DEFAULT_PORTFOLIO_MODE},
         {"name": "T2_mid1500_10d", "universe_n": 1500, "horizon": 10, "cost_bps": 25, "cost_bps_by_market": {"ashare": 30, "us": 25}, "mode": DEFAULT_PORTFOLIO_MODE},

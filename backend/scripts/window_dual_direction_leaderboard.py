@@ -73,6 +73,7 @@ DIRECTIONS = (1, -1)
 _WORKER_SPEC: BatchBacktestSpec | None = None
 _WORKER_PANEL_GLOB = ""
 _WORKER_SCENARIO_ENGINE = "event"
+_WORKER_DSL_FIELDS: tuple[str, ...] = ()
 _ACTIVE_PROTOCOL = EVENT_PROTOCOL
 _ACTIVE_POLICY_LABEL = EVENT_POLICY_LABEL
 
@@ -116,9 +117,10 @@ def _worker_init(
     spec: dict,
     panel_glob: str,
     scenario_engine: str,
+    dsl_fields: list[str],
 ) -> None:
     global _WORKER_SPEC, _WORKER_PANEL_GLOB
-    global _WORKER_SCENARIO_ENGINE
+    global _WORKER_SCENARIO_ENGINE, _WORKER_DSL_FIELDS
     global _ACTIVE_PROTOCOL, _ACTIVE_POLICY_LABEL
     _WORKER_SPEC = BatchBacktestSpec(**{
         **spec,
@@ -126,6 +128,7 @@ def _worker_init(
     })
     _WORKER_PANEL_GLOB = panel_glob
     _WORKER_SCENARIO_ENGINE = scenario_engine
+    _WORKER_DSL_FIELDS = tuple(sorted(set(dsl_fields)))
     _ACTIVE_PROTOCOL, _ACTIVE_POLICY_LABEL = _protocol_for_engine(
         scenario_engine
     )
@@ -170,6 +173,7 @@ def _frame_for_expression(expression: str) -> pl.DataFrame:
         panel_glob=_WORKER_PANEL_GLOB,
         market=_WORKER_SPEC.market,
         forward_horizon=_WORKER_SPEC.horizon,
+        dsl_fields=_WORKER_DSL_FIELDS or None,
     )
     return frame
 
@@ -778,6 +782,11 @@ def main() -> None:
     expressions = list(snapshot.get("expressions", []))
     if args.limit > 0:
         expressions = expressions[: args.limit]
+    dsl_fields = sorted({
+        str(field)
+        for row in expressions
+        for field in ((row.get("profile") or {}).get("fields") or [])
+    })
     by_source_hash = {
         str(row["expression_hash"]): row for row in expressions
     }
@@ -815,6 +824,7 @@ def main() -> None:
         "panel_identity_path_size_mtime_sha256": panel_identity,
         "spec": spec.as_dict(),
         "directions": list(DIRECTIONS),
+        "dsl_fields": dsl_fields,
         "limit": args.limit,
         "execution_source_sha256": execution_source_sha256,
     }
@@ -853,6 +863,9 @@ def main() -> None:
         "python": sys.version,
         "direction_selection": "disabled_both_directions_forced",
         "scenario_engine": args.scenario_engine,
+        "candidate_source_kind": snapshot.get("candidate_source_kind"),
+        "candidate_source_label": snapshot.get("candidate_source_label"),
+        "source_database_sha256": snapshot.get("source_database_sha256"),
         "screening_only": args.scenario_engine == "vector_screen",
         "vector_screen_protocol": (
             VECTOR_SCREEN_PROTOCOL
@@ -940,6 +953,7 @@ def main() -> None:
             spec.as_dict(),
             panel_glob,
             args.scenario_engine,
+            dsl_fields,
         ),
     ) as executor:
         futures = {

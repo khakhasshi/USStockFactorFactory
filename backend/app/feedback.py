@@ -22,12 +22,13 @@ from .factors.return_path import (
     combined_training_signature,
     return_path_correlation,
 )
+from .factors.return_source_governance import cluster_training_return_sources
 from .factors.semantics import audit_expression_semantics
 from .factors.similarity import expression_similarity
 from .observability import redact_text, redact_value
 
 FEEDBACK_SCHEMA_VERSION = "factorfactory.evaluation-feedback/v3"
-OUTER_REPORT_SCHEMA_VERSION = "factorfactory.outer-feedback/v3"
+OUTER_REPORT_SCHEMA_VERSION = "factorfactory.outer-feedback/v4"
 
 DEFAULT_CONTEXT_POLICY = {
     "top_k": 4,
@@ -388,6 +389,42 @@ def build_feedback_envelope(
     return envelope
 
 
+def enrich_feedback_with_factor_admission(
+    envelope: dict,
+    admission: dict | None,
+) -> dict:
+    """Attach post-evaluation library governance without altering V4 scores."""
+    if not admission:
+        return envelope
+    result = {
+        **envelope,
+        "outcome": dict(envelope.get("outcome") or {}),
+        "failure_reasons": list(envelope.get("failure_reasons") or []),
+        "improvement_targets": list(envelope.get("improvement_targets") or []),
+        "factor_admission": redact_value(admission),
+    }
+    accepted = bool(admission.get("accepted"))
+    result["outcome"]["factor_library_admitted"] = accepted
+    if not accepted:
+        reason = str(admission.get("reason") or "factor_admission_rejected")
+        if reason.startswith("return_path_duplicate"):
+            failure = "训练收益路径与已入库因子高度重复"
+            target = "改变经济机制和收益形成路径，不要只换窗口、符号或归一化包装"
+        elif reason.startswith("structural_duplicate"):
+            failure = "表达式结构与已入库因子高度重复"
+            target = "切换字段关系或算子结构，提出可归因的新机制而非语法近邻"
+        else:
+            failure = f"因子治理拒绝: {reason}"
+            target = "根据因子治理拒绝原因改写候选"
+        if failure not in result["failure_reasons"]:
+            result["failure_reasons"].append(failure)
+        if target not in result["improvement_targets"]:
+            result["improvement_targets"].append(target)
+    result["feedback_fingerprint"] = _canonical_hash(result)
+    ensure_training_safe(result)
+    return result
+
+
 def resolve_context_policy(template: dict | None) -> dict:
     raw = dict((template or {}).get("context_policy") or {})
     policy = dict(DEFAULT_CONTEXT_POLICY)
@@ -681,6 +718,13 @@ def build_inner_feedback_context(
             f"attempts={summary['mechanism_counts']}；"
             f"passed={summary['passed_mechanism_counts']}"
         ),
+        (
+            "训练收益来源: "
+            f"clusters={summary['return_source_clusters']}，"
+            f"effective={summary['effective_return_sources']:.2f}，"
+            f"scoped_redundancy={summary['scoped_behavior_duplicate_rate']:.1%}，"
+            f"signature_coverage={summary['return_source_signature_coverage']:.1%}"
+        ),
     ]
     if summary["failure_reason_counts"]:
         lines.append(
@@ -825,6 +869,10 @@ def _summary_core(envelopes: list[dict]) -> dict:
         ),
         0.85,
     )
+    return_sources = cluster_training_return_sources(
+        valid,
+        correlation_threshold=0.85,
+    )
     return {
         "score_semantics": "continuous_failure_margin_v4.2",
         "attempts": attempts,
@@ -853,6 +901,25 @@ def _summary_core(envelopes: list[dict]) -> dict:
         ),
         "structural_duplicate_rate": structural_duplicate_rate,
         "behavior_duplicate_rate": behavior_duplicate_rate,
+        # V1 is retained above for historical report comparability.  V2 uses
+        # quality representatives and task-scoped comparisons, avoiding both
+        # cross-task false matches and transitive correlation chaining.
+        "scoped_behavior_duplicate_rate": return_sources[
+            "return_source_redundancy_rate"
+        ],
+        "return_source_clusters": return_sources["return_source_clusters"],
+        "effective_return_sources": return_sources["effective_return_sources"],
+        "largest_return_source_cluster": return_sources[
+            "largest_return_source_cluster"
+        ],
+        "return_source_signature_coverage": return_sources[
+            "signature_coverage"
+        ],
+        "return_source_governance": {
+            key: value
+            for key, value in return_sources.items()
+            if key != "representative_qualities"
+        },
         **diversity,
         "source_counts": dict(sources.most_common()),
         "direction_counts": dict(directions.most_common()),

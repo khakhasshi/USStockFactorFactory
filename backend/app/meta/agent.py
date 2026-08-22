@@ -205,7 +205,7 @@ _SYSTEM_V2 = """你是自动化因子挖掘系统的元优化器 (Meta-Optimizer
 8. **dsl_exploration_templates**: 会真实进入内层提示词的 DSL 结构样例
 
 安全边界 (你绝不能触碰):
-- 权威 V4.2 评估器与数据层只读；最终封存评价不可作为训练反馈
+- 权威 V4.2 评估器与数据层只读；Rating V4.3 和最终封存评价不可作为训练反馈
 - 不得在模板中引用特定年份/era/数据层名称
 - 不得注入 Python 代码或文件系统操作
 - 所有改动必须引用历史报告中的证据；没有证据时应声明为探索性假设
@@ -228,7 +228,11 @@ _SYSTEM_V2 = """你是自动化因子挖掘系统的元优化器 (Meta-Optimizer
     "diagnosis": ["基于证据的问题"],
     "lessons_applied": ["本轮吸取的经验"],
     "evidence_used": ["引用的版本/任务/指标"],
-    "hypothesis": "本次改动为何应改善评价"
+    "hypothesis": "本次改动为何应改善评价",
+    "expected_effect": "预期改善的具体训练安全指标与方向",
+    "falsification_rule": "下一完整配对 cohort 中什么结果会证伪假设",
+    "confidence": 0.0,
+    "expiry_cohorts": 1
   }},
   "changed_fields": ["字段名列表"],
   "template": {{要修改的字段}},
@@ -359,6 +363,14 @@ def _as_text_list(value: object, limit: int) -> list[str]:
     ]
 
 
+def _bounded_number(value: object, default: float, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
 def _clean_reflection(value: dict | None) -> dict:
     value = dict(value) if isinstance(value, dict) else {}
     result = {
@@ -372,6 +384,18 @@ def _clean_reflection(value: dict | None) -> dict:
             300,
         )[:10],
         "hypothesis": str(value.get("hypothesis") or "")[:1000],
+        "expected_effect": str(
+            value.get("expected_effect") or ""
+        )[:800],
+        "falsification_rule": str(
+            value.get("falsification_rule") or ""
+        )[:800],
+        "confidence": _bounded_number(
+            value.get("confidence"), 0.5, 0.0, 1.0
+        ),
+        "expiry_cohorts": int(
+            _bounded_number(value.get("expiry_cohorts"), 1.0, 1.0, 3.0)
+        ),
     }
     ensure_training_safe(result)
     return result
@@ -423,6 +447,7 @@ async def propose_template(
     direction_policy: str = "both_train_select",
     trace_context: dict | None = None,
     deliberate_random: bool = False,
+    scientific_directive: dict | None = None,
 ) -> tuple[dict, str, str, dict]:
     """返回 (new_template, note, source, proposal_reflection).
 
@@ -447,6 +472,8 @@ async def propose_template(
                 f"{'只能做多，评价只奖励正向收益和多头稳定性。' if portfolio_mode == 'long_only' else '允许多空，评价可同时使用多头和空头收益。'}\n\n"
                 f"=== 当前在位模板 ===\n{current_summary}\n\n"
                 f"=== 同协议历史与评价反馈 ===\n{hist_text}\n\n"
+                f"=== 第三层科学总督指令 ===\n"
+                f"{redact_value(scientific_directive or {})}\n\n"
                 "请先判断上轮假设得到支持、被证伪还是证据不足，再提出下一项最小可归因改动。"
                 "重点检查任务间退化、种子方差、通过率、失败原因、重复率、随机回退率和最弱评价组件。"
             )
@@ -459,7 +486,9 @@ async def propose_template(
                 0.7,
                 trace={
                     **(trace_context or {}),
-                    "role": "outer",
+                    "role": str(
+                        (trace_context or {}).get("llm_role") or "outer"
+                    ),
                     "phase": "template_proposal",
                     "feedback_fingerprint": history_fingerprint,
                 },
@@ -487,6 +516,12 @@ async def propose_template(
                 raise llm.LLMError(
                     "外层改动缺少可审计的 diagnosis/hypothesis"
                 )
+            if not reflection["expected_effect"]:
+                reflection["expected_effect"] = reflection["hypothesis"]
+            if not reflection["falsification_rule"]:
+                reflection["falsification_rule"] = (
+                    "下一完整配对 cohort 未达到预注册接受阈值则证伪"
+                )
             raw_updates = data.get("template", {})
             logger.info("外层 LLM 拟改动 %d 个字段: %s", len(raw_updates), list(raw_updates.keys())[:10])
             new_template = clamp_template(raw_updates, incumbent_template)
@@ -511,6 +546,21 @@ async def propose_template(
 
             # 检查实质改动
             changed_keys = [k for k in new_template if new_template.get(k) != incumbent_template.get(k)]
+            if len(changed_keys) > 1:
+                requested_order = [
+                    str(key) for key in changed if str(key) in changed_keys
+                ]
+                selected_key = (requested_order or changed_keys)[0]
+                discarded = [key for key in changed_keys if key != selected_key]
+                single_axis_template = deepcopy(incumbent_template)
+                single_axis_template[selected_key] = new_template[selected_key]
+                new_template = single_axis_template
+                changed_keys = [selected_key]
+                reflection["single_variable_governance"] = {
+                    "selected_field": selected_key,
+                    "discarded_fields": discarded,
+                    "reason": "outer A/B permits one attributable template change",
+                }
             if changed_keys:
                 logger.info("外层模板实质改动 %d 个字段: %s", len(changed_keys), changed_keys)
             else:
@@ -528,8 +578,28 @@ async def propose_template(
                 error=fallback_reason,
             )
             logger.warning(
-                "外层 LLM 异常, 回退随机: %s",
+                "外层 LLM 异常，执行语义拒绝或 provider 熔断: %s",
                 fallback_reason,
+            )
+            if text is None:
+                # A provider failure is not a Governor decision and must not
+                # be disguised as a random template proposal.
+                raise RuntimeError(
+                    f"第三层 LLM provider 不可用: {fallback_reason}"
+                ) from exc
+            return (
+                deepcopy(incumbent_template),
+                f"Governor 响应未通过语义验证: {fallback_reason}",
+                "llm_rejected",
+                {
+                    "diagnosis": ["Governor 响应未通过结构或安全验证"],
+                    "lessons_applied": [],
+                    "evidence_used": [history_fingerprint]
+                    if history_fingerprint else [],
+                    "hypothesis": "不以随机模板替代失败的 Governor 响应。",
+                    "fallback_reason": fallback_reason,
+                    "history_context_fingerprint": history_fingerprint,
+                },
             )
 
     t, note = random_jitter(incumbent_template)

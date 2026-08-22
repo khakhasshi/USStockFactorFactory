@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>A股四榜Top100收益来源与稳定性报告</title>
+  <style>
+    :root{--ink:#172235;--muted:#647187;--line:#dfe5ed;--paper:#f4f6f9;--card:#fff;--blue:#2854c5;--green:#16805b;--amber:#a26300;--red:#b32e3b;--navy:#101d32}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.68}
+    .hero{padding:55px 24px 48px;color:#fff;background:radial-gradient(circle at 80% 18%,#2f66c9 0,transparent 32%),linear-gradient(135deg,#101a2c,#173961 63%,#165d61)}.wrap{max-width:1180px;margin:auto}.eyebrow{font-size:12px;letter-spacing:.15em;color:#8bd9df;font-weight:800}.hero h1{font-size:40px;line-height:1.16;margin:12px 0}.hero p{max-width:900px;color:#d9e4f2;font-size:17px}.pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:22px}.pill{border:1px solid #ffffff38;background:#ffffff10;border-radius:999px;padding:4px 9px;font-size:12px}
+    nav{position:sticky;top:0;z-index:4;background:#fffffff2;border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}nav .wrap{display:flex;gap:20px;overflow:auto;padding:10px 20px}nav a{font-size:13px;color:var(--muted);font-weight:700;text-decoration:none;white-space:nowrap}main{padding:29px 20px 65px}section{scroll-margin-top:60px;margin-bottom:25px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.kpi,.card,.factor{background:var(--card);border:1px solid var(--line);border-radius:13px;box-shadow:0 7px 20px #293b5e18}.kpi{padding:17px}.kpi span{display:block;font-size:12px;color:var(--muted)}.kpi b{display:block;font-size:27px;color:var(--navy)}.card{padding:23px;margin-top:14px}h2{font-size:24px;margin:0 0 11px;color:var(--navy)}h3{font-size:17px;margin:19px 0 8px}.lead{font-size:17px}.callout{padding:14px 16px;margin:13px 0;border-left:4px solid var(--blue);border-radius:8px;background:#edf3ff}.callout.ok{border-color:var(--green);background:#edf9f3}.callout.warn{border-color:var(--amber);background:#fff6e6}.callout.reject{border-color:var(--red);background:#fff0f1}.table{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;min-width:850px;border-collapse:collapse;background:#fff}th,td{text-align:left;vertical-align:top;padding:10px 11px;border-bottom:1px solid var(--line);font-size:13px}th{background:#eef2f7;color:#45536a;font-size:11px}.factor-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:13px}.factor{padding:18px}.factor-head{display:flex;justify-content:space-between;gap:12px}.factor h3{margin:0}.tag{font-size:11px;color:#315071;background:#eaf0fa;border-radius:999px;padding:3px 8px;white-space:nowrap}.factor dl{display:grid;grid-template-columns:88px 1fr;gap:4px 8px;font-size:12px}.factor dt{color:var(--muted)}.factor dd{margin:0}.code{display:block;padding:9px 10px;background:#101c30;color:#dce8f8;border-radius:8px;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.good{color:var(--green);font-weight:750}.bad{color:var(--red);font-weight:750}.status{display:inline-block;padding:4px 8px;border-radius:7px;background:#fff0d0;color:var(--amber);font-weight:800}.evidence{font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}footer{background:#e9edf3;color:var(--muted);padding:23px 20px;font-size:12px}
+    @media(max-width:850px){.grid{grid-template-columns:repeat(2,1fr)}.factor-grid,.two{grid-template-columns:1fr}.hero h1{font-size:31px}}@media(max-width:500px){.grid{grid-template-columns:1fr}.hero h1{font-size:27px}.card{padding:17px}}
+  </style>
+</head>
+<body>
+  <header class="hero"><div class="wrap">
+    <div class="eyebrow">FACTORFACTORY · RETURN SOURCE AUDIT · 2026-08-22</div>
+    <h1>A股四榜Top100收益来源与稳定性报告</h1>
+    <p>冻结内部样本外事件榜、内部全区间榜、外部A股库榜和外部美股库榜各100个经济代表，在同一A股交易口径下重放主动收益，回答“究竟有多少不同来源、哪些跨榜复现、哪些只是单榜或单一阶段现象”。</p>
+    <div class="pills"><span class="pill">A股纯多</span><span class="pill">2020-01-01—2026-08-20</span><span class="pill">Top500</span><span class="pill">5日调仓</span><span class="pill">15 BPS</span><span class="pill">NON-PIT RESEARCH</span></div>
+  </div></header>
+  <nav><div class="wrap"><a href="#answer">主答案</a><a href="#method">方法</a><a href="#lists">四榜稳定性</a><a href="#sources">七个研究袖套</a><a href="#risks">边界</a><a href="#next">下一轮</a><a href="#evidence">证据</a></div></nav>
+  <main class="wrap">
+    <section id="answer">
+      <div class="grid">
+        <div class="kpi"><span>冻结榜位</span><b>400</b><small>四榜各Top100</small></div>
+        <div class="kpi"><span>公式×方向路径</span><b>363</b><small>322个唯一原始公式</small></div>
+        <div class="kpi"><span>|ρ|≥0.80收益簇</span><b>88</b><small>其中47个为单例</small></div>
+        <div class="kpi"><span>有效独立来源</span><b>13.65</b><small>按簇集中度HHI折算</small></div>
+      </div>
+      <div class="card">
+        <h2>主答案：统计上88簇，经济上约14个有效来源，下一轮先研究7个袖套</h2>
+        <p class="lead">400个榜位不能理解为400条Alpha。完全相同的公式与方向先压缩为363条收益路径；按绝对收益相关0.80去重后剩88簇，但最大簇含84条、47簇只出现一次。集中度折算的有效来源只有<strong>13.65</strong>。</p>
+        <div class="callout ok">采用“至少两个成员、全窗口Sharpe≥0.20、2020–22/2023–24/2025–最新三个阶段主动年化均为正”的预声明规则，只剩12个反复出现且跨阶段为正的簇。再按经济暴露合并相近的量价和规模代理，得到7个适合下一轮组合研究的袖套。</div>
+        <div class="callout warn"><strong>这7个不是正式因子库晋升结果。</strong>它们的身份和方向都受全窗口榜单影响；这里回答的是去重、归因和研究优先级，不是 untouched holdout 或实盘批准。</div>
+      </div>
+    </section>
+
+    <section id="method" class="card">
+      <h2>一、统一审计口径</h2>
+      <div class="two"><div><h3>四个冻结榜单</h3><ul><li>内部样本外事件榜Top100</li><li>内部全区间双向榜Top100</li><li>外部联合库中A股来源Top100</li><li>外部联合库中美股来源Top100</li></ul></div><div><h3>重放与去重</h3><ul><li>方向严格复制原榜，不在共同窗口重新择向</li><li>全部按A股纯多基准主动收益比较</li><li>2020-01-01至2026-08-20，共320个5日收益期</li><li>|ρ|≥0.80合并为同一经济收益簇</li></ul></div></div>
+      <p>外部联合库中4个 <code>origin_scope=both</code> 的代表被排除在两个外部子榜之外，防止同一来源同时占据A股库榜和美股库榜席位。41个原始公式在不同榜中出现方向冲突，因此无符号聚类是主答案，有向聚类只作可交易方向诊断。</p>
+      <div class="callout">阈值敏感性：|ρ|从0.70、0.75、0.80、0.85、0.90、0.95提高时，簇数依次为57、74、88、116、143、183；对应有效来源约10.40、11.98、13.65、13.51、15.84、33.37。结论是“十几个主要来源”，而不是精确迷信88这个阈值点。</div>
+    </section>
+
+    <section id="lists" class="card">
+      <h2>二、四榜稳定性：来源质量差异非常大</h2>
+      <div class="table"><table><thead><tr><th>榜单</th><th>全窗正年化</th><th>全窗中位Sharpe</th><th>2020–22正Sharpe</th><th>2023–24正Sharpe</th><th>2025–最新正Sharpe</th><th>涉及收益簇</th></tr></thead><tbody>
+        <tr><td>内部样本外事件榜</td><td>16/100</td><td class="bad">−0.095</td><td>11/100</td><td class="good">100/100</td><td class="bad">0/100</td><td>9</td></tr>
+        <tr><td>内部全区间双向榜</td><td>62/100</td><td>0.145</td><td>43/100</td><td class="good">96/100</td><td class="bad">10/100</td><td>24</td></tr>
+        <tr><td>外部A股库</td><td class="good">100/100</td><td class="good">0.406</td><td>99/100</td><td>84/100</td><td class="good">82/100</td><td>25</td></tr>
+        <tr><td>外部美股库</td><td class="bad">18/100</td><td class="bad">−0.793</td><td>18/100</td><td>23/100</td><td>20/100</td><td>54</td></tr>
+      </tbody></table></div>
+      <h3>三个直接结论</h3>
+      <ol><li><strong>内部事件榜是明显的2023–2024阶段簇。</strong>该阶段100/100为正，2025–最新却0/100为正；这更像共同的阶段暴露，不是100条独立Alpha。</li><li><strong>外部A股库是目前最有用的候选来源。</strong>它在最近阶段仍有82/100为正，但其榜单本身使用全窗口筛选，所以100/100全窗为正带有选择效应，不能当样本外胜率。</li><li><strong>美股公式直接迁移A股总体失败。</strong>它触达54个簇、表面多样性最高，但全窗仅18个正年化，中位Sharpe为−0.793；跨市场新颖不等于跨市场有效。</li></ol>
+    </section>
+
+    <section id="sources">
+      <div class="card"><h2>三、下一轮优先研究的7个不同收益袖套</h2><p>以下代表均属于0.80阈值下的不同收益簇，任意两者的共同窗口相关性不超过0.710。展示的是主动收益；三个阶段依次为2020–22、2023–24、2025–最新。</p></div>
+      <div class="factor-grid">
+        <article class="factor"><div class="factor-head"><h3>U0001 · 大单参与度</h3><span class="tag">簇规模9</span></div><dl><dt>方向</dt><dd>+1，高值偏多</dd><dt>全窗</dt><dd>年化5.25% · Sharpe 0.732 · 回撤8.34%</dd><dt>阶段年化</dt><dd>4.3% / 7.4% / 5.0%</dd><dt>阶段Sharpe</dt><dd>0.622 / 0.938 / 0.651</dd><dt>归因</dt><dd>大单买卖总额占成交额的长期比例，偏“机构参与/成交结构”，不是净买入。</dd></dl><code class="code">zscore(winsor_mad(ts_mean(((buy_lg_amount + sell_lg_amount) / amount), 120), 5))</code></article>
+        <article class="factor"><div class="factor-head"><h3>U0003 · 量比持续性</h3><span class="tag">簇规模11 · 跨A/美外部库</span></div><dl><dt>方向</dt><dd>−1，原式低值偏多</dd><dt>全窗</dt><dd>年化5.03% · Sharpe 0.636 · 回撤13.15%</dd><dt>阶段年化</dt><dd>6.5% / 1.8% / 7.2%</dd><dt>阶段Sharpe</dt><dd>0.828 / 0.198 / 0.912</dd><dt>归因</dt><dd>量比均值相对峰值的持续性，代理成交活跃度稳定而非单日放量。</dd></dl><code class="code">rank((-(ts_mean(volume_ratio, 120) / ts_max(volume_ratio, 120))))</code></article>
+        <article class="factor"><div class="factor-head"><h3>U0004 · 流通市值尺度/变化</h3><span class="tag">簇规模8</span></div><dl><dt>方向</dt><dd>−1，原式低值偏多</dd><dt>全窗</dt><dd>年化3.98% · Sharpe 0.614 · 回撤11.42%</dd><dt>阶段年化</dt><dd>4.0% / 2.9% / 5.9%</dd><dt>阶段Sharpe</dt><dd>0.635 / 0.359 / 1.069</dd><dt>归因</dt><dd>流通市值的时间波动；数值同时受绝对规模影响，下一轮必须拆解规模与市值变化。</dd></dl><code class="code">rank((-winsor_mad(ts_std(circ_mv, 60), 5)))</code></article>
+        <article class="factor"><div class="factor-head"><h3>U0012 · 低市销率</h3><span class="tag">簇规模13 · 三榜复现</span></div><dl><dt>方向</dt><dd>+1，低PS偏多</dd><dt>全窗</dt><dd>年化4.66% · Sharpe 0.478 · 回撤14.77%</dd><dt>阶段年化</dt><dd>2.9% / 11.7% / 1.1%</dd><dt>阶段Sharpe</dt><dd>0.254 / 1.478 / 0.088</dd><dt>归因</dt><dd>清晰的低估值来源；最近阶段仍为正，但强度显著低于2023–2024。</dd></dl><code class="code">rank((-ps))</code></article>
+        <article class="factor"><div class="factor-head"><h3>U0015 · 日内价量反转</h3><span class="tag">簇规模2</span></div><dl><dt>方向</dt><dd>+1，高值偏多</dd><dt>全窗</dt><dd>年化4.27% · Sharpe 0.458 · 回撤19.06%</dd><dt>阶段年化</dt><dd>6.3% / 5.4% / 0.8%</dd><dt>阶段Sharpe</dt><dd>0.627 / 0.524 / 0.076</dd><dt>归因</dt><dd>反向持有长窗开收盘价差乘成交量较弱的股票，代理日内卖压后的反转。</dd></dl><code class="code">-rank(ts_sum((close - open) / close * vol, 120))</code></article>
+        <article class="factor"><div class="factor-head"><h3>U0021 · 中期反转</h3><span class="tag">簇规模6 · 三榜复现</span></div><dl><dt>方向</dt><dd>−1，低20/60日均价比偏多</dd><dt>全窗</dt><dd>年化4.28% · Sharpe 0.390 · 回撤25.55%</dd><dt>阶段年化</dt><dd>3.8% / 8.1% / 3.3%</dd><dt>阶段Sharpe</dt><dd>0.302 / 0.646 / 0.244</dd><dt>归因</dt><dd>中期弱势后的反转，而不是趋势追随；回撤较高，应控制组合权重。</dd></dl><code class="code">zscore(winsor_mad((ts_mean(close, 20) / ts_mean(close, 60)), 5))</code></article>
+        <article class="factor"><div class="factor-head"><h3>U0026 · 标准化净资金流</h3><span class="tag">簇规模5</span></div><dl><dt>方向</dt><dd>+1，高值偏多</dd><dt>全窗</dt><dd>年化3.96% · Sharpe 0.365 · 回撤22.34%</dd><dt>阶段年化</dt><dd>7.8% / 2.1% / 2.3%</dd><dt>阶段Sharpe</dt><dd>0.723 / 0.127 / 0.190</dd><dt>归因</dt><dd>净主力资金相对自身长期波动的持续性；与量比持续性相关0.710，是七袖套中最接近的一对。</dd></dl><code class="code">zscore(winsor_mad(ts_mean((net_mf_amount / ts_std(net_mf_amount, 120)), 120), 5))</code></article>
+      </div>
+      <div class="card"><p><strong>12簇为何缩成7袖套：</strong>U0007、U0009、U0017均并入“成交活跃度稳定性”；U0011、U0022并入“规模/流通结构”。它们在0.80收益相关阈值下虽分属不同簇，但经济暴露高度相近，组合研究中继续分开等权会重复下注。</p></div>
+    </section>
+
+    <section id="risks" class="card">
+      <h2>四、不能被忽略的稳定性和归因边界</h2>
+      <div class="two"><div><h3>证据风险</h3><ul><li>全窗口参与了榜单筛选与方向冻结，三阶段切片是稳定性描述，不是全局样本外。</li><li>外部A股库的强结果包含全窗口择优效应；真正新增证据应从本次冻结之后开始。</li><li>年度并非全部为正：七袖套只是三个宽阶段为正，不能称“逐年稳定”。</li><li>47个单例簇缺乏复现，不计入核心袖套。</li></ul></div><div><h3>经济暴露风险</h3><ul><li>市值、成交额、量比和大单字段可能共享规模/流动性暴露。</li><li>U0004用绝对流通市值的时间标准差，可能主要是大盘尺度，而不是新Alpha。</li><li>资金流与量比袖套相关0.710；若采用更保守0.70阈值，应合并成一个流动性/资金流大袖套。</li><li>A股公式迁移美股与美股公式迁移A股都应单独冻结方向，不能默认跨市场同号。</li></ul></div></div>
+      <p><span class="status">RESEARCH_ONLY</span> 当前不输出“正式组合已通过”，也不把13.65或7解释为可交易Alpha的精确数量。</p>
+    </section>
+
+    <section id="next" class="card">
+      <h2>五、下一轮组合实验建议</h2>
+      <ol><li>以七袖套等权为唯一基准；若采用0.70保守口径，则先合并U0003与U0026，再做六袖套等权。</li><li>每个袖套先做市值、流动性、波动和行业暴露回归；若中性化后主动收益消失，降级为风险暴露而非Alpha。</li><li>做逐袖套删除消融、相关性滚动窗口与成本压力；重点审查U0012最近衰减、U0015最近接近零、U0021高回撤。</li><li>程序化优化只允许收缩权重或风险预算，不重新搜索方向；所有学习方案必须优于等权并通过2025–最新压力。</li><li>从2026-08-22起建立真正前瞻冻结记录，后续数据只追加，不回改本次身份、方向和代表式。</li></ol>
+    </section>
+
+    <section id="evidence" class="card">
+      <h2>六、可复现证据</h2>
+      <p class="evidence">var/reports/ashare-four-leaderboard-top100-return-source-audit-20260822/protocol.json</p>
+      <p class="evidence">var/reports/ashare-four-leaderboard-top100-return-source-audit-20260822/{frozen_top100_memberships.csv,return_paths.jsonl,global_unsigned_clusters.csv,global_unsigned_assignments.csv,threshold_sensitivity.csv}</p>
+      <p class="evidence">var/reports/ashare-four-leaderboard-top100-return-source-audit-20260822/{cluster_stability.csv,list_regime_stability.csv,selected_research_sources.csv,selected_source_correlations.csv,stability_conclusion.json}</p>
+      <p class="evidence">backend/scripts/{audit_ashare_top100_independent_return_sources.py,summarize_ashare_return_source_stability.py}</p>
+      <p>回放363条唯一路径全部成功，零失败。报告数值按显示精度舍入；原始路径、榜单哈希、面板身份与运行参数均保留在审计目录。</p>
+    </section>
+  </main>
+  <footer><div class="wrap">FactorFactory Research Documents · 研究审计工件，不构成投资建议或实盘批准。</div></footer>
+</body>
+</html>

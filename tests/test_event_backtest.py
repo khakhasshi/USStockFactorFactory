@@ -299,6 +299,32 @@ class EventLedgerRegressionTests(unittest.TestCase):
                 places=6,
             )
 
+    def test_artifact_schema_scans_late_fractional_execution_values(self):
+        # Polars normally infers a sequence-of-dicts schema from the first 100
+        # rows.  A long integer-looking prefix followed by a fractional US fill
+        # must still publish a complete audit ledger.
+        trades = [
+            {"fill_id": index, "quantity": index + 1, "price": 10.0}
+            for index in range(101)
+        ]
+        trades.append({"fill_id": 101, "quantity": 17.055546, "price": 10.0})
+        result = {
+            "trades": trades,
+            "events": [],
+            "daily_steps": [],
+            "round_trips": [],
+            "config": {},
+            "fee_schedule": {},
+            "stats": {},
+            "integrity": {"all_pass": True},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = _write_artifacts(result, Path(tmp))
+            stored = pl.read_parquet(Path(tmp) / "settlement_statement.parquet")
+            self.assertEqual(manifest["files"]["trades"]["rows"], 102)
+            self.assertEqual(stored.height, 102)
+            self.assertAlmostEqual(stored["quantity"][-1], 17.055546)
+
     def test_integrity_gate_rejects_a_tampered_statement(self):
         config = EventBacktestConfig(
             market="ashare",

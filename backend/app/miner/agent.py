@@ -3,6 +3,7 @@
 纪律: 提示词只包含训练安全的 V4 聚合反馈；最终封存层永不进入上下文.
 """
 
+import json
 import logging
 import random
 
@@ -26,12 +27,13 @@ from ..feedback import (
     ensure_training_safe,
 )
 from ..llm import client as llm
-from ..observability import redact_text
+from ..observability import redact_text, redact_value
 
 logger = logging.getLogger("miner")
 
 _FIELDS = DSL_FIELDS
 _WINDOWS = [3, 5, 10, 20, 40, 60, 120]
+_CHANGE_AXES = {"window", "transform", "normalization", "combination", "new_draft"}
 
 # ============================================================
 # 随机回退 (无 LLM 时)
@@ -592,6 +594,7 @@ def _build_system_prompt(
         "输出格式: 只回复 JSON: "
         "{\"expression\":\"...\",\"hypothesis\":\"...\","
         "\"mechanism_family\":\"...\","
+        "\"change_axis\":\"window|transform|normalization|combination|new_draft\","
         "\"reflection\":\"从反馈提炼的经验与本次改变\","
         "\"targeted_failures\":[\"本次针对的失败原因\"],"
         "\"expected_effect\":\"预期改善的评价组件\"}\n"
@@ -764,6 +767,17 @@ async def propose(
                 if template
                 else ""
             )
+            scientific_directive = (
+                redact_value(template.get("_scientific_governor_directive") or {})
+                if template
+                else {}
+            )
+            directive_instruction = (
+                "\n第三层科学总督指令（只约束研究方向，不替代你的表达式判断）: "
+                f"{scientific_directive}\n"
+                "你拥有直接提出完整因子表达式的权力；算法种子如存在仅供参考。"
+                if scientific_directive else ""
+            )
 
             if op == "draft":
                 draft_inst = template.get("draft_strategy", "提出与历史不同的新因子。") if template else "请提出一个与历史尝试思路不同的新因子。"
@@ -773,6 +787,7 @@ async def propose(
                     f"评价反馈与历史经验:\n{context}\n\n"
                     f"上下文使用要求: {context_instruction}\n"
                     f"策略指令: {draft_inst}\n{div_inst}\n"
+                    f"{directive_instruction}"
                     f"可探索的 DSL 结构样例（只作语法启发，不得机械复制）:\n{dsl_examples or '(无)'}"
                 )
             else:  # improve
@@ -784,13 +799,16 @@ async def propose(
                     f"完整评价反馈与经验:\n{context}\n\n"
                     f"上下文使用要求: {context_instruction}\n"
                     f"改进策略: {impr_inst}\n"
+                    f"{directive_instruction}"
                     f"可探索的 DSL 结构样例（只作语法启发，不得机械复制）:\n{dsl_examples or '(无)'}"
                 )
 
             temp_val = float(template.get("llm_temperature", 0.9)) if template else float(template_or_spec.get("llm_temperature", 0.9))
             trace = {
                 **(trace_context or {}),
-                "role": "inner",
+                "role": str(
+                    (trace_context or {}).get("llm_role") or "inner"
+                ),
                 "phase": f"proposal_{op}",
                 "task_name": task.get("name"),
                 "feedback_fingerprint": feedback_snapshot.get(
@@ -814,6 +832,7 @@ async def propose(
             hypothesis = str(data.get("hypothesis") or "").strip()[:500]
             declared_family = str(data.get("mechanism_family") or "").strip()
             reflection = str(data.get("reflection") or "").strip()[:800]
+            change_axis = str(data.get("change_axis") or "").strip()
             expected_effect = str(
                 data.get("expected_effect") or ""
             ).strip()[:500]
@@ -829,6 +848,15 @@ async def propose(
                 raise llm.LLMError(
                     "LLM 输出缺少 hypothesis/reflection"
                 )
+            if op == "draft" and not change_axis:
+                change_axis = "new_draft"
+            if change_axis not in _CHANGE_AXES:
+                raise llm.LLMError(
+                    "change_axis 必须为 window/transform/normalization/"
+                    "combination/new_draft"
+                )
+            if op == "improve" and change_axis == "new_draft":
+                raise llm.LLMError("改进节点必须声明唯一改动轴")
             if declared_family != target_family:
                 raise llm.LLMError(
                     f"mechanism_family 必须为本轮指定的 {target_family}"
@@ -874,6 +902,7 @@ async def propose(
                 )
             proposal_meta = {
                 "reflection": reflection,
+                "change_axis": change_axis,
                 "targeted_failures": targeted,
                 "expected_effect": expected_effect,
                 "semantic_normalizations": semantic_normalizations,
@@ -930,6 +959,7 @@ async def propose(
             "target_family": target_family,
             "declared_family": target_family,
             "family_match": True,
+            "change_axis": "new_draft" if op == "draft" else "window",
         }
     else:
         fallback_meta = {
@@ -940,6 +970,7 @@ async def propose(
             "target_family": target_family,
             "declared_family": target_family,
             "family_match": True,
+            "change_axis": "new_draft" if op == "draft" else "window",
         }
     known_expressions = {
         str(node.get("expression") or "").strip()
@@ -1025,6 +1056,281 @@ async def propose(
         "random",
         fallback_meta,
     )
+
+
+async def propose_batch(
+    template: dict,
+    requests: list[dict],
+    provider: dict | None,
+    *,
+    fields: list[str],
+    trace_context: dict | None = None,
+) -> list[tuple[str, str, str, dict]]:
+    """Propose several preassigned candidates in one audited LLM call.
+
+    Invalid or missing members stay explicit ``llm_rejected`` records.  They
+    are never silently replaced by random candidates, which preserves the
+    scientific distinction between the LLM, cold-LLM, and random arms.
+    """
+    if not requests:
+        return []
+    if provider is None:
+        return [
+            await propose(
+                template,
+                row["op"],
+                row["task"],
+                row["feedback_nodes"],
+                None,
+                fields=fields,
+                trace_context={**(trace_context or {}), "request_id": row["request_id"]},
+                rng=row.get("rng"),
+                target_family=row["target_family"],
+            )
+            for row in requests
+        ]
+
+    first_task = requests[0]["task"]
+    system = _build_system_prompt(
+        template,
+        fields,
+        first_task.get("mode", "long_short"),
+        first_task.get("market", "us"),
+        int(first_task.get("direction", 1)),
+        str(first_task.get("direction_policy") or "both_train_select"),
+        None,
+    ) + (
+        "\n【批量协议】仅返回 JSON 对象 {\"candidates\":[...]}；"
+        "每个成员必须原样返回 request_id，且独立满足其指定机制。"
+    )
+    rendered = []
+    snapshots = []
+    for row in requests:
+        task = row["task"]
+        context, snapshot = build_inner_feedback_context(
+            _feedback_envelopes(
+                row["feedback_nodes"],
+                market=task.get("market", "us"),
+                portfolio_mode=task.get("mode", "long_short"),
+                direction=int(task.get("direction", 1)),
+            ),
+            template,
+        )
+        snapshots.append(snapshot)
+        base = row.get("base_node") or {}
+        search_seed = row.get("search_seed")
+        rendered.append({
+            "request_id": row["request_id"],
+            "task_name": task.get("name"),
+            "market": task.get("market", "us"),
+            "portfolio_mode": task.get("mode", "long_short"),
+            "universe_n": task.get("universe_n"),
+            "horizon": task.get("horizon"),
+            "operation": row["op"],
+            "target_family": row["target_family"],
+            "base_expression": base.get("expression"),
+            "layer1_seed_expression": (
+                search_seed.expression if search_seed is not None else None
+            ),
+            "layer1_seed_hypothesis": (
+                search_seed.hypothesis if search_seed is not None else None
+            ),
+            "layer1_search_algorithm": (
+                search_seed.metadata.get("search_algorithm")
+                if search_seed is not None else None
+            ),
+            "feedback": context[:4500],
+        })
+    user = (
+        "你是因子机制科学家 LLM，拥有直接提出完整因子表达式的权力。"
+        "算法种子若存在只作可选灵感，不是前置条件，也不要求复制；"
+        "只在能依据训练安全反馈说明理由时做结构化起草、单轴变异或修复；不得访问或猜测"
+        "META_HOLDOUT、FACTOR_VAULT 或冻结评级结果。为以下预注册请求各生成一个候选。"
+        "每个候选必须包含 "
+        "request_id, expression, hypothesis, mechanism_family, change_axis, "
+        "reflection, targeted_failures, expected_effect。\n"
+        + "\n第三层科学总督指令: "
+        + json.dumps(
+            redact_value(template.get("_scientific_governor_directive") or {}),
+            ensure_ascii=False,
+        )
+        + "\n请求: "
+        + json.dumps(rendered, ensure_ascii=False)
+    )
+    text: str | None = None
+    try:
+        text = await llm.chat(
+            provider,
+            system,
+            user,
+            float(template.get("llm_temperature", 0.9)),
+            trace={
+                **(trace_context or {}),
+                "role": str(
+                    (trace_context or {}).get("llm_role") or "inner"
+                ),
+                "phase": "proposal_batch",
+                "task_name": "batch",
+                "batch_size": len(requests),
+                "feedback_fingerprints": [
+                    row.get("context_fingerprint", "") for row in snapshots
+                ],
+            },
+        )
+        payload = llm.extract_json(text)
+        candidates = payload.get("candidates") or []
+        if not isinstance(candidates, list):
+            raise llm.LLMError("batch candidates 必须是数组")
+        by_id = {
+            str(item.get("request_id")): item
+            for item in candidates
+            if isinstance(item, dict) and item.get("request_id") is not None
+        }
+        results: list[tuple[str, str, str, dict]] = []
+        valid_count = 0
+        errors: list[str] = []
+        for row, snapshot in zip(requests, snapshots):
+            request_id = str(row["request_id"])
+            item = by_id.get(request_id)
+            error = ""
+            if item is None:
+                error = "LLM 未返回该 request_id"
+                item = {}
+            expr = str(item.get("expression") or "").strip()
+            hypothesis = str(item.get("hypothesis") or "").strip()[:500]
+            reflection = str(item.get("reflection") or "").strip()[:800]
+            declared = str(item.get("mechanism_family") or "").strip()
+            change_axis = str(item.get("change_axis") or "").strip()
+            targeted = item.get("targeted_failures") or []
+            if not isinstance(targeted, list):
+                targeted = [str(targeted)]
+            targeted = [str(value).strip()[:240] for value in targeted[:6] if str(value).strip()]
+            expected_effect = str(item.get("expected_effect") or "").strip()[:500]
+            market = row["task"].get("market", "us")
+            if not error:
+                error = validate(expr, fields) or ""
+            if not error and (not hypothesis or not reflection):
+                error = "缺少 hypothesis/reflection"
+            if not error and declared != row["target_family"]:
+                error = f"mechanism_family 必须为 {row['target_family']}"
+            if not error and change_axis not in _CHANGE_AXES:
+                error = "change_axis 非法"
+            if not error and row["op"] == "improve" and change_axis == "new_draft":
+                error = "improve 必须使用单一改动轴"
+            if not error and not mechanism_compatible(expr, row["target_family"]):
+                error = "表达式与指定收益机制不相容"
+            semantic_audit = audit_expression_semantics(expr, market) if expr else {"errors": []}
+            if not error and semantic_audit["errors"]:
+                error = "；".join(semantic_audit["errors"])
+            seed_expression = (
+                row["search_seed"].expression
+                if row.get("search_seed") is not None else ""
+            )
+            seed_similarity = (
+                expression_similarity(expr, seed_expression)
+                if expr and seed_expression else None
+            )
+            direct_expression_authority = bool(
+                (trace_context or {}).get("direct_expression_authority", False)
+            )
+            if (
+                not error
+                and seed_similarity is not None
+                and seed_similarity < 0.20
+                and not direct_expression_authority
+            ):
+                error = (
+                    f"第二层偏离第一层种子过远: similarity={seed_similarity:.3f}"
+                )
+            similarity = max(
+                (
+                    expression_similarity(expr, str(node.get("expression") or ""))
+                    for node in row["feedback_nodes"]
+                    if node.get("expression")
+                ),
+                default=0.0,
+            )
+            if not error and row["op"] == "draft" and similarity >= 0.84:
+                error = f"新草稿结构相似度 {similarity:.3f} 过高"
+            if not error and row["feedback_nodes"] and not targeted:
+                error = "已有反馈时 targeted_failures 不能为空"
+            meta = {
+                "request_id": request_id,
+                "reflection": reflection,
+                "targeted_failures": targeted,
+                "expected_effect": expected_effect,
+                "change_axis": change_axis or ("new_draft" if row["op"] == "draft" else ""),
+                "target_family": row["target_family"],
+                "declared_family": declared,
+                "semantic_audit": semantic_audit,
+                "max_structural_similarity": round(similarity, 6),
+                "feedback_context_fingerprint": snapshot.get("context_fingerprint", ""),
+                "batch_size": len(requests),
+                "architecture_layer": int(
+                    (trace_context or {}).get("architecture_layer", 2)
+                ),
+                "direct_expression_authority": direct_expression_authority,
+                "layer1_seed_expression": (
+                    row["search_seed"].expression
+                    if row.get("search_seed") is not None else None
+                ),
+                "layer1_search_algorithm": (
+                    row["search_seed"].metadata.get("search_algorithm")
+                    if row.get("search_seed") is not None else None
+                ),
+                "layer2_changed_seed": (
+                    expr != row["search_seed"].expression
+                    if row.get("search_seed") is not None else None
+                ),
+                "layer1_seed_similarity": (
+                    round(seed_similarity, 6)
+                    if seed_similarity is not None else None
+                ),
+            }
+            if error:
+                meta["validation_error"] = redact_text(error, 500)
+                results.append((expr, hypothesis, "llm_rejected", meta))
+                errors.append(f"{request_id}: {error}")
+            else:
+                ensure_training_safe(meta)
+                results.append((expr, hypothesis, "llm", meta))
+                valid_count += 1
+        await llm.mark_validation(
+            text,
+            accepted=valid_count == len(requests),
+            error="; ".join(errors),
+            trace_meta_updates={
+                "valid_candidates": valid_count,
+                "rejected_candidates": len(requests) - valid_count,
+            },
+        )
+        return results
+    except Exception as exc:
+        error = redact_text(exc, 500)
+        await llm.mark_validation(text, accepted=False, error=error)
+        if text is None:
+            # Provider/auth/network/balance failures are infrastructure state,
+            # not rejected factor hypotheses.  Let the worker circuit-break
+            # before it consumes any candidate-evaluation budget.
+            raise RuntimeError(
+                f"第二层 LLM provider 不可用: {error}"
+            ) from exc
+        return [
+            (
+                "",
+                "",
+                "llm_rejected",
+                {
+                    "request_id": str(row["request_id"]),
+                    "target_family": row["target_family"],
+                    "declared_family": "",
+                    "change_axis": "",
+                    "validation_error": error,
+                    "batch_size": len(requests),
+                },
+            )
+            for row in requests
+        ]
 
 
 # ============================================================

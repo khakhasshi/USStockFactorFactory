@@ -1,4 +1,4 @@
-"""Evaluation Protocol V4.2.
+"""Evaluation Protocol V4.2 with Frozen Rating V4.3.
 
 The mining loop is allowed to see only INNER_PUBLIC and META_TRAIN.  A full
 audit is an explicit, persisted action that adds META_HOLDOUT and FACTOR_VAULT.
@@ -11,7 +11,8 @@ The protocol evaluates an executable portfolio, not IC in isolation:
 * long/short leg attribution and borrow proxy
 * return confidence bounds, cost breakeven and multiple-testing evidence
 * cost stress, drawdown, monotonicity, era/year stability and capacity proxy
-* a pre-vault live rank whose calibration is measured on the frozen vault
+* a frozen full-history rating from 2020 through the latest available panel date
+* independent HOLDOUT/Vault hard gates that remain separate from that rating
 
 PIT is intentionally outside this score at the user's request.  Every result is
 therefore labelled NON_PIT_RESEARCH; an F5 result means execution-ready under
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import math
 import time
+from datetime import date
 from statistics import NormalDist
 
 import polars as pl
@@ -30,6 +32,8 @@ from ..config import (
     DIRECTION_POLICY_BOTH,
     DIRECTION_POLICY_FIXED,
     EVALUATION_PROTOCOL_VERSION,
+    FROZEN_RATING_PROTOCOL_VERSION,
+    FROZEN_RATING_WINDOW_START,
     evaluation_config,
     get_dsl_fields,
 )
@@ -40,6 +44,7 @@ from .ranking import build_live_ranking
 
 DISCOVERY_LAYERS = ["INNER_PUBLIC", "META_TRAIN"]
 FULL_LAYERS = ["INNER_PUBLIC", "META_TRAIN", "META_HOLDOUT", "FACTOR_VAULT"]
+FROZEN_RATING_LAYER = "FROZEN_RATING"
 LAYER_ALIASES = {
     "INNER_PUBLIC": "public",
     "META_TRAIN": "gate",
@@ -295,6 +300,9 @@ def _prepare_factor_base(
     panel_glob: str | None,
     market: str,
     layers: list[str],
+    *,
+    date_window: tuple[str, str | None] | None = None,
+    layer_name_override: str | None = None,
 ) -> tuple[pl.LazyFrame, str]:
     """Build the direction-neutral part of one factor evaluation.
 
@@ -309,8 +317,25 @@ def _prepare_factor_base(
     if fwd not in df.columns:
         raise ValueError(f"不支持的 horizon: {horizon}")
     pipe = parse(expression, get_dsl_fields(market))
+    source = df.lazy()
+    if date_window is not None:
+        if not layer_name_override:
+            raise ValueError("日期窗口评估必须提供独立层名称")
+        start, end = date_window
+        source = source.filter(
+            pl.col("trade_date") >= date.fromisoformat(start)
+        )
+        if end is not None:
+            source = source.filter(
+                pl.col("trade_date") <= date.fromisoformat(end)
+            )
+        source = source.with_columns(
+            pl.lit(layer_name_override).alias("layer")
+        )
+    else:
+        source = source.filter(pl.col("layer").is_in(layers))
     base = (
-        pipe.apply(df.lazy().filter(pl.col("layer").is_in(layers)))
+        pipe.apply(source)
         .filter((pl.col("univ_rank") <= universe_n) & pl.col(fwd).is_finite())
         .with_columns(pl.len().over("trade_date").alias("_eligible_n"))
         .filter(pl.col("factor").is_finite())
@@ -568,6 +593,9 @@ def _prepare_direction_batch(
     market: str,
     layers: list[str],
     cfg: dict,
+    *,
+    date_window: tuple[str, str | None] | None = None,
+    layer_name_override: str | None = None,
 ) -> tuple[dict[int, tuple[pl.DataFrame, pl.DataFrame]], dict]:
     started = time.perf_counter()
     base, fwd = _prepare_factor_base(
@@ -577,6 +605,8 @@ def _prepare_direction_batch(
         panel_glob,
         market,
         layers,
+        date_window=date_window,
+        layer_name_override=layer_name_override,
     )
     planned = time.perf_counter()
     frames = _collect_direction_frames(
@@ -608,6 +638,9 @@ def _prepare_daily(
     market: str,
     layers: list[str],
     cfg: dict,
+    *,
+    date_window: tuple[str, str | None] | None = None,
+    layer_name_override: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     frames, _ = _prepare_direction_batch(
         expression,
@@ -619,6 +652,8 @@ def _prepare_daily(
         market,
         layers,
         cfg,
+        date_window=date_window,
+        layer_name_override=layer_name_override,
     )
     return frames[direction]
 
@@ -809,6 +844,8 @@ def _layer_metrics(
     result = {
         "layer": layer,
         "available": True,
+        "window_start": str(sub["trade_date"].min()),
+        "window_end": str(sub["trade_date"].max()),
         "n_days": sub.height,
         "n_periods": sub.height,
         "calendar_equivalent_days": sub.height * horizon,
@@ -1297,6 +1334,81 @@ def _evaluate_layers(
     return metrics, cfg
 
 
+def _evaluate_frozen_rating(
+    expression: str,
+    universe_n: int,
+    horizon: int,
+    portfolio_mode: str,
+    direction: int,
+    panel_glob: str | None,
+    cost_bps: float | None,
+    market: str,
+    evaluation_overrides: dict | None,
+) -> tuple[dict, dict]:
+    """Evaluate the frozen direction from 2020 through the panel's latest date.
+
+    This view deliberately spans multiple isolation layers, so it is a
+    full-history rating rather than independent out-of-sample evidence.  It is
+    only called by the explicit full-audit path and is never exposed to either
+    proposal LLM.
+    """
+    cfg = evaluation_config(market, evaluation_overrides)
+    if cost_bps is not None:
+        cfg["base_cost_bps"] = float(cost_bps)
+        if float(cost_bps) not in cfg["stress_cost_bps"]:
+            cfg["stress_cost_bps"] = sorted({
+                *cfg["stress_cost_bps"],
+                float(cost_bps),
+            })
+    daily, deciles = _prepare_daily(
+        expression,
+        universe_n,
+        horizon,
+        portfolio_mode,
+        direction,
+        panel_glob,
+        market,
+        FULL_LAYERS,
+        cfg,
+        date_window=(FROZEN_RATING_WINDOW_START, None),
+        layer_name_override=FROZEN_RATING_LAYER,
+    )
+    metrics = _layer_metrics(
+        daily,
+        deciles,
+        FROZEN_RATING_LAYER,
+        horizon,
+        portfolio_mode,
+        direction,
+        cfg,
+    )
+    evaluated_start = metrics.get("window_start")
+    evaluated_end = metrics.get("window_end")
+    panel = PanelStore.get(panel_glob, market).ensure_loaded()
+    panel_latest = panel["trade_date"].max()
+    metrics.update({
+        "rating_protocol_version": FROZEN_RATING_PROTOCOL_VERSION,
+        "window_start": FROZEN_RATING_WINDOW_START,
+        "window_end": str(panel_latest) if panel_latest is not None else None,
+        "evaluated_signal_start": evaluated_start,
+        "evaluated_signal_end": evaluated_end,
+        "window_policy": "2020_to_latest_available",
+        "independent_out_of_sample": False,
+        "visible_to_research_llms": False,
+        "source_scope": (
+            "all panel observations from 2020-01-01 through the latest "
+            "available date, independent of isolation-layer labels"
+        ),
+        "overlaps_isolation_layers": [
+            "META_TRAIN",
+            "META_HOLDOUT",
+            "FACTOR_VAULT",
+            "post_declared_vault_extension_if_present",
+        ],
+    })
+    return metrics, cfg
+
+
 def _validate_direction_policy(direction_policy: str) -> str:
     if direction_policy not in {
         DIRECTION_POLICY_BOTH,
@@ -1538,7 +1650,7 @@ def evaluate_full(
     evaluation_overrides: dict | None = None,
     direction_policy: str = DIRECTION_POLICY_BOTH,
 ) -> dict:
-    """Explicit four-layer audit with direction frozen before validation."""
+    """Explicit audit with four isolation layers plus a full-history rating."""
     full_started = time.perf_counter()
     discovery_layers, cfg, discovery, discovery_runtime = (
         _evaluate_discovery_orientations(
@@ -1569,14 +1681,29 @@ def evaluate_full(
         cfg,
     )
     validation_finished = time.perf_counter()
+    rating_started = time.perf_counter()
+    frozen_rating, _ = _evaluate_frozen_rating(
+        expression,
+        universe_n,
+        horizon,
+        portfolio_mode,
+        selected_direction,
+        panel_glob,
+        cost_bps,
+        market,
+        cfg,
+    )
+    rating_finished = time.perf_counter()
     layers = {
         **discovery_layers,
         **validation_layers,
+        "rating": frozen_rating,
     }
     eligibility = _eligibility(layers, discovery, portfolio_mode, cfg)
     ranking = build_live_ranking(layers, eligibility, portfolio_mode, cfg)
     return {
         "protocol_version": EVALUATION_PROTOCOL_VERSION,
+        "rating_protocol_version": FROZEN_RATING_PROTOCOL_VERSION,
         "scope": "full_audit",
         "policy_label": "NON_PIT_RESEARCH",
         "market": market,
@@ -1598,12 +1725,16 @@ def evaluate_full(
             "direction_trials_multiplier": (
                 discovery["direction_selection"]["trials_multiplier"]
             ),
+            "frozen_rating_window_start": FROZEN_RATING_WINDOW_START,
+            "frozen_rating_window_end": frozen_rating.get("window_end"),
+            "frozen_rating_window_policy": "latest_available",
         },
         "layers": layers,
         "public": layers["public"],
         "gate": layers["gate"],
         "holdout": layers["holdout"],
         "vault": layers["vault"],
+        "rating": layers["rating"],
         "discovery": discovery,
         "eligibility": eligibility,
         "ranking": ranking,
@@ -1611,6 +1742,10 @@ def evaluate_full(
             "discovery": discovery_runtime,
             "validation_ms": round(
                 (validation_finished - validation_started) * 1000.0,
+                3,
+            ),
+            "rating_ms": round(
+                (rating_finished - rating_started) * 1000.0,
                 3,
             ),
             "total_ms": round(

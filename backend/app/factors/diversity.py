@@ -9,6 +9,10 @@ from collections import Counter
 from typing import Any, Iterable
 
 from ..dsl.engine import expression_profile, normalize_hash
+from .return_source_governance import (
+    cluster_training_return_sources,
+    return_source_quality,
+)
 
 
 COMMON_MECHANISMS = (
@@ -200,8 +204,13 @@ def diversity_adjusted_score(
     envelopes: Iterable[dict],
     market: str,
     required_mechanisms: int = 4,
+    *,
+    return_source_weight: float = 0.0,
+    required_return_sources: int = 4,
 ) -> tuple[float, dict]:
     rows = list(envelopes)
+    if not 0.0 <= float(return_source_weight) <= 0.5:
+        raise ValueError("return_source_weight 必须在 [0, 0.5]")
     snapshot = diversity_snapshot(rows, market)
     task_quality = (
         sum(float(value) for value in task_best_scores.values())
@@ -215,14 +224,34 @@ def diversity_adjusted_score(
     required = max(1, min(required_mechanisms, len(mechanisms_for_market(market))))
     padded = (family_scores[:required] + [0.0] * required)[:required]
     family_quality = sum(padded) / required
-    score = 0.40 * task_quality + 0.60 * family_quality
+    legacy_score = 0.40 * task_quality + 0.60 * family_quality
+    return_sources = cluster_training_return_sources(rows)
+    source_quality = return_source_quality(
+        return_sources,
+        required_sources=required_return_sources,
+    )
+    source_weight = float(return_source_weight)
+    score = (1.0 - source_weight) * legacy_score + source_weight * source_quality
     detail = {
         **snapshot,
-        "score_semantics": "task_quality_40pct_plus_top4_mechanism_quality_60pct_v1",
+        "score_semantics": (
+            "legacy_mechanism_score_plus_training_return_source_quality_v2"
+            if source_weight > 0
+            else "task_quality_40pct_plus_top4_mechanism_quality_60pct_v1"
+        ),
         "task_quality": round(task_quality, 4),
         "family_quality": round(family_quality, 4),
         "required_mechanisms": required,
+        "legacy_diversity_adjusted_score": round(legacy_score, 4),
+        "return_source_weight": round(source_weight, 4),
+        "required_return_sources": max(1, int(required_return_sources)),
+        "return_source_quality": round(source_quality, 4),
+        "return_source_clusters": return_sources["return_source_clusters"],
+        "effective_return_sources": return_sources["effective_return_sources"],
+        "scoped_behavior_duplicate_rate": return_sources[
+            "return_source_redundancy_rate"
+        ],
+        "return_source_signature_coverage": return_sources["signature_coverage"],
         "diversity_adjusted_score": round(score, 4),
     }
     return round(score, 4), detail
-

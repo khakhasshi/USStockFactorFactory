@@ -148,7 +148,10 @@ def select_diverse_combination_candidates(
                     row.get("training_return_path_signature"),
                     incumbent.get("training_return_path_signature"),
                 )
-                if correlation is not None and abs(correlation) > return_path_correlation_cap:
+                # The component direction is already frozen.  Strong negative
+                # correlation is therefore a useful diversifier, not a
+                # duplicate return source.
+                if correlation is not None and correlation > return_path_correlation_cap:
                     conflicts.append((incumbent, correlation))
             if conflicts:
                 incumbent, correlation = max(
@@ -159,7 +162,7 @@ def select_diverse_combination_candidates(
                     "component_key": row["component_key"],
                     "reason": "training_return_path_too_correlated",
                     "kept_component_key": incumbent["component_key"],
-                    "absolute_correlation": round(abs(correlation), 6),
+                    "correlation": round(correlation, 6),
                 })
                 continue
             selected.append(row)

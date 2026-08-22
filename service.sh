@@ -6,6 +6,15 @@ cd "$(dirname "$0")"
 service_root="$PWD"
 service_port="${FF_PORT:-10010}"
 service_host="${FF_HOST:-127.0.0.1}"
+service_instance="${FF_SERVICE_INSTANCE:-factorfactory-${service_port}}"
+service_architecture="${FF_SERVICE_ARCHITECTURE:-}"
+research_autostart="${FF_AUTOSTART_RESEARCH:-0}"
+parallel_evaluations="${FF_MAX_PARALLEL_EVALUATIONS:-2}"
+llm_timeout_seconds="${FF_LLM_TIMEOUT_SECONDS:-420}"
+llm_max_attempts="${FF_LLM_MAX_ATTEMPTS:-2}"
+skip_historical_feedback_backfill="${FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL:-0}"
+database_url="${FF_DATABASE_URL:-}"
+backtest_artifact_root="${FF_BACKTEST_ARTIFACT_ROOT:-}"
 log_dir="$service_root/var/log"
 log_file="$log_dir/factorfactory-${service_port}.log"
 service_label="com.factorfactory.${service_port}"
@@ -57,13 +66,27 @@ start_service() {
     return 1
   fi
 
+  local -a launch_environment
+  launch_environment=(
+    "FF_HOST=$service_host"
+    "FF_PORT=$service_port"
+    "FF_SERVICE_INSTANCE=$service_instance"
+    "FF_SERVICE_ARCHITECTURE=$service_architecture"
+    "FF_AUTOSTART_RESEARCH=$research_autostart"
+    "FF_MAX_PARALLEL_EVALUATIONS=$parallel_evaluations"
+    "FF_LLM_TIMEOUT_SECONDS=$llm_timeout_seconds"
+    "FF_LLM_MAX_ATTEMPTS=$llm_max_attempts"
+    "FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL=$skip_historical_feedback_backfill"
+  )
+  [[ -n "$database_url" ]] && launch_environment+=("FF_DATABASE_URL=$database_url")
+  [[ -n "$backtest_artifact_root" ]] && launch_environment+=("FF_BACKTEST_ARTIFACT_ROOT=$backtest_artifact_root")
+
   launchctl submit \
     -l "$service_label" \
     -o "$log_file" \
     -e "$log_file" \
     -- /usr/bin/env \
-    "FF_HOST=$service_host" \
-    "FF_PORT=$service_port" \
+    "${launch_environment[@]}" \
     "$service_root/run.sh"
 
   local attempts=0

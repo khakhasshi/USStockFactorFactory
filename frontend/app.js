@@ -8,6 +8,8 @@ const appState = reactive({
   experimentId: null,
   experimentVersion: 0,
   activeTab: localStorage.getItem("factorfactory.tab") || "dash",
+  requestedTab: null,
+  backtestDraft: "",
   switching: false,
   switchMessage: "",
 });
@@ -395,7 +397,7 @@ const FactorLibraryWorkbench = {
   template: `
   <div class="factor-workbench">
     <div class="card" style="margin-bottom:14px">
-      <div class="panel-title-row"><div><div class="eyebrow">LIVE-RANKED FACTOR RESEARCH</div><h1>因子研究资产库</h1><span class="sub">V4.2 在训练安全层双向选优并冻结方向，把连续学习分、硬准入与实盘排序彻底分开；Vault 数值仅用于校准检验。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag green">{{ groupStats.groups || 0 }} 个结构组</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
+      <div class="panel-title-row"><div><div class="eyebrow">LIVE-RANKED FACTOR RESEARCH</div><h1>因子研究资产库</h1><span class="sub">研究评估 V4.2 在训练安全层双向选优并冻结方向；Rating V4.3 使用 2020 至最新交易日完整窗口，HOLDOUT/Vault 仍作为独立硬门槛，且不反馈给 LLM。</span></div><div><span class="tag blue">{{ factors.length }} 条记录</span> <span class="tag green">{{ groupStats.groups || 0 }} 个结构组</span> <span class="tag amber">NON_PIT_RESEARCH</span></div></div>
       <div class="form-row" style="margin-top:14px">
         <input style="flex:3" v-model="query" @keyup.enter="refresh" placeholder="搜索名称、表达式、经济学假设…" />
         <select v-model="status"><option value="">全部生命周期</option><option value="discovery_only">F1 · discovery_only</option><option value="research_pass">F2 · research_pass</option><option value="oos_pass">F3 · oos_pass</option><option value="paper_candidate">F4 · paper_candidate</option><option value="live_candidate_non_pit">F5 · live_candidate_non_pit</option><option value="legacy_unreviewed">旧协议未审计</option><option value="invalid_provenance">来源无效</option><option value="configuration_changed_requires_reaudit">配置变更待复审</option></select>
@@ -435,17 +437,17 @@ const FactorLibraryWorkbench = {
 
     <div class="card">
       <div class="panel-title-row"><h2>研究资产</h2><span class="sub">{{ visibleFactors.length }} 条 · 点击行读取详情与相似因子</span></div>
-      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>实盘排序</th><th>判断</th><th>结构组</th><th>表达式</th><th>方向</th><th>协议</th><th>等级</th><th>HOLDOUT Sharpe LCB</th><th>成本缓冲</th><th>学习分</th><th>来源</th></tr>
+      <table><tr><th><input type="checkbox" @change="toggleAll" /></th><th>名称</th><th>冻结评级</th><th>判断</th><th>结构组</th><th>表达式</th><th>方向</th><th>协议</th><th>等级</th><th>评级 Sharpe LCB</th><th>成本缓冲</th><th>学习分</th><th>来源</th></tr>
         <tr v-for="fa in visibleFactors" :key="fa.id" class="clickable" @click="open(fa)">
           <td @click.stop><input type="checkbox" :value="fa.id" v-model="selected" /></td><td><b>{{ fa.name }}</b></td>
-          <td><div class="live-rank-cell"><b>{{ fa.ranking?.score == null ? '—' : Number(fa.ranking.score).toFixed(1) }}</b><small v-if="fa.ranking?.position">#{{ fa.ranking.position }}</small></div></td>
+          <td><div class="live-rank-cell"><b>{{ !fa.ranking?.current || fa.ranking?.score == null ? '—' : Number(fa.ranking.score).toFixed(1) }}</b><small v-if="fa.ranking?.position">#{{ fa.ranking.position }}</small></div></td>
           <td><span class="tag" :class="rankStatusClass(fa.ranking?.status)">{{ rankStatusLabel(fa.ranking?.status) }}</span></td>
           <td><button class="group-chip" @click.stop="groupFilter=groupFor(fa.id)">{{ groupFor(fa.id) || '—' }}</button></td>
           <td class="mono-expr factor-expression">{{ fa.expression }}</td>
           <td><span class="tag">{{ Number(fa.research_meta?.direction || 1)>0?'+1':'-1' }}</span></td>
           <td><span class="tag" :class="String(fa.evaluation_protocol || '').startsWith('v4.') ? 'green' : 'amber'">{{ fa.evaluation_protocol }}</span></td>
           <td><b :class="gradeClass(fa.eligibility?.grade)">{{ fa.eligibility?.grade || '—' }}</b></td>
-          <td>{{ f(fa.ranking?.evidence?.holdout_sharpe_lcb) }}</td><td>{{ fa.ranking?.evidence?.cost_cushion_multiple == null ? '—' : f(fa.ranking.evidence.cost_cushion_multiple) + '×' }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
+          <td>{{ fa.ranking?.current ? f(fa.ranking?.evidence?.rating_sharpe_lcb) : '—' }}</td><td>{{ !fa.ranking?.current || fa.ranking?.evidence?.cost_cushion_multiple == null ? '—' : f(fa.ranking.evidence.cost_cushion_multiple) + '×' }}</td><td><b>{{ f(fa.public?.score) }}</b></td>
           <td><span class="tag" :class="fa.provenance_status?.includes('invalid') ? 'red' : ''">{{ fa.provenance_status }}</span></td>
         </tr></table>
       <div v-if="!visibleFactors.length" class="selector-empty"><h2>当前筛选没有结果</h2><p>降低筛选条件，或清除相似组筛选。</p></div>
@@ -462,21 +464,21 @@ const FactorLibraryWorkbench = {
       </div>
       <p class="sub">{{ detail.factor.hypothesis }}</p>
       <div v-if="detail.factor.research_meta?.direction_selection?.candidates" class="protocol-card"><b>双向训练选择</b><span>+1 学习 {{ f(detail.factor.research_meta.direction_selection.candidates['+1']?.learning_score) }} / 门槛 {{ f(detail.factor.research_meta.direction_selection.candidates['+1']?.gate_score) }}；-1 学习 {{ f(detail.factor.research_meta.direction_selection.candidates['-1']?.learning_score) }} / 门槛 {{ f(detail.factor.research_meta.direction_selection.candidates['-1']?.gate_score) }}</span><small>选中 {{ Number(detail.factor.research_meta.direction || 1)>0?'+1':'-1' }}，后续隔离层与实盘工具沿用冻结方向</small></div>
-      <div class="live-rank-hero" v-if="detail.factor.ranking?.available">
-        <div class="live-rank-score"><span>实盘排序分</span><b>{{ Number(detail.factor.ranking.score).toFixed(1) }}</b><small>{{ rankStatusLabel(detail.factor.ranking.status) }} · Vault {{ detail.factor.ranking.vault_seal }}</small></div>
+      <div class="live-rank-hero" v-if="detail.factor.ranking?.available && detail.factor.ranking?.current">
+        <div class="live-rank-score"><span>冻结评级分</span><b>{{ Number(detail.factor.ranking.score).toFixed(1) }}</b><small>{{ detail.factor.ranking.rating_window?.start || '2020-01-01' }} 至 {{ detail.factor.ranking.rating_window?.end || '最新' }} · Vault 门槛 {{ detail.factor.ranking.vault_seal }}</small></div>
         <div class="live-rank-evidence">
-          <div><span>HOLDOUT Sharpe LCB</span><b>{{ f(detail.factor.ranking.evidence?.holdout_sharpe_lcb) }}</b></div>
-          <div><span>年化收益 LCB</span><b>{{ pct(detail.factor.ranking.evidence?.holdout_ann_return_lcb) }}</b></div>
-          <div><span>收益 HAC t</span><b>{{ f(detail.factor.ranking.evidence?.holdout_return_hac_t) }}</b></div>
+          <div><span>评级 Sharpe LCB</span><b>{{ f(detail.factor.ranking.evidence?.rating_sharpe_lcb ?? detail.factor.ranking.evidence?.holdout_sharpe_lcb) }}</b></div>
+          <div><span>评级年化收益 LCB</span><b>{{ pct(detail.factor.ranking.evidence?.rating_ann_return_lcb ?? detail.factor.ranking.evidence?.holdout_ann_return_lcb) }}</b></div>
+          <div><span>评级收益 HAC t</span><b>{{ f(detail.factor.ranking.evidence?.rating_return_hac_t ?? detail.factor.ranking.evidence?.holdout_return_hac_t) }}</b></div>
           <div><span>成本缓冲</span><b>{{ f(detail.factor.ranking.evidence?.cost_cushion_multiple) }}×</b></div>
         </div>
         <div class="rank-components">
           <div v-for="(value,key) in detail.factor.ranking.components" :key="key"><span>{{ componentLabel(key) }}</span><i><em :style="{width:(Number(value)*100).toFixed(0)+'%'}"></em></i><b>{{ (Number(value)*100).toFixed(0) }}</b></div>
         </div>
-        <div class="sub">排序分不使用 Vault 数值；Vault 只作为通过/失败封印。详细 Vault 结果只用于全库校准诊断。</div>
+        <div class="sub">冻结评级是 2020 至最新交易日的全窗口 NON-PIT 统计，不是独立样本外证明；HOLDOUT/Vault 继续独立决定硬门槛，评级结果不会反馈给两层 LLM。</div>
         <div v-if="detail.factor.ranking.warnings?.length" class="failure-list"><b>排序警告</b><ul><li v-for="warning in detail.factor.ranking.warnings" :key="warning">{{ warning }}</li></ul></div>
       </div>
-      <div v-else class="warn-banner">尚无 V4.2 实盘排序。旧研究分不能用于实盘优先级，请运行完整审计。</div>
+      <div v-else class="warn-banner">尚无当前 Rating V4.3 冻结评级。旧评级仅保留为历史记录，请运行完整审计。</div>
       <div class="card similarity-detail" v-if="detail.similarity">
         <div class="panel-title-row"><div><h3>结构近邻</h3><span class="sub">{{ detail.similarity.group_id || '单因子组' }} · 不读取未来收益</span></div><span class="tag blue">{{ detail.similarity.nearest?.length || 0 }} 个近邻</span></div>
         <div class="similar-factor-list">
@@ -485,18 +487,18 @@ const FactorLibraryWorkbench = {
       </div>
       <div v-if="detail.factor.validation?.source_provenance_warning" class="warn-banner">{{ detail.factor.validation.source_provenance_warning }}</div>
       <div class="card audit-controls">
-        <div class="panel-title-row"><div><h3>完整 V4.2 审计</h3><span class="sub">沿训练阶段选中的冻结方向生成费后实盘排序；手动翻向会作为新假设重新审计。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
+        <div class="panel-title-row"><div><h3>完整 V4.2 审计 + Rating V4.3</h3><span class="sub">沿训练阶段选中的冻结方向，计算 2020 至最新交易日评级；手动翻向会作为新假设重新审计。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
         <div class="form-row"><div><label>股票池</label><input type="number" v-model.number="auditForm.universe_n" /></div><div><label>持有期</label><select v-model.number="auditForm.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="10">10日</option><option :value="20">20日</option></select></div><div><label>冻结方向</label><select v-model.number="auditForm.direction"><option :value="1">+1 高值偏多</option><option :value="-1">-1 低值偏多</option></select></div><div><label>基础成本 bps</label><input type="number" v-model.number="auditForm.cost_bps" /></div><div><label>目标资金规模</label><input type="number" v-model.number="auditForm.target_capital" /></div></div>
         <div v-if="auditErr" style="color:var(--red)">{{ auditErr }}</div>
       </div>
       <div class="card" v-if="detail.factor.validation?.layers">
-        <div class="panel-title-row"><h3>四层实战指标</h3><div><span class="grade-pill" :class="gradeClass(detail.factor.eligibility?.grade)">{{ detail.factor.eligibility?.grade }}</span> <span class="tag">{{ detail.factor.eligibility?.stage }}</span></div></div>
+        <div class="panel-title-row"><h3>四层隔离指标 + 冻结评级窗口</h3><div><span class="grade-pill" :class="gradeClass(detail.factor.eligibility?.grade)">{{ detail.factor.eligibility?.grade }}</span> <span class="tag">{{ detail.factor.eligibility?.stage }}</span></div></div>
         <table><tr><th>层</th><th>费后 Sharpe</th><th>Sharpe LCB</th><th>年化 LCB</th><th>收益 t</th><th>成本盈亏平衡</th><th>盈利 era</th><th>压力最差</th></tr>
           <tr v-for="(m,k) in detail.factor.validation.layers" :key="k"><td>{{ k.toUpperCase() }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ f(m?.return_confidence?.sharpe_lcb) }}</td><td>{{ pct(m?.return_confidence?.ann_return_lcb) }}</td><td>{{ f(m?.return_confidence?.hac_t_stat) }}</td><td>{{ f(m?.cost_breakeven_bps) }} bps</td><td>{{ pct(m?.profitable_era_rate) }}</td><td>{{ f(worstStress(m)) }}</td></tr>
         </table>
         <div v-if="detail.factor.eligibility?.failure_reasons?.length" class="failure-list"><b>未通过原因</b><ul><li v-for="reason in detail.factor.eligibility.failure_reasons" :key="reason">{{ reason }}</li></ul></div>
       </div>
-      <div v-else class="card selector-empty"><h3>尚未完成 V4.2 全层审计</h3><p>旧评分仅作为历史记录。运行审计后才会生成 F1–F5 等级与实盘排序分。</p></div>
+      <div v-else class="card selector-empty"><h3>尚未完成 Rating V4.3 全层审计</h3><p>旧评分仅作为历史记录。运行审计后才会生成 F1–F5 等级与 2020 至最新冻结评级分。</p></div>
       <div class="card"><h3>训练反馈层</h3><table><tr><th>层</th><th>ICIR</th><th>一致性</th><th>费后 Sharpe</th><th>日均等效换手</th><th>学习分</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
       <label>标签（逗号分隔）</label><input v-model="review.tags" placeholder="momentum, quality, low-turnover" /><label>研究备注</label><textarea v-model="review.note" rows="5" placeholder="记录经济机制、已知暴露、失败原因和后续动作"></textarea>
       <div style="margin-top:10px"><button class="btn primary" @click="saveReview">保存研究备注</button><span class="sub" style="margin-left:8px">experiment={{ detail.factor.experiment_id }}</span></div>
@@ -521,12 +523,14 @@ const FactorLibraryWorkbench = {
     const gradeClass = grade => grade === "F5" ? "grade-f5" : grade === "F4" ? "grade-f4" : grade === "F3" ? "grade-f3" : "grade-low";
     const calibrationLabel = value => ({
       calibrated:"已校准", needs_review:"未通过", insufficient_sample:"样本不足",
+      not_applicable_full_window_rating:"全窗口口径",
     })[value] || "未知";
     const rankStatusLabel = value => ({
       capital_priority_non_pit:"资本候选", paper_priority:"模拟优先",
       passed_low_conviction:"低置信通过", capacity_limited:"容量受限",
       vault_rejected:"Vault 拒绝", holdout_rejected:"OOS 拒绝",
       research_rejected:"研究拒绝", missing_holdout:"缺少 OOS",
+      missing_rating_window:"缺少评级窗口",
     })[value] || "未审计";
     const rankStatusClass = value => (
       value === "capital_priority_non_pit" ? "green"
@@ -639,15 +643,15 @@ const BacktestView = {
   <section class="backtest-lab">
     <div class="selector-heading">
       <div><div class="eyebrow">CHRONOLOGICAL EXECUTION / EVENT LEDGER</div><h1>步进事件式回测实验室</h1><p>唯一真相来自订单、成交、现金、持仓与费用账本；信号在 t 日收盘生成，只允许 t+1 原始开盘价成交。</p></div>
-      <div><span class="tag blue">{{ market==='ashare' ? 'A股' : '美股' }}</span> <span class="tag green">{{ feeLabel }}</span> <span class="tag amber">{{ taskMode==='long_only' ? '纯多头' : '多空' }}</span> <span class="tag">{{ form.direction===1 ? '+1 高值偏多' : '-1 低值偏多' }}</span></div>
+      <div><span class="tag blue">{{ market==='ashare' ? 'A股' : '美股' }}</span> <span class="tag green">{{ feeLabel }}</span> <span class="tag amber">{{ form.mode==='long_only' ? '纯多头' : '多空' }}</span> <span class="tag">{{ form.direction===1 ? '+1 高值偏多' : '-1 低值偏多' }}</span></div>
     </div>
 
     <div class="card backtest-config">
       <div class="execution-timeline">
-        <span><b>01</b> t 日收盘读取信号</span><i>→</i><span><b>02</b> 创建目标持仓订单</span><i>→</i><span><b>03</b> t+1 开盘成交/拒单</span><i>→</i><span><b>04</b> 收盘逐仓估值与对账</span>
+        <span><b>01</b> t 日收盘读取信号</span><i>→</i><span><b>02</b> t+1开盘风险检查</span><i>→</i><span><b>03</b> 成交与日内止损止盈</span><i>→</i><span><b>04</b> 收盘估值、风控与对账</span>
       </div>
       <label>因子 DSL 表达式</label>
-      <input v-model="form.expression" placeholder="例: -rank(ts_delta(close, 20))" />
+      <textarea v-model="form.expression" class="backtest-expression-input" rows="3" placeholder="例: -rank(ts_delta(close, 20))"></textarea>
       <div class="backtest-form-grid">
         <div><label>股票池</label><select v-model.number="form.universe_n"><option :value="100">Top100</option><option :value="300">Top300</option><option :value="500">Top500</option><option :value="1000">Top1000</option><option :value="1500">Top1500</option></select></div>
         <div><label>开始日期</label><input type="date" v-model="form.start" /></div>
@@ -657,15 +661,71 @@ const BacktestView = {
         <div><label>单边选股比例</label><input type="number" v-model.number="form.top_fraction" min="0.01" max="0.5" step="0.05" /></div>
         <div><label>基础滑点 bps</label><input type="number" v-model.number="form.slippage_bps" min="0" step="0.5" /></div>
         <div><label>最大成交量参与率</label><input type="number" v-model.number="form.max_volume_participation" min="0.01" max="1" step="0.01" /></div>
-        <div><label>冻结回测方向</label><select v-model.number="form.direction"><option :value="1">+1 高值做多{{ taskMode==='long_short' ? ' / 低值做空' : '' }}</option><option :value="-1">-1 低值做多{{ taskMode==='long_short' ? ' / 高值做空' : '' }}</option></select><small>手动翻向属于独立诊断假设</small></div>
-        <div v-if="taskMode==='long_short'"><label>年化借券成本 bps</label><input type="number" v-model.number="form.borrow_cost_bps_annual" min="0" /></div>
+        <div><label>组合版本</label><select v-model="form.mode"><option value="long_only">纯多头（Long Only）</option><option value="long_short" :disabled="market==='ashare'">多空（Long/Short）</option></select><small>每次回测独立冻结，不改写任务默认值 {{ taskMode }}</small></div>
+        <div><label>冻结回测方向</label><select v-model.number="form.direction"><option :value="1">+1 高值做多{{ form.mode==='long_short' ? ' / 低值做空' : '' }}</option><option :value="-1">-1 低值做多{{ form.mode==='long_short' ? ' / 高值做空' : '' }}</option></select><small>手动翻向属于独立诊断假设</small></div>
+        <div v-if="form.mode==='long_short'"><label>年化借券成本 bps</label><input type="number" v-model.number="form.borrow_cost_bps_annual" min="0" /></div>
       </div>
+      <div class="backtest-v2-toolbar"><span class="tag green">step_event_v2</span><button class="btn" @click="applyRiskPreset">载入稳健风控预设</button><button class="btn" @click="clearExitPolicy">关闭全部个股退出规则</button></div>
+      <details class="backtest-policy" open>
+        <summary>个股止损、止盈与持仓生命周期</summary>
+        <div class="backtest-form-grid">
+          <div><label>固定止损比例</label><input type="number" v-model.number="form.exit_policy.fixed_stop_loss_pct" min="0.001" max="0.99" step="0.01" placeholder="留空关闭" /></div>
+          <div><label>固定止盈比例</label><input type="number" v-model.number="form.exit_policy.fixed_take_profit_pct" min="0.001" max="0.99" step="0.01" placeholder="留空关闭" /></div>
+          <div><label>移动止损回撤</label><input type="number" v-model.number="form.exit_policy.trailing_stop_pct" min="0.001" max="0.99" step="0.01" placeholder="留空关闭" /></div>
+          <div><label>ATR周期</label><input type="number" v-model.number="form.exit_policy.atr_period" min="2" max="252" /></div>
+          <div><label>ATR止损倍数</label><input type="number" v-model.number="form.exit_policy.atr_stop_multiple" min="0.1" step="0.25" placeholder="留空关闭" /></div>
+          <div><label>ATR止盈倍数</label><input type="number" v-model.number="form.exit_policy.atr_take_profit_multiple" min="0.1" step="0.25" placeholder="留空关闭" /></div>
+          <div><label>ATR移动止损倍数</label><input type="number" v-model.number="form.exit_policy.atr_trailing_multiple" min="0.1" step="0.25" placeholder="留空关闭" /></div>
+          <div><label>保本启动盈利比例</label><input type="number" v-model.number="form.exit_policy.break_even_activation_pct" min="0.001" max="0.99" step="0.01" placeholder="留空关闭" /></div>
+          <div><label>最长持有交易日</label><input type="number" v-model.number="form.exit_policy.time_stop_sessions" min="1" max="2520" placeholder="留空关闭" /></div>
+          <div><label>同日双触发</label><select v-model="form.exit_policy.intrabar_conflict_policy"><option value="conservative">保守：先止损</option><option value="optimistic">乐观：先止盈</option></select></div>
+        </div>
+        <p class="sub">跳空越过阈值按开盘价；日线无法判断先后时默认先止损；移动锚点只在收盘后更新；A股当日买入数量遵守T+1。</p>
+      </details>
+      <details class="backtest-policy">
+        <summary>仓位、账户与组合风险</summary>
+        <div class="backtest-form-grid">
+          <div><label>账户类型</label><select v-model="form.account_type"><option value="auto">自动</option><option value="cash">现金账户</option><option value="margin">保证金账户</option></select></div>
+          <div><label>仓位模型</label><select v-model="form.position_sizing"><option value="equal_weight">等权</option><option value="inverse_volatility">逆波动率</option><option value="atr_risk">ATR风险定仓</option></select></div>
+          <div><label>最大持仓数</label><input type="number" v-model.number="form.max_positions" min="1" max="10000" /></div>
+          <div><label>单股最大权重</label><input type="number" v-model.number="form.max_position_weight" min="0.001" max="2" step="0.01" /></div>
+          <div><label>现金缓冲比例</label><input type="number" v-model.number="form.cash_buffer_fraction" min="0" max="0.99" step="0.01" /></div>
+          <div><label>最大总杠杆</label><input type="number" v-model.number="form.max_gross_leverage" min="1" max="10" step="0.1" /></div>
+          <div><label>多头目标敞口</label><input type="number" v-model.number="form.long_gross_target" min="0" max="10" step="0.1" /></div>
+          <div v-if="form.mode==='long_short'"><label>空头目标敞口</label><input type="number" v-model.number="form.short_gross_target" min="0" max="10" step="0.1" /></div>
+          <div v-if="form.position_sizing==='atr_risk'"><label>每只股票风险预算</label><input type="number" v-model.number="form.risk_per_position_fraction" min="0.001" max="0.25" step="0.005" /></div>
+          <div><label>最小调仓金额</label><input type="number" v-model.number="form.min_trade_notional" min="0" step="100" /></div>
+          <div><label>调仓缓冲比例</label><input type="number" v-model.number="form.rebalance_buffer_pct" min="0" max="0.99" step="0.01" /></div>
+          <div><label>融资年利率 bps</label><input type="number" v-model.number="form.margin_interest_bps_annual" min="0" /></div>
+          <div><label>组合回撤退出触发阈值</label><input type="number" v-model.number="form.portfolio_stop_drawdown_pct" min="0.001" max="0.99" step="0.01" placeholder="留空关闭" /><small>收盘触发、次日开盘清仓，不是最大回撤保证</small></div>
+          <div><label>组合单日亏损退出</label><input type="number" v-model.number="form.portfolio_daily_loss_pct" min="0.001" max="0.99" step="0.01" placeholder="留空关闭" /></div>
+          <div><label>风险退出冷却期</label><input type="number" v-model.number="form.risk_cooldown_sessions" min="0" max="252" /></div>
+        </div>
+        <p class="sub" :class="{'bad-text':leveragePlan.invalid}">
+          目标总敞口 {{ num(leveragePlan.configured,2) }}×；实际运行目标 {{ num(leveragePlan.effective,2) }}×；硬上限 {{ num(form.max_gross_leverage,2) }}×；预留 {{ num(leveragePlan.headroom,2) }}×。
+          每笔增仓成交均执行硬上限检查，跳空越线会在开盘自动去杠杆；只有无法修复的剩余超限才判定账本失败。
+          <b v-if="leveragePlan.invalid">当前多空目标之和超过硬上限，无法运行。</b>
+        </p>
+      </details>
+      <details class="backtest-policy">
+        <summary>订单、流动性与终止规则</summary>
+        <div class="backtest-form-grid">
+          <div><label>买卖价差 bps</label><input type="number" v-model.number="form.spread_bps" min="0" step="0.5" /></div>
+          <div><label>市场冲击模型</label><select v-model="form.impact_model"><option value="fixed">固定滑点</option><option value="linear">线性参与率</option><option value="square_root">平方根冲击</option></select></div>
+          <div v-if="form.impact_model!=='fixed'"><label>冲击系数 bps</label><input type="number" v-model.number="form.impact_coefficient_bps" min="0" step="1" /></div>
+          <div><label>部分成交处理</label><select v-model="form.unfilled_order_policy"><option value="cancel">DAY取消</option><option value="carry">GTC续挂</option></select></div>
+          <div v-if="form.unfilled_order_policy==='carry'"><label>最多续挂交易日</label><input type="number" v-model.number="form.max_order_age_sessions" min="1" max="20" /></div>
+          <div><label>行情缺失减记阈值</label><input type="number" v-model.number="form.max_stale_sessions" min="1" max="252" /></div>
+          <div><label><input type="checkbox" v-model="form.liquidate_at_end" /> 区间结束强制平仓</label></div>
+        </div>
+        <p class="sub">成交容量使用此前20个交易日ADV，不再使用开盘时尚未知的当日总成交量。</p>
+      </details>
       <div class="fee-disclosure">
         <b>{{ feeLabel }}</b>
         <span v-if="market==='ashare'">券商佣金万2免5；卖出印花税按历史日期；过户费双向按历史日期。</span>
         <span v-else>每股 $0.005、每单最低 $1、最高成交额 1%；固定费率中的交易规费不重复扣除。</span>
       </div>
-      <div class="run-row"><button class="btn primary" @click="run" :disabled="running || !form.expression.trim()">{{ running ? '正在生成事件账本…' : '运行事件回测' }}</button><span v-if="err" class="selector-error inline-error">{{ err }}</span></div>
+      <div class="run-row"><button class="btn primary" @click="run" :disabled="running || !form.expression.trim() || leveragePlan.invalid">{{ running ? '正在生成事件账本…' : '运行事件回测' }}</button><span v-if="err" class="selector-error inline-error">{{ err }}</span></div>
     </div>
 
     <template v-if="result">
@@ -676,6 +736,18 @@ const BacktestView = {
         <div class="metric-card"><span>订单 / 成交</span><b>{{ result.stats.orders }} / {{ result.stats.fills }}</b><small>成交率 {{ pct(result.stats.fill_rate) }}</small></div>
         <div class="metric-card"><span>佣金税费</span><b>{{ money(result.stats.commission_and_tax) }}</b><small>滑点 {{ money(result.stats.slippage_cost) }}</small></div>
         <div class="metric-card"><span>账本完整性</span><b :class="result.integrity?.all_pass ? 'ok-text' : 'bad-text'">{{ result.integrity?.all_pass ? 'PASS' : 'FAIL' }}</b><small>{{ result.stats.protocol }}</small></div>
+        <div class="metric-card"><span>Sortino / Calmar</span><b>{{ num(result.stats.sortino, 2) }}</b><small>Calmar {{ num(result.stats.calmar, 2) }}</small></div>
+        <div class="metric-card"><span>完整交易 / 胜率</span><b>{{ result.stats.closed_trades }} / {{ pct(result.stats.win_rate) }}</b><small>PF {{ num(result.stats.profit_factor, 2) }} · 持有 {{ num(result.stats.avg_holding_sessions,1) }}日</small></div>
+      </div>
+      <div class="fee-disclosure" v-if="result.stats.portfolio_risk_trigger_events || result.stats.terminal_flat_sessions">
+        <b>组合风控状态</b>
+        <span>触发 {{ result.stats.portfolio_risk_trigger_events || 0 }} 次，重新武装 {{ result.stats.portfolio_risk_rearms || 0 }} 次，风险关闭 {{ result.stats.portfolio_risk_active_sessions || 0 }} 个交易日，单周期最大回撤 {{ pct(result.stats.max_portfolio_risk_cycle_drawdown) }}，区间末连续空仓 {{ result.stats.terminal_flat_sessions || 0 }} 日。</span>
+        <span v-if="result.stats.portfolio_risk_active_at_end" class="bad-text">回测结束时仍处于清仓或冷却状态；这属于明确的风险状态，不是曲线数据截断。</span>
+      </div>
+
+      <div class="card ledger-card" v-if="result.round_trips?.length">
+        <div class="panel-title-row"><div><h3>完整交易与退出归因</h3><span class="sub">成本、持有期、MAE/MFE及止损止盈原因</span></div><div><span class="tag">{{ result.stats.closed_trades }} 笔</span> <a v-if="currentId" class="btn-link" :href="'/api/backtests/'+currentId+'/round-trips.csv'">下载完整归因CSV</a></div></div>
+        <div class="ledger-scroll"><table><thead><tr><th>证券</th><th>入场/退出</th><th>方向</th><th>数量</th><th>成本/退出价</th><th>净盈亏</th><th>收益</th><th>持有</th><th>MFE/MAE</th><th>退出原因</th></tr></thead><tbody><tr v-for="row in result.round_trips" :key="row.symbol+row.entry_date+row.exit_date"><td><code>{{ row.symbol }}</code></td><td>{{ row.entry_date }} / {{ row.exit_date }}</td><td>{{ row.direction>0?'LONG':'SHORT' }}</td><td>{{ num(row.quantity,2) }}</td><td>{{ num(row.entry_price,4) }} / {{ num(row.exit_price,4) }}</td><td :class="row.net_pnl>=0?'ok-text':'bad-text'">{{ money(row.net_pnl) }}</td><td>{{ pct(row.return) }}</td><td>{{ row.holding_sessions }}</td><td>{{ pct(row.mfe_pct) }} / {{ pct(row.mae_pct) }}</td><td><span class="tag">{{ row.exit_reason }}</span></td></tr></tbody></table></div>
       </div>
 
       <div class="grid cols-2 backtest-analysis">
@@ -683,8 +755,14 @@ const BacktestView = {
         <div class="card integrity-card">
           <div class="panel-title-row"><div><h3>交割单回归检查</h3><span class="sub">API、CSV 与净值共用同一成交账本</span></div><span class="grade-pill" :class="result.integrity?.all_pass ? 'grade-f5' : 'grade-low'">{{ result.integrity?.all_pass ? '全部通过' : '存在异常' }}</span></div>
           <table><tr><th>检查项</th><th>结果</th></tr>
-            <tr v-for="(value,key) in result.integrity" :key="key"><td>{{ integrityLabels[key] || key }}</td><td :class="integrityOk(key,value) ? 'ok-text' : 'bad-text'">{{ typeof value==='number' ? num(value,8) : value }}</td></tr>
+            <tr v-for="(value,key) in integrityRows" :key="key"><td>{{ integrityLabels[key] || key }}</td><td :class="integrityOk(key,value) ? 'ok-text' : 'bad-text'">{{ formatIntegrityValue(value) }}</td></tr>
           </table>
+          <details v-if="result.integrity?.gross_leverage_violation_details?.length" class="backtest-policy">
+            <summary>杠杆控制明细（{{ result.integrity.gross_leverage_violation_details.length }} 次）</summary>
+            <table><tr><th>日期</th><th>控制前</th><th>控制后</th><th>硬上限</th><th>减仓单</th><th>结果</th></tr>
+              <tr v-for="row in result.integrity.gross_leverage_violation_details" :key="row.trade_date"><td>{{ row.trade_date }}</td><td>{{ num(row.before,6) }}</td><td>{{ num(row.after,6) }}</td><td>{{ num(row.hard_limit,4) }}</td><td>{{ row.orders }}</td><td :class="row.resolved?'ok-text':'bad-text'">{{ row.resolved?'已修复':'未修复' }}</td></tr>
+            </table>
+          </details>
         </div>
       </div>
 
@@ -692,7 +770,7 @@ const BacktestView = {
         <div class="panel-title-row"><div><h3>逐日步进状态</h3><span class="sub">拖动时间轴查看当日现金、敞口、成交与事件</span></div><span class="tag blue">{{ currentStep?.trade_date }}</span></div>
         <input class="step-range" type="range" min="0" :max="result.daily_steps.length-1" v-model.number="stepCursor" />
         <div class="step-state-grid" v-if="currentStep">
-          <div><span>收盘 NLV</span><b>{{ money(currentStep.close_nlv) }}</b></div><div><span>现金</span><b>{{ money(currentStep.cash) }}</b></div><div><span>多头市值</span><b>{{ money(currentStep.long_market_value) }}</b></div><div><span>空头市值</span><b>{{ money(currentStep.short_market_value) }}</b></div><div><span>成交 / 事件</span><b>{{ currentStep.fills }} / {{ currentStep.events }}</b></div><div><span>净敞口</span><b>{{ pct(currentStep.net_exposure) }}</b></div>
+          <div><span>收盘 NLV</span><b>{{ money(currentStep.close_nlv) }}</b></div><div><span>现金</span><b>{{ money(currentStep.cash) }}</b></div><div><span>多头市值</span><b>{{ money(currentStep.long_market_value) }}</b></div><div><span>空头市值</span><b>{{ money(currentStep.short_market_value) }}</b></div><div><span>成交 / 事件</span><b>{{ currentStep.fills }} / {{ currentStep.events }}</b></div><div><span>净敞口</span><b>{{ pct(currentStep.net_exposure) }}</b></div><div><span>开盘杠杆（控制前/后）</span><b>{{ num(currentStep.open_gross_exposure_before_control,4) }} / {{ num(currentStep.open_gross_exposure,4) }}</b></div><div><span>自动减仓单</span><b>{{ currentStep.leverage_control_orders || 0 }}</b></div>
         </div>
       </div>
 
@@ -714,9 +792,9 @@ const BacktestView = {
 
     <div class="card history-card">
       <div class="panel-title-row"><div><h3>历史回测档案</h3><span class="sub">旧向量回测保留但标记 legacy；新记录可重放交割单</span></div><button class="btn" @click="loadHistory">刷新</button></div>
-      <table><tr><th>#</th><th>协议</th><th>方向</th><th>状态</th><th>表达式</th><th>区间</th><th>Sharpe</th><th>年化</th><th>回撤</th><th>交割检查</th><th>时间</th></tr>
+      <table><tr><th>#</th><th>协议</th><th>组合</th><th>方向</th><th>状态</th><th>表达式</th><th>区间</th><th>Sharpe</th><th>年化</th><th>回撤</th><th>交割检查</th><th>时间</th></tr>
         <tr v-for="b in history" :key="b.id" class="clickable" @click="openHistory(b)">
-          <td>{{ b.id }}</td><td><span class="tag" :class="b.protocol==='step_event_v1'?'green':'amber'">{{ b.protocol }}</span></td><td>{{ Number(b.params?.direction || 1)>0?'+1':'-1' }}</td><td>{{ b.status }}</td><td class="mono-expr factor-expression">{{ b.params.expression }}</td><td class="sub">{{ b.params.start }}~{{ b.params.end }}</td><td>{{ num(b.stats?.sharpe,2) }}</td><td>{{ pct(b.stats?.ann_ret) }}</td><td>{{ pct(b.stats?.max_dd) }}</td><td :class="b.integrity?.all_pass?'ok-text':'bad-text'">{{ b.integrity?.all_pass ? 'PASS' : '—' }}</td><td class="sub">{{ b.created_at?.slice(0,16) }}</td>
+          <td>{{ b.id }}</td><td><span class="tag" :class="b.protocol?.startsWith('step_event_')?'green':'amber'">{{ b.protocol }}</span></td><td><span class="tag amber">{{ b.params?.mode==='long_short' ? '多空' : '纯多' }}</span></td><td>{{ Number(b.params?.direction || 1)>0?'+1':'-1' }}</td><td>{{ b.status }}</td><td class="mono-expr factor-expression">{{ b.params.expression }}</td><td class="sub">{{ b.params.start }}~{{ b.params.end }}</td><td>{{ num(b.stats?.sharpe,2) }}</td><td>{{ pct(b.stats?.ann_ret) }}</td><td>{{ pct(b.stats?.max_dd) }}</td><td :class="b.integrity?.all_pass?'ok-text':'bad-text'">{{ b.integrity?.all_pass ? 'PASS' : '—' }}</td><td class="sub">{{ b.created_at?.slice(0,16) }}</td>
         </tr>
       </table>
     </div>
@@ -728,6 +806,21 @@ const BacktestView = {
       initial_capital:1000000, rebalance_every:5, top_fraction:0.20,
       slippage_bps:2, max_volume_participation:0.10,
       borrow_cost_bps_annual:0, fee_profile:null,
+      account_type:"auto", cash_buffer_fraction:0.02, max_gross_leverage:1,
+      margin_interest_bps_annual:500, position_sizing:"equal_weight",
+      max_positions:100, max_position_weight:0.10, min_trade_notional:0,
+      rebalance_buffer_pct:0.02, long_gross_target:0.95, short_gross_target:0.95,
+      risk_per_position_fraction:0.01, spread_bps:0, impact_model:"square_root",
+      impact_coefficient_bps:10, unfilled_order_policy:"cancel",
+      max_order_age_sessions:3, max_stale_sessions:20, liquidate_at_end:false,
+      portfolio_stop_drawdown_pct:null, portfolio_daily_loss_pct:null,
+      risk_cooldown_sessions:5,
+      exit_policy:{
+        fixed_stop_loss_pct:null, fixed_take_profit_pct:null, trailing_stop_pct:null,
+        atr_period:14, atr_stop_multiple:null, atr_take_profit_multiple:null,
+        atr_trailing_multiple:null, break_even_activation_pct:null,
+        time_stop_sessions:null, intrabar_conflict_policy:"conservative",
+      },
     });
     const taskMode = ref("long_only"), market = ref("us");
     const result = ref(null), history = ref([]), err = ref(""), running = ref(false);
@@ -737,6 +830,18 @@ const BacktestView = {
     let loadedExperimentVersion = -1;
     const feeLabel = computed(() => market.value === "ashare" ? "万2免5" : "IBKR Pro Fixed");
     const currentStep = computed(() => result.value?.daily_steps?.[stepCursor.value] || null);
+    const leveragePlan = computed(() => {
+      const longTarget = Math.max(0, Number(form.long_gross_target) || 0);
+      const shortTarget = form.mode === "long_short" ? Math.max(0, Number(form.short_gross_target) || 0) : 0;
+      const configured = longTarget + shortTarget;
+      const hard = Math.max(0, Number(form.max_gross_leverage) || 0);
+      const buffer = Math.max(0, Math.min(0.99, Number(form.cash_buffer_fraction) || 0));
+      const effective = Math.min(configured, hard * (1 - buffer));
+      return {configured, effective, headroom:Math.max(0, hard-effective), invalid:configured > hard + 1e-12};
+    });
+    const integrityRows = computed(() => Object.fromEntries(
+      Object.entries(result.value?.integrity || {}).filter(([key]) => key !== "gross_leverage_violation_details")
+    ));
     const integrityLabels = {
       statement_rows:"交割单成交行数",
       cash_reconciliation_max_error:"逐笔现金恒等式最大误差",
@@ -754,6 +859,16 @@ const BacktestView = {
       ashare_buy_lot_violations:"A股买入非整手",
       event_phase_order_violations:"事件阶段乱序",
       long_only_negative_position_violations:"纯多头负持仓违规",
+      cash_account_negative_cash_violations:"现金账户负现金违规",
+      gross_leverage_violations:"总杠杆未修复超限",
+      gross_leverage_breach_events:"开盘杠杆触线次数（含已修复）",
+      automatic_deleveraging_events:"自动去杠杆次数",
+      leverage_limited_orders:"逐笔杠杆限额订单数",
+      max_open_gross_leverage_observed:"控制前最大开盘杠杆",
+      max_open_gross_leverage_after_control:"控制后最大开盘杠杆",
+      position_state_quantity_violations:"持仓状态与账本数量不一致",
+      stale_position_writeoffs:"长期缺失行情减记次数",
+      intrabar_ambiguities:"日内止损止盈先后不确定次数",
       ledger_source_of_truth:"净值是否来自账本",
       all_pass:"总检查",
     };
@@ -763,12 +878,20 @@ const BacktestView = {
     const integrityOk = (key, value) => {
       if (key === "statement_rows") return Number(value) >= 0;
       if (key.endsWith("_max_error")) return Number(value) <= 1e-5;
+      if (["gross_leverage_breach_events","automatic_deleveraging_events","leverage_limited_orders","intrabar_ambiguities","stale_position_writeoffs"].includes(key)) return Number(value) >= 0;
+      if (key === "max_open_gross_leverage_observed") return Number(value) >= 0;
+      if (key === "max_open_gross_leverage_after_control") return Number(value) <= Number(result.value?.config?.max_gross_leverage || 0) + 1e-6;
       return value === 0 || value === true;
     };
+    const formatIntegrityValue = value => typeof value === "number" ? num(value,8) : String(value);
     async function run() {
       running.value = true; err.value = "";
       try {
-        result.value = await api("/backtest", { method: "POST", body: { ...form } });
+        const payload = JSON.parse(JSON.stringify(form));
+        for (const [key,value] of Object.entries(payload.exit_policy || {})) if (value === "") payload.exit_policy[key] = null;
+        for (const key of ["portfolio_stop_drawdown_pct","portfolio_daily_loss_pct"]) if (payload[key] === "") payload[key] = null;
+        payload.short_gross_target = payload.mode === "long_short" ? payload.short_gross_target : 0;
+        result.value = await api("/backtest", { method: "POST", body: payload });
         currentId.value = result.value.id;
         ledgerTab.value = "trades";
         ledgerRows.value = result.value.trades || [];
@@ -781,6 +904,26 @@ const BacktestView = {
         await loadHistory();
       }
       finally { running.value = false; }
+    }
+    function applyRiskPreset() {
+      Object.assign(form.exit_policy, {
+        fixed_stop_loss_pct:0.08, fixed_take_profit_pct:0.20,
+        trailing_stop_pct:0.10, atr_period:14, atr_stop_multiple:2.5,
+        atr_take_profit_multiple:null, atr_trailing_multiple:3,
+        break_even_activation_pct:0.10, time_stop_sessions:60,
+        intrabar_conflict_policy:"conservative",
+      });
+      form.portfolio_stop_drawdown_pct = 0.20;
+      form.position_sizing = "atr_risk";
+      form.risk_per_position_fraction = 0.01;
+    }
+    function clearExitPolicy() {
+      Object.assign(form.exit_policy, {
+        fixed_stop_loss_pct:null, fixed_take_profit_pct:null,
+        trailing_stop_pct:null, atr_stop_multiple:null,
+        atr_take_profit_multiple:null, atr_trailing_multiple:null,
+        break_even_activation_pct:null, time_stop_sessions:null,
+      });
     }
     function drawCurve() {
       if (!curveEl.value || !result.value?.curve?.dates) return;
@@ -803,6 +946,7 @@ const BacktestView = {
     async function openHistory(backtest) {
       const detail = await api(`/backtests/${backtest.id}`, { cacheTtl:1000 });
       form.direction = Number(backtest.params?.direction || 1);
+      form.mode = backtest.params?.mode || taskMode.value;
       currentId.value = detail.id;
       result.value = detail.result?.stats ? detail.result : {stats:detail.result || {},curve:null,integrity:{}};
       ledgerTab.value = "trades"; ledgerRows.value = detail.trades?.rows || [];
@@ -832,6 +976,11 @@ const BacktestView = {
       form.initial_capital = meta.evaluation_config?.target_capital ?? (market.value==="ashare"?10000000:1000000);
       form.slippage_bps = market.value === "ashare" ? 5 : 2;
       form.borrow_cost_bps_annual = meta.evaluation_config?.borrow_cost_bps_annual ?? 0;
+      form.account_type = form.mode === "long_short" ? "margin" : "cash";
+      form.max_gross_leverage = form.mode === "long_short" ? 2 : 1;
+      form.long_gross_target = 0.95;
+      form.short_gross_target = form.mode === "long_short" ? 0.95 : 0;
+      form.min_trade_notional = market.value === "ashare" ? 1000 : 100;
       currentId.value = null; ledgerRows.value = []; Object.assign(ledgerPage,{offset:0,limit:200,total:0});
       await loadHistory();
       loadedExperimentVersion = appState.experimentVersion;
@@ -843,12 +992,20 @@ const BacktestView = {
       () => appState.experimentVersion,
       () => { if (appState.activeTab === "backtest") ensureContext(); },
     );
-    onActivated(ensureContext);
+    function activateBacktest() {
+      ensureContext();
+      if (appState.backtestDraft) {
+        form.expression = appState.backtestDraft;
+        form.direction = 1;
+        appState.backtestDraft = "";
+      }
+    }
+    onActivated(activateBacktest);
     return {
       form, taskMode, market, feeLabel, result, history, err, running, run,
       curveEl, currentId, currentStep, stepCursor, ledgerTab, ledgerRows,
-      ledgerPage, integrityLabels, num, pct, money, loadHistory, openHistory,
-      integrityOk, switchLedger, pageLedger,
+      ledgerPage, integrityLabels, integrityRows, leveragePlan, num, pct, money, loadHistory, openHistory,
+      integrityOk, formatIntegrityValue, switchLedger, pageLedger, applyRiskPreset, clearExitPolicy,
     };
   },
 };
@@ -868,7 +1025,32 @@ const SettingsView = {
         <div><label>持仓约束</label><select v-model="taskForm.portfolio_mode"><option value="long_only">纯多头</option><option value="long_short" :disabled="taskForm.market==='ashare'">多空</option></select></div>
         <div><label>双向同分优先方向</label><select v-model.number="taskForm.direction"><option :value="1">+1 高值偏多</option><option :value="-1">-1 低值偏多</option></select><small>每个候选仍会同时评价正反两向</small></div>
         <div><label>引擎版本</label><select v-model="taskForm.engine_mode"><option value="v2">V2 MinerTemplate（当前）</option></select></div>
+        <div><label>候选总预算</label><input v-model.number="taskForm.candidate_evaluation_budget" type="number" min="1" /></div>
+        <div><label>正式因子目标（0=不限）</label><input v-model.number="taskForm.target_factor_count" type="number" min="0" /></div>
         <div style="flex:3"><label>面板路径（可选）</label><input v-model="taskForm.panel_glob" placeholder="留空使用服务默认面板" /></div>
+      </div>
+      <div class="architecture-builder">
+        <div class="panel-title-row"><div><h3>研究架构</h3><span class="sub">后端会再次校验层级组合；proposal_mode 由架构自动推导，不能出现界面与实际运行不一致。</span></div><span class="tag blue">{{ architectureSchema || 'architecture/v1' }}</span></div>
+        <div class="form-row">
+          <div style="flex:3"><label>架构模板</label><select v-model="taskForm.architecture_template" @change="applyArchitectureTemplate"><option v-for="a in architectureTemplates" :key="a.key" :value="a.key">{{ a.label }}{{ a.recommended ? '（推荐）' : '' }}</option><option value="custom">自定义层级</option></select></div>
+          <div v-if="taskForm.layer2_enabled"><label>第二层记忆</label><select v-model="taskForm.memory_mode"><option value="adaptive">任务连续记忆</option><option value="cold">冷记忆对照</option></select></div>
+          <label class="inline-check"><input type="checkbox" v-model="taskForm.start_after_create" /> 创建后立即启动</label>
+          <label class="inline-check"><input type="checkbox" v-model="taskForm.return_source_governance_enabled" /> 训练收益来源去重</label>
+        </div>
+        <div class="architecture-flow">
+          <div class="architecture-layer" :class="{enabled:taskForm.layer1_enabled}"><b>L1 搜索</b><span>{{ layer1Label }}</span></div><i>→</i>
+          <div class="architecture-layer" :class="{enabled:taskForm.layer2_enabled}"><b>L2 Researcher</b><span>{{ taskForm.layer2_enabled ? (taskForm.memory_mode==='adaptive'?'LLM · 连续记忆':'LLM · 冷记忆') : '关闭' }}</span></div><i>→</i>
+          <div class="architecture-layer" :class="{enabled:taskForm.layer3_enabled}"><b>L3 Governor</b><span>{{ taskForm.layer3_enabled ? 'LLM · 单变量治理' : '关闭' }}</span></div>
+        </div>
+        <p class="sub">{{ (selectedArchitecture && selectedArchitecture.description) || '手工组合层级；第三层必须依赖第二层。' }}</p>
+        <div v-if="taskForm.layer2_enabled && !llm.inner_provider" class="warn-banner">当前没有内层 LLM provider。可以先创建任务，但启动 L2 时会熔断，不会偷偷退化为随机任务。</div>
+        <div v-if="taskForm.layer3_enabled && !llm.outer_provider" class="warn-banner">当前没有外层 LLM provider。可以先创建任务，但启动 L3 Governor 时会熔断。</div>
+        <div v-if="taskForm.architecture_template==='custom'" class="architecture-custom">
+          <label class="inline-check"><input type="checkbox" v-model="taskForm.layer1_enabled" /> 启用第一层</label>
+          <label class="inline-check"><input type="checkbox" v-model="taskForm.layer2_enabled" @change="syncCustomArchitecture" /> 启用第二层 LLM</label>
+          <label class="inline-check"><input type="checkbox" v-model="taskForm.layer3_enabled" :disabled="!taskForm.layer2_enabled" /> 启用第三层 LLM</label>
+          <div v-if="taskForm.layer1_enabled" class="algorithm-options"><span>第一层算法：</span><label v-for="algorithm in architectureAlgorithms" :key="algorithm"><input type="checkbox" :value="algorithm" v-model="taskForm.search_algorithms" /> {{ algorithm }}</label></div>
+        </div>
       </div>
       <div class="evaluation-config-grid">
         <div><label>建仓比例</label><input v-model.number="taskForm.top_fraction" type="number" min="0.05" max="0.5" step="0.05" /></div>
@@ -885,7 +1067,7 @@ const SettingsView = {
         <div><label>最低成本缓冲倍数</label><input v-model.number="taskForm.min_cost_cushion_multiple" type="number" min="0" step="0.25" /></div>
         <div><label>预声明检验次数</label><input v-model.number="taskForm.multiple_testing_trials" type="number" min="1" step="100" /></div>
         <div><label>排序目标年化</label><input v-model.number="taskForm.target_rank_ann_return" type="number" min="0.01" step="0.01" /></div>
-        <div style="align-self:end"><button class="btn primary" @click="createTask">按 V4.2 创建任务</button></div>
+        <div style="align-self:end"><button class="btn primary" @click="createTask">创建可审计架构任务</button></div>
       </div>
       <div v-if="taskMsg" :style="{color: taskOk ? 'var(--green)' : 'var(--red)'}">{{ taskMsg }}</div>
     </div>
@@ -908,26 +1090,34 @@ const SettingsView = {
         </div>
         <button class="btn" @click="llm.providers.push({name:'', format:'openai', base_url:'', api_key:'', model:''})">+ 添加提供商</button>
         <div class="form-row" style="margin-top:12px">
-          <div><label>内层挖掘用</label><select v-model="llm.inner_provider"><option value="">(未配置=随机基线)</option><option v-for="p in llm.providers" :key="p.name" :value="p.name">{{ p.name }}</option></select></div>
-          <div><label>外层元优化用</label><select v-model="llm.outer_provider"><option value="">(未配置=随机扰动)</option><option v-for="p in llm.providers" :key="p.name" :value="p.name">{{ p.name }}</option></select></div>
+          <div><label>内层挖掘用</label><select v-model="llm.inner_provider"><option value="">未配置（LLM 任务启动时熔断）</option><option v-for="p in llm.providers" :key="p.name" :value="p.name">{{ p.name }}</option></select></div>
+          <div><label>外层元优化用</label><select v-model="llm.outer_provider"><option value="">未配置（Governor 启动时熔断）</option><option v-for="p in llm.providers" :key="p.name" :value="p.name">{{ p.name }}</option></select></div>
         </div>
       </div>
       <div class="card">
         <h3>引擎参数</h3>
         <div class="form-row">
           <div><label>每外层步内层评估预算</label><input v-model.number="eng.inner_budget_per_outer_step" type="number" /></div>
-          <div><label>外层接受阈值 ε</label><input v-model.number="eng.outer_accept_epsilon" type="number" step="0.01" /></div>
+          <div><label>外层单边 p 阈值</label><input v-model.number="eng.outer_accept_p_value" type="number" min="0.001" max="0.5" step="0.01" /></div>
         </div>
         <div class="form-row">
           <div><label>在位者重测周期 (步)</label><input v-model.number="eng.incumbent_remeasure_every" type="number" /></div>
+          <div><label>配对种子数</label><input v-model.number="eng.n_seeds_per_candidate" type="number" min="2" /></div>
+          <div><label>单次 LLM 批量</label><input v-model.number="eng.batch_candidates_per_call" type="number" min="1" /></div>
+        </div>
+        <div class="form-row">
+          <div><label>最大外层步</label><input v-model.number="eng.max_outer_steps" type="number" min="1" /></div>
+          <div><label>最大运行小时</label><input v-model.number="eng.max_runtime_hours" type="number" min="0.1" step="0.5" /></div>
+          <div><label>最大 LLM 调用</label><input v-model.number="eng.max_llm_calls" type="number" min="1" /></div>
+          <div><label>研究树深度</label><input v-model.number="eng.max_tree_depth" type="number" min="1" /></div>
         </div>
         <h3 style="margin-top:16px">任务集</h3>
         <table>
           <tr><th>名称</th><th>股票池</th><th>持有期</th><th>A股成本</th><th>美股成本</th></tr>
           <tr v-for="t in eng.tasks" :key="t.name"><td>{{ t.name }}</td><td>{{ t.universe_n }}</td><td>{{ t.horizon }}日</td><td>{{ t.cost_bps_by_market?.ashare ?? '—' }} bps</td><td>{{ t.cost_bps_by_market?.us ?? t.cost_bps }} bps</td></tr>
         </table>
-        <div class="sub" style="margin-top:8px">V4.2 在训练安全层同时评价 +1/-1，双向计入检验次数后冻结方向；连续学习分服务于归因搜索，独立硬门槛决定准入。HOLDOUT/Vault 都不能参与选方向或循环提示词。</div>
-        <div class="protocol-card"><b>Evaluation Protocol {{ evalProtocol.version || 'v4.2' }}</b><span>双向训练评价 · 连续学习分 · 独立硬门槛分 · 费后收益下界 · 多重检验</span><small>{{ evalProtocol.policy_label }}</small></div>
+        <div class="sub" style="margin-top:8px">V4.2 在训练安全层同时评价 +1/-1，双向计入检验次数后冻结方向；Rating V4.3 在完整审计中计算 2020 至最新交易日评级。HOLDOUT/Vault 与评级结果都不能参与选方向或循环提示词。</div>
+        <div class="protocol-card"><b>Evaluation {{ evalProtocol.version || 'v4.2' }} · Rating {{ evalProtocol.rating_version || 'v4.3' }}</b><span>双向训练评价 · 2020 至最新冻结评级 · 独立硬门槛 · 费后收益下界 · 多重检验</span><small>{{ evalProtocol.policy_label }}</small></div>
       </div>
     </div>
     <div style="margin-top:14px; display:flex; gap:10px; align-items:center">
@@ -939,6 +1129,7 @@ const SettingsView = {
     const llm = reactive({ providers: [], inner_provider: "", outer_provider: "" });
     const eng = reactive({ tasks: [] });
     const evalProtocol = reactive({});
+    const architectureTemplates = ref([]), architectureAlgorithms = ref([]), architectureSchema = ref("");
     const msg = ref(""), saved = ref("");
     const taskForm = reactive({
       name: "", description: "", market: "ashare", portfolio_mode: "long_only",
@@ -949,13 +1140,24 @@ const SettingsView = {
       return_lcb_confidence: 0.90, min_return_hac_t: 1.2816,
       min_profitable_era_rate: 0.60, min_cost_cushion_multiple: 1.50,
       multiple_testing_trials: 1000, target_rank_ann_return: 0.10,
+      architecture_template: "random_researcher",
+      layer1_enabled: true, layer2_enabled: true, layer3_enabled: false,
+      search_algorithms: ["structured_random"], memory_mode: "adaptive",
+      candidate_evaluation_budget: 120, target_factor_count: 0,
+      start_after_create: false, return_source_governance_enabled: true,
     });
     const taskMsg = ref(""), taskOk = ref(false);
     async function load() {
-      const s = await api("/settings");
+      const [s, architectures] = await Promise.all([
+        api("/settings"), api("/research-architectures", { cacheTtl: 10000 }),
+      ]);
       Object.assign(llm, s.llm_providers);
       Object.assign(eng, s.engine_config);
       Object.assign(evalProtocol, s.evaluation_protocol || {});
+      architectureTemplates.value = architectures.templates || [];
+      architectureAlgorithms.value = architectures.customization?.search_algorithms || [];
+      architectureSchema.value = architectures.schema || "";
+      applyArchitectureTemplate();
     }
     async function save() {
       try {
@@ -969,10 +1171,21 @@ const SettingsView = {
       taskMsg.value = "";
       try {
         const stress = String(taskForm.stress_cost_bps).split(",").map(Number).filter(Number.isFinite);
-        await api("/experiments", { method: "POST", body: {
+        const created = await api("/experiments", { method: "POST", body: {
           name: taskForm.name, description: taskForm.description,
           research_config: { market: taskForm.market, portfolio_mode: taskForm.portfolio_mode,
             direction: taskForm.direction, direction_policy: "both_train_select", engine_mode: taskForm.engine_mode,
+            architecture_template: taskForm.architecture_template,
+            layer1_enabled: taskForm.layer1_enabled, layer2_enabled: taskForm.layer2_enabled,
+            layer3_enabled: taskForm.layer3_enabled,
+            search_algorithms: [...taskForm.search_algorithms], memory_mode: taskForm.memory_mode,
+            candidate_evaluation_budget: taskForm.candidate_evaluation_budget,
+            target_factor_count: taskForm.target_factor_count,
+            engine_config: JSON.parse(JSON.stringify(eng)),
+            return_source_governance: taskForm.return_source_governance_enabled ? {
+              protocol: "training_return_source_governance_v2", correlation_threshold: 0.85,
+              required_sources: 5, meta_score_weight: 0.15, cross_experiment_admission: false,
+            } : { protocol: "disabled" },
             panel_glob: taskForm.panel_glob || undefined, evaluation_protocol: evalProtocol.version || "v4.2",
             evaluation_config: {
               top_fraction: taskForm.top_fraction, tail_fraction: taskForm.top_fraction,
@@ -988,7 +1201,10 @@ const SettingsView = {
               target_rank_ann_return: taskForm.target_rank_ann_return,
             }},
         }});
-        taskOk.value = true; taskMsg.value = "研究任务已创建，可在“实验”页启动";
+        if (taskForm.start_after_create) {
+          await api("/engine/start", { method: "POST", body: { mode: "v2", experiment_id: created.id } });
+        }
+        taskOk.value = true; taskMsg.value = `研究任务 #${created.id} 已创建${taskForm.start_after_create ? '并启动' : '，可在“实验”页启动'}`;
         taskForm.name = ""; taskForm.description = "";
       } catch (e) { taskOk.value = false; taskMsg.value = "创建失败: " + e.message; }
     }
@@ -1005,8 +1221,29 @@ const SettingsView = {
         taskForm.target_rank_ann_return = 0.12;
       }
     }
+    const selectedArchitecture = computed(() => architectureTemplates.value.find(a => a.key === taskForm.architecture_template));
+    const layer1Label = computed(() => {
+      if (!taskForm.layer1_enabled) return "关闭";
+      if (taskForm.search_algorithms.length === 1 && taskForm.search_algorithms[0] === "structured_random") return "结构化随机";
+      return `${taskForm.search_algorithms.length} 算法组合`;
+    });
+    function applyArchitectureTemplate() {
+      if (taskForm.architecture_template === "custom") return;
+      const template = architectureTemplates.value.find(a => a.key === taskForm.architecture_template);
+      if (!template) return;
+      taskForm.layer1_enabled = Boolean(template.layer1_enabled);
+      taskForm.layer2_enabled = Boolean(template.layer2_enabled);
+      taskForm.layer3_enabled = Boolean(template.layer3_enabled);
+      taskForm.search_algorithms = [...(template.search_algorithms || [])];
+      taskForm.memory_mode = template.default_memory_mode || "adaptive";
+    }
+    function syncCustomArchitecture() {
+      if (!taskForm.layer2_enabled) taskForm.layer3_enabled = false;
+    }
     onMounted(load);
-    return { llm, eng, evalProtocol, save, msg, saved, taskForm, taskMsg, taskOk, createTask, syncMarketDefaults };
+    return { llm, eng, evalProtocol, save, msg, saved, taskForm, taskMsg, taskOk, createTask, syncMarketDefaults,
+      architectureTemplates, architectureAlgorithms, architectureSchema, selectedArchitecture, layer1Label,
+      applyArchitectureTemplate, syncCustomArchitecture };
   },
 };
 
@@ -1016,27 +1253,23 @@ const ExperimentsView = {
   <div>
     <div class="card" style="margin-bottom:14px">
       <h3>研究任务与并行运行</h3>
-      <div class="form-row">
-        <div style="flex:1"><label>名称</label><input v-model="form.name" placeholder="如: 实验2-修复评估器" /></div>
-        <div style="flex:2"><label>描述</label><input v-model="form.description" placeholder="研究假设 / 变更点" /></div>
-        <div style="align-self:flex-end"><button class="btn primary" @click="create">创建（基础）</button></div>
-      </div>
+      <div class="warn-banner">为避免隐式默认和错误层级组合，“基础创建”已取消。请在“设置 → 定义研究任务”中选择无 LLM、随机→LLM、算法池→LLM、完整三层或自定义架构；创建后回到本页启动和管理。</div>
       <div v-if="err" style="color:var(--red); margin-top:8px">{{ err }}</div>
     </div>
     <div class="card">
       <h3>研究任务列表 ({{ exps.length }})</h3>
       <table>
-        <tr><th>#</th><th>名称</th><th>市场 / 约束</th><th>协议</th><th>任务状态</th><th>运行态</th><th>因子</th><th>节点</th><th>外层步</th><th style="min-width:250px">操作</th></tr>
+        <tr><th>#</th><th>名称</th><th>市场 / 约束</th><th>协议</th><th>任务状态</th><th>运行态</th><th>因子</th><th>节点</th><th>外层步</th><th>创建时间</th><th style="min-width:250px">操作</th></tr>
         <tr v-for="e in exps" :key="e.id" :style="{background: e.active ? '#1c2733' : ''}">
           <td>{{ e.id }}</td>
           <td>
             <input v-if="editing===e.id" v-model="editForm.name" style="width:180px" />
             <template v-else><b>{{ e.name }}</b> <span v-if="e.active" class="tag green">活动</span></template>
           </td>
-          <td><span class="tag blue">{{ e.research_config?.market==='ashare' ? 'A股' : '美股' }}</span> <span class="sub">{{ e.research_config?.portfolio_mode==='long_only' ? '纯多头' : '多空' }} · {{ e.research_config?.direction_policy==='both_train_select' ? '双向训练，选中后冻结' : (Number(e.research_config?.direction || 1)===1 ? '固定 +1' : '固定 -1') }}</span></td>
+          <td><span class="tag blue">{{ e.research_config?.market==='ashare' ? 'A股' : '美股' }}</span> <span class="sub">{{ e.research_config?.portfolio_mode==='long_only' ? '纯多头' : '多空' }} · {{ e.research_config?.direction_policy==='both_train_select' ? '双向训练，选中后冻结' : (Number(e.research_config?.direction || 1)===1 ? '固定 +1' : '固定 -1') }}</span><div class="sub">{{ architectureLabel(e.research_config) }} · 预算 {{ e.research_config?.candidate_evaluation_budget || '旧任务未限定' }}</div></td>
           <td><span class="tag" :class="String(e.research_config?.evaluation_protocol || '').startsWith('v4.')?'green':'amber'">{{ e.research_config?.evaluation_protocol || 'legacy' }}</span><div v-if="e.research_config?.provenance_warning" class="provenance-dot" :title="e.research_config.provenance_warning">来源警告</div></td>
           <td><span class="tag" :class="{green: e.status==='open', amber: e.status==='archived'}">{{ e.status }}</span></td>
-          <td><span class="tag" :class="{green: runtime[e.id]?.state==='running', amber: runtime[e.id]?.state==='starting', red: runtime[e.id]?.state==='stopped'}">{{ runtime[e.id]?.state || 'stopped' }}</span></td>
+          <td><span class="tag" :class="{green: runtime[e.id]?.state==='running', amber: runtime[e.id]?.state==='starting', red: runtime[e.id]?.state==='stopped'}">{{ runtime[e.id]?.state || 'stopped' }}</span><div class="sub" v-if="runtime[e.id]?.global_progress!=null">全局预算 {{ (Number(runtime[e.id].global_progress)*100).toFixed(1) }}% · LLM {{ runtime[e.id]?.llm_calls || 0 }}/{{ runtime[e.id]?.max_llm_calls || '—' }}</div><div class="sub" v-if="runtime[e.id]?.runtime_identity?.code_short">代码 {{ runtime[e.id].runtime_identity.code_short }}</div></td>
           <td>{{ e.counts.factors }}</td><td>{{ e.counts.nodes }}</td><td>{{ e.counts.outer_steps }}</td>
           <td class="sub">{{ e.created_at?.slice(0,16) }}</td>
           <td>
@@ -1060,7 +1293,6 @@ const ExperimentsView = {
   </div>`,
   setup() {
     const exps = ref([]), runtime = reactive({});
-    const form = reactive({ name: "", description: "" });
     const editForm = reactive({ name: "", description: "" });
     const editing = ref(null), err = ref("");
     let loadedExperimentVersion = -1;
@@ -1077,10 +1309,12 @@ const ExperimentsView = {
     function ensureFresh() {
       if (loadedExperimentVersion !== appState.experimentVersion) refresh();
     }
-    async function create() {
-      err.value = "";
-      try { await api("/experiments", { method: "POST", body: { ...form } }); form.name = ""; form.description = ""; refresh(); }
-      catch (e) { err.value = e.message; }
+    function architectureLabel(config={}) {
+      const layers = [config.layer1_enabled ? "L1" : "", config.layer2_enabled ? "L2" : "", config.layer3_enabled ? "L3" : ""].filter(Boolean).join("→");
+      const known = { random_only:"随机无LLM", algorithm_pool_only:"算法池无LLM", random_researcher:"随机→Researcher", algorithm_pool_researcher:"算法池→Researcher", full_three_layer:"完整三层", direct_researcher:"直接Researcher" };
+      if (known[config.architecture_template]) return known[config.architecture_template];
+      if (layers) return `${layers}${config.memory_mode==='cold' && config.layer2_enabled ? '·冷记忆' : ''}`;
+      return config.proposal_mode==='random' ? "历史随机基线" : config.memory_mode==='cold' ? "历史LLM冷记忆" : "历史LLM连续记忆";
     }
     function startEdit(e) { editing.value = e.id; editForm.name = e.name; editForm.description = e.description; }
     async function saveEdit(e) {
@@ -1112,7 +1346,7 @@ const ExperimentsView = {
       () => { if (appState.activeTab === "exps") ensureFresh(); },
     );
     onActivated(ensureFresh);
-    return { exps, runtime, form, editForm, editing, err, create, startEdit, saveEdit, setStatus, activate, start, stop };
+    return { exps, runtime, editForm, editing, err, architectureLabel, startEdit, saveEdit, setStatus, activate, start, stop };
   },
 };
 
@@ -1861,9 +2095,643 @@ const LeaderboardsView = {
   },
 };
 
+/* ============ 任务研究记录（非正式因子库） ============ */
+const ResearchRecordsView = {
+  template: `
+  <section>
+    <div class="selector-heading">
+      <div><div class="eyebrow">TRAINING-SAFE CANDIDATE LEDGER</div><h1>任务研究记录库</h1><p>保留每个已评价候选，按任务内学习分排名；不等同于正式因子、封存验证或交易批准。</p></div>
+      <span class="tag amber">研究记录 ≠ 正式因子</span>
+    </div>
+    <div class="metric-strip" v-if="data.tasks?.length">
+      <div class="metric-card" v-for="task in data.tasks" :key="task.task_name"><span>{{ task.task_name }}</span><b>{{ task.records }}</b><small>有效 {{ task.valid }} · 通过 {{ task.passed }} · 正式 {{ task.formal_factors }} · 最高 {{ num(task.best_learning_score) }}</small></div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <div class="form-row">
+        <div style="flex:2"><input v-model="q" @keyup.enter="refresh" placeholder="搜索表达式、假设或机制" /></div>
+        <div><select v-model="taskName" @change="refresh"><option value="">全部研究任务</option><option v-for="task in data.tasks" :key="task.task_name" :value="task.task_name">{{ task.task_name }}</option></select></div>
+        <div><select v-model="status" @change="refresh"><option value="">全部状态</option><option value="ok">有效</option><option value="error">失败/拒绝</option></select></div>
+        <button class="btn primary" @click="refresh" :disabled="loading">{{ loading ? '加载中…' : '刷新' }}</button>
+      </div>
+      <div class="sub" style="margin-top:8px">{{ data.interpretation_boundary }}</div>
+    </div>
+    <div class="card">
+      <div class="panel-title-row"><div><h3>候选排名（{{ data.total || 0 }}）</h3><span class="sub">排名仅在各 task 内可比；列表总序按学习分降序展示</span></div></div>
+      <table><tr><th>Task 排名</th><th>学习分</th><th>硬门分</th><th>结果</th><th>机制</th><th>来源/操作</th><th>表达式</th><th>主要失败</th><th>时间</th></tr>
+        <tr v-for="row in data.records" :key="row.id" class="clickable" @click="open(row)">
+          <td><b>#{{ row.task_rank }}</b><div class="sub">{{ row.task_name }}</div></td><td>{{ num(row.learning_score) }}</td><td>{{ num(row.hard_gate_score) }}</td><td><span class="tag" :class="row.discovery_passed?'green':row.status==='ok'?'amber':'red'">{{ row.discovery_passed?'通过':row.status==='ok'?'待改进':'失败' }}</span><div v-if="row.formal_factor_admitted" class="tag blue">已入正式库</div></td><td>{{ row.mechanism_family }}</td><td>{{ row.source }} / {{ row.operation }}</td><td class="mono-expr" style="max-width:360px">{{ row.expression || '—' }}</td><td class="sub">{{ row.failure_reasons?.[0] || '—' }}</td><td class="sub">{{ row.created_at?.slice(5,16) }}</td>
+        </tr>
+      </table>
+    </div>
+    <div class="drawer" v-if="detail"><button class="btn close" @click="detail=null">✕ 关闭</button><h2>研究记录 #{{ detail.id }}</h2><div class="tag amber" style="margin:8px 0">{{ detail.interpretation_boundary }}</div><div class="mono-expr" style="margin:12px 0">{{ detail.expression || '无有效表达式' }}</div><p>{{ detail.hypothesis }}</p><div class="card"><h3>训练安全指标</h3><table><tr v-for="(value,key) in detail.metrics" :key="key"><td>{{ key }}</td><td>{{ num(value) }}</td></tr></table></div><div class="card" style="margin-top:12px"><h3>失败与改进目标</h3><p>{{ detail.failure_reasons?.join('；') || '无' }}</p><p class="sub">{{ detail.improvement_targets?.join('；') || '无' }}</p></div></div>
+  </section>`,
+  setup() {
+    const data = reactive({ tasks:[], records:[], total:0, interpretation_boundary:"" });
+    const q = ref(""), taskName = ref(""), status = ref(""), detail = ref(null), loading = ref(false);
+    let timer = null;
+    const num = (value) => value == null || Number.isNaN(Number(value)) ? "—" : Number(value).toFixed(3);
+    async function refresh() {
+      loading.value = true;
+      try {
+        const params = new URLSearchParams({ limit:"500" });
+        if (q.value.trim()) params.set("q", q.value.trim());
+        if (taskName.value) params.set("task_name", taskName.value);
+        if (status.value) params.set("status", status.value);
+        Object.assign(data, await api(`/research-records?${params}`));
+      } finally { loading.value = false; }
+    }
+    async function open(row) { detail.value = await api(`/research-records/${row.id}`); }
+    function start() { refresh(); clearInterval(timer); timer = setInterval(refresh, 8000); }
+    watch(() => appState.experimentVersion, () => { detail.value=null; if (appState.activeTab==="records") refresh(); });
+    onActivated(start); onDeactivated(() => clearInterval(timer)); onUnmounted(() => clearInterval(timer));
+    return { data, q, taskName, status, detail, loading, refresh, open, num };
+  },
+};
+
+/* ============ Manual Factor Correlation + DSL Builder ============ */
+const FactorToolsView = {
+  template: `
+  <section class="factor-tools-page">
+    <div class="selector-heading factor-tools-heading">
+      <div><div class="eyebrow">COMMON-PANEL CORRELATION / EXECUTABLE DSL COMPOSER</div><h1>因子相关性与组合表达式工具</h1><p>手工输入N个因子，在统一口径下识别重复收益来源，并生成方向、权重和标准化都已内嵌的可执行DSL。</p></div>
+      <div class="factor-tools-heading-tags"><span class="tag blue">{{ market==='ashare'?'A股':'美股' }}</span><span class="tag amber">组件快照优先</span><span class="tag">DSL ≤ {{ capabilities?.limits?.expression_characters || 4000 }}</span></div>
+    </div>
+
+    <div v-if="error" class="selector-error">{{ error }}</div>
+    <div v-if="message" class="warn-banner factor-tools-message">{{ message }}</div>
+
+    <div class="factor-tools-layout">
+      <div class="card factor-tools-components">
+        <div class="panel-title-row"><div><h3>01 · 因子输入</h3><span class="sub">相关性最多{{ capabilities?.limits?.correlation_components || 12 }}个；表达式生成最多{{ capabilities?.limits?.expression_components || 20 }}个</span></div><div class="factor-tools-actions"><button class="btn" v-if="market==='ashare'" @click="loadAshareExample">载入本轮五因子</button><button class="btn primary" @click="addComponent">＋ 添加因子</button></div></div>
+        <div class="factor-tools-bulk">
+          <textarea v-model="bulkText" rows="3" placeholder="也可以每行粘贴一个DSL表达式，然后点击批量导入"></textarea>
+          <button class="btn" @click="importBulk">批量导入</button>
+        </div>
+        <div class="factor-tools-component-head"><span>#</span><span>名称 / Key</span><span>DSL表达式</span><span>方向</span><span>权重</span><span></span></div>
+        <div v-for="(row,index) in components" :key="row.uid" class="factor-tools-component-row">
+          <span class="factor-tools-index">{{ index+1 }}</span>
+          <div><input v-model="row.name" placeholder="因子名称"><input v-model="row.key" class="factor-key-input" placeholder="F01"></div>
+          <textarea v-model="row.expression" rows="2" class="mono-input" placeholder="输入单个DSL表达式"></textarea>
+          <select v-model.number="row.direction"><option :value="1">+1 高值</option><option :value="-1">-1 低值</option></select>
+          <input v-model.number="row.weight" type="number" min="0.0001" step="0.05">
+          <button class="btn danger" @click="removeComponent(index)" :disabled="components.length<=2">×</button>
+        </div>
+        <details class="factor-tools-whitelist"><summary>当前市场字段白名单（{{ capabilities?.dsl_fields?.length || 0 }}）</summary><code>{{ (capabilities?.dsl_fields || []).join(', ') }}</code></details>
+      </div>
+
+      <div class="factor-tools-workspaces">
+        <div class="card factor-tools-correlation-config">
+          <div class="panel-title-row"><div><h3>02 · 相关性检测</h3><span class="sub">主去重口径是统一成本后的单因子收益路径相关</span></div><button class="btn primary" @click="runCorrelation" :disabled="correlating">{{ correlating?'正在计算共同面板…':'检测相互相关性' }}</button></div>
+          <div class="factor-tools-form-grid">
+            <label><span>市场</span><select v-model="market" @change="changeMarket"><option value="ashare">A股</option><option value="us">美股</option></select></label>
+            <label><span>组合模式</span><select v-model="correlationForm.portfolio_mode"><option value="long_only">纯多</option><option value="long_short" :disabled="market==='ashare'">多空</option></select></label>
+            <label><span>开始日期</span><input type="date" v-model="correlationForm.start"></label>
+            <label><span>结束日期</span><input type="date" v-model="correlationForm.end"></label>
+            <label><span>股票池</span><select v-model.number="correlationForm.universe_n"><option :value="300">Top300</option><option :value="500">Top500</option><option :value="1000">Top1000</option><option :value="1500">Top1500</option></select></label>
+            <label><span>周期</span><select v-model.number="correlationForm.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="20">20日</option></select></label>
+            <label><span>选股比例</span><input type="number" v-model.number="correlationForm.top_fraction" min="0.05" max="0.5" step="0.05"></label>
+            <label><span>成本BPS</span><input type="number" v-model.number="correlationForm.cost_bps" min="0" max="500" step="5"></label>
+            <label><span>高相关阈值</span><input type="number" v-model.number="correlationForm.threshold" min="0.5" max="0.99" step="0.05"></label>
+          </div>
+        </div>
+
+        <div class="card factor-tools-expression-config">
+          <div class="panel-title-row"><div><h3>03 · 多因子DSL生成</h3><span class="sub">默认按方向做截面Rank，再按权重组合</span></div><button class="btn primary" @click="buildExpression" :disabled="building">{{ building?'正在验证…':'生成可回测DSL' }}</button></div>
+          <div class="factor-tools-expression-options">
+            <label><span>组件标准化</span><select v-model="builderForm.normalization"><option value="rank">截面Rank（推荐）</option><option value="zscore">截面ZScore</option><option value="none">不标准化</option></select></label>
+            <label class="factor-tools-check"><input type="checkbox" v-model="builderForm.omit_common_scale"><span>等权时省略共同系数以缩短表达式</span></label>
+          </div>
+          <template v-if="built">
+            <div class="factor-tools-built-meta"><span class="tag green">验证通过</span><span>{{ built.component_count }}因子</span><span>{{ built.length }}/{{ built.max_length }}字符</span><span>历史{{ built.required_history }}日</span><span>最终方向 +1</span></div>
+            <textarea class="factor-tools-output mono-input" rows="7" readonly :value="built.expression"></textarea>
+            <div class="factor-tools-actions"><button class="btn" @click="copyExpression">{{ copied?'已复制':'复制DSL' }}</button><button class="btn primary" @click="sendToBacktest">送入回测模块</button></div>
+            <div class="sub">{{ built.scale_note }}</div><div v-for="warning in built.warnings" :key="warning" class="bad-text">{{ warning }}</div>
+          </template>
+          <div v-else class="combination-empty">填写至少两个因子后生成。结构化组件仍会随结果返回，长DSL只是选股与手工回测的兼容输出。</div>
+        </div>
+      </div>
+    </div>
+
+    <template v-if="correlation">
+      <div class="metric-strip factor-tools-metrics">
+        <div class="metric-card accent"><span>共同收益期</span><b>{{ correlation.common_periods }}</b><small>{{ correlation.window.start }}~{{ correlation.window.end }}</small></div>
+        <div class="metric-card"><span>高相关对</span><b>{{ correlation.high_correlation_pairs.length }}</b><small>阈值 |ρ|≥{{ correlation.threshold }}</small></div>
+        <div class="metric-card"><span>面板行数</span><b>{{ Number(correlation.panel.rows||0).toLocaleString() }}</b><small>Top{{ correlation.universe_n }} · H{{ correlation.horizon }}</small></div>
+        <div class="metric-card"><span>计算耗时</span><b>{{ num(correlation.elapsed_seconds,2) }}s</b><small>{{ correlation.cache_hit?'命中缓存':'完整计算' }}</small></div>
+      </div>
+      <div class="card factor-tools-matrix-card">
+        <div class="panel-title-row"><div><h3>相关矩阵</h3><span class="sub">方向已经内嵌；负相关表示收益来源符号相反</span></div><div class="combination-mode-tabs factor-tools-matrix-tabs"><button v-for="option in matrixOptions" :key="option.key" :class="{active:matrixKey===option.key}" @click="matrixKey=option.key">{{ option.label }}</button></div></div>
+        <div class="factor-tools-matrix-scroll"><table class="factor-tools-matrix"><thead><tr><th></th><th v-for="label in correlation.labels" :key="label">{{ label }}</th></tr></thead><tbody><tr v-for="(row,rowIndex) in activeMatrix" :key="correlation.labels[rowIndex]"><th>{{ correlation.labels[rowIndex] }}</th><td v-for="(value,colIndex) in row" :key="colIndex" :style="correlationCellStyle(value)">{{ num(value,3) }}</td></tr></tbody></table></div>
+        <p class="sub">{{ correlation.interpretation[matrixKey] }}</p>
+      </div>
+      <div class="grid cols-2 factor-tools-results-grid">
+        <div class="card"><div class="panel-title-row"><div><h3>高相关因子对</h3><span class="sub">优先查看收益路径同源，再查看信号与IC状态重叠</span></div></div><div v-if="!correlation.high_correlation_pairs.length" class="combination-empty">当前阈值下没有高相关因子对。</div><table v-else><tr><th>因子对</th><th>分类</th><th>信号ρ</th><th>IC路径ρ</th><th>收益ρ</th></tr><tr v-for="row in correlation.high_correlation_pairs" :key="row.left+row.right"><td><b>{{ row.left }}</b> / <b>{{ row.right }}</b></td><td><span class="tag" :class="row.classification==='same_return_source'?'red':'amber'">{{ pairClass(row.classification) }}</span></td><td>{{ num(row.signal_rank_correlation,3) }}</td><td>{{ num(row.rank_ic_path_correlation,3) }}</td><td><b>{{ num(row.portfolio_return_correlation,3) }}</b></td></tr></table></div>
+        <div class="card"><div class="panel-title-row"><div><h3>单因子共同口径表现</h3><span class="sub">仅用于理解相关矩阵，不是因子晋升评级</span></div></div><table><tr><th>因子</th><th>主动/净年化</th><th>Sharpe</th><th>Rank IC</th><th>Rank ICIR</th><th>换手</th></tr><tr v-for="row in correlation.factor_stats" :key="row.key"><td><b>{{ row.key }}</b><div class="sub">{{ row.direction>0?'+1':'-1' }}</div></td><td>{{ pct(row.ann_return) }}</td><td>{{ num(row.sharpe,3) }}</td><td>{{ pct(row.rank_ic_mean) }}</td><td>{{ num(row.rank_icir,3) }}</td><td>{{ pct(row.avg_turnover) }}</td></tr></table></div>
+      </div>
+    </template>
+  </section>`,
+  setup() {
+    const capabilities = ref(null), correlation = ref(null), built = ref(null);
+    const market = ref("ashare"), bulkText = ref(""), error = ref(""), message = ref("");
+    const correlating = ref(false), building = ref(false), copied = ref(false), matrixKey = ref("portfolio_return_correlation");
+    let uid = 2;
+    const blankComponent = index => ({uid:++uid,key:`F${String(index).padStart(2,"0")}`,name:`因子${index}`,expression:"",direction:1,weight:1});
+    const components = ref([blankComponent(1), blankComponent(2)]);
+    const correlationForm = reactive({portfolio_mode:"long_only",start:"2020-01-01",end:"2026-12-31",universe_n:500,horizon:5,top_fraction:0.20,cost_bps:15,threshold:0.80});
+    const builderForm = reactive({normalization:"rank",omit_common_scale:true});
+    const matrixOptions = [
+      {key:"portfolio_return_correlation",label:"收益路径"},
+      {key:"signal_rank_correlation",label:"截面信号"},
+      {key:"rank_ic_path_correlation",label:"Rank IC路径"},
+    ];
+    const activeComponents = computed(() => components.value.filter(row => row.expression.trim()).map((row,index) => ({key:row.key.trim()||`F${String(index+1).padStart(2,"0")}`,name:row.name.trim()||row.key,expression:row.expression.trim(),direction:Number(row.direction),weight:Number(row.weight)||1})));
+    const activeMatrix = computed(() => correlation.value?.matrices?.[matrixKey.value] || []);
+    function addComponent() { components.value.push(blankComponent(components.value.length+1)); }
+    function removeComponent(index) { if (components.value.length>2) components.value.splice(index,1); }
+    function importBulk() {
+      const rows = bulkText.value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean);
+      if (!rows.length) return;
+      components.value = rows.slice(0,capabilities.value?.limits?.expression_components||20).map((expression,index)=>({...blankComponent(index+1),expression}));
+      while (components.value.length<2) components.value.push(blankComponent(components.value.length+1));
+      bulkText.value=""; correlation.value=null; built.value=null;
+    }
+    function loadAshareExample() {
+      market.value="ashare"; correlationForm.portfolio_mode="long_only";
+      const rows=[
+        ["U0001","大单参与度","zscore(winsor_mad(ts_mean((buy_lg_amount+sell_lg_amount)/amount,120),5))",1],
+        ["U0003","量比持续性","rank(-(ts_mean(volume_ratio,120)/ts_max(volume_ratio,120)))",-1],
+        ["U0012","低市销率TTM","rank(-ps_ttm)",1],
+        ["U0015","日内价量反转","-rank(ts_sum((close-open)/close*vol,120))",1],
+        ["U0021","中期反转","zscore(winsor_mad(ts_mean(close,20)/ts_mean(close,60),5))",-1],
+      ];
+      components.value=rows.map(([key,name,expression,direction])=>({uid:++uid,key,name,expression,direction,weight:1}));
+      correlation.value=null; built.value=null; loadCapabilities();
+    }
+    async function loadCapabilities() {
+      try {
+        const q=new URLSearchParams({market:market.value});
+        if(appState.experimentId) q.set("experiment_id",appState.experimentId);
+        capabilities.value=await api(`/factor-tools/capabilities?${q}`,{cacheTtl:1000});
+      } catch(e){error.value=e.message;}
+    }
+    function changeMarket(){correlationForm.portfolio_mode=market.value==="ashare"?"long_only":"long_short";correlation.value=null;built.value=null;loadCapabilities();}
+    function ensureComponents(limit) { if(activeComponents.value.length<2) throw new Error("请至少输入2个有效因子表达式"); if(activeComponents.value.length>limit) throw new Error(`当前操作最多支持${limit}个因子`); }
+    async function runCorrelation(){correlating.value=true;error.value="";message.value="";try{ensureComponents(capabilities.value?.limits?.correlation_components||12);correlation.value=await api("/factor-tools/correlation",{method:"POST",body:{experiment_id:appState.experimentId,market:market.value,components:activeComponents.value,...correlationForm}});}catch(e){error.value=e.message;}finally{correlating.value=false;}}
+    async function buildExpression(){building.value=true;error.value="";message.value="";try{ensureComponents(capabilities.value?.limits?.expression_components||20);built.value=await api("/factor-tools/build-expression",{method:"POST",body:{market:market.value,components:activeComponents.value,...builderForm}});}catch(e){error.value=e.message;}finally{building.value=false;}}
+    async function copyExpression(){if(!built.value)return;try{await navigator.clipboard.writeText(built.value.expression);copied.value=true;setTimeout(()=>copied.value=false,1400);}catch(e){error.value="复制失败，请手工选择表达式";}}
+    function sendToBacktest(){if(!built.value)return;appState.backtestDraft=built.value.expression;appState.requestedTab="backtest";message.value="表达式已送入回测模块，方向固定为 +1";}
+    function correlationCellStyle(value){const number=Number(value||0),alpha=Math.min(.72,.08+.55*Math.abs(number));return {background:number>=0?`rgba(46,160,100,${alpha})`:`rgba(56,118,200,${alpha})`,color:Math.abs(number)>.65?"#fff":"var(--text)",fontWeight:Math.abs(number)>=(correlation.value?.threshold||.8)?"800":"500"};}
+    const num=(value,digits=3)=>value==null||Number.isNaN(Number(value))?"—":Number(value).toFixed(digits);
+    const pct=value=>value==null||Number.isNaN(Number(value))?"—":`${(Number(value)*100).toFixed(2)}%`;
+    const pairClass=value=>({same_return_source:"收益同源",signal_overlap:"信号重叠",ic_regime_overlap:"IC状态重叠"})[value]||value;
+    watch(()=>appState.experimentVersion,()=>{correlation.value=null;built.value=null;loadCapabilities();});
+    onActivated(loadCapabilities);
+    return {appState,capabilities,components,activeComponents,market,bulkText,error,message,correlation,built,correlating,building,copied,correlationForm,builderForm,matrixKey,matrixOptions,activeMatrix,addComponent,removeComponent,importBulk,loadAshareExample,changeMarket,runCorrelation,buildExpression,copyExpression,sendToBacktest,correlationCellStyle,num,pct,pairClass};
+  },
+};
+
+/* ============ Factor Combination Laboratory ============ */
+const CombinationLabView = {
+  template: `
+  <section class="combination-page">
+    <div class="combination-heading">
+      <div>
+        <div class="eyebrow">NESTED COMPONENT ARRAY / PURGED VALIDATION / EVENT REPLAY</div>
+        <h1>因子组合优化实验台</h1>
+        <p>组件数组是权威数据，不再拼接超长DSL；程序化与LLM模式共享同一冻结协议和确定性裁判。</p>
+      </div>
+      <div class="combination-mode-tabs">
+        <button :class="{active:form.search_mode==='programmatic'}" @click="form.search_mode='programmatic'">程序化优化</button>
+        <button :class="{active:form.search_mode==='llm'}" @click="form.search_mode='llm'">LLM协作优化</button>
+      </div>
+    </div>
+
+    <div v-if="form.search_mode==='llm' && capabilities && !capabilities.llm?.configured" class="warn-banner">
+      LLM协作模式需要先在“设置”中配置 inner_provider 或 outer_provider；不会静默回退为程序化结果。
+    </div>
+    <div v-if="error" class="selector-error">{{ error }}</div>
+
+    <div class="combination-layout">
+      <div class="combination-builder">
+        <div class="card combination-section">
+          <div class="panel-title-row">
+            <div><h2>1. 冻结候选因子</h2><span class="sub">从任务因子库选择，或手工加入DSL；最多12个。</span></div>
+            <span class="count-badge">{{ components.length }} / 12</span>
+          </div>
+          <div class="combination-add-row">
+            <input v-model="factorQuery" placeholder="搜索因子库名称或表达式">
+            <select v-model="selectedLibraryId">
+              <option value="">从因子库选择…</option>
+              <option v-for="factor in filteredLibrary" :key="factor.id" :value="factor.id">#{{ factor.id }} {{ factor.name || factor.expression.slice(0,42) }}</option>
+            </select>
+            <button class="btn" @click="addLibraryFactor" :disabled="!selectedLibraryId || components.length>=12">加入</button>
+          </div>
+          <div class="combination-add-row manual">
+            <input v-model="manualExpression" class="mono-input" placeholder="输入单个DSL表达式（每个组件独立保存）">
+            <select v-model.number="manualDirection"><option :value="1">正向 +1</option><option :value="-1">反向 -1</option></select>
+            <button class="btn" @click="addManualFactor" :disabled="!manualExpression.trim() || addingManual || components.length>=12">{{ addingManual?'校验中':'校验并加入' }}</button>
+          </div>
+          <div v-if="!components.length" class="combination-empty">请至少加入2个因子。组合不会被压成一条500字符DSL。</div>
+          <div v-for="(component,index) in components" :key="component.key" class="combination-component-row">
+            <div class="combination-index">{{ index+1 }}</div>
+            <div class="combination-component-copy">
+              <b>{{ component.name }}</b>
+              <code>{{ component.expression }}</code>
+              <small>{{ component.source }}<template v-if="component.source_ref"> · {{ component.source_ref }}</template></small>
+            </div>
+            <select v-model.number="component.direction"><option :value="1">+1 正向</option><option :value="-1">-1 反向</option></select>
+            <input v-model="component.mechanism" title="收益机制">
+            <button class="text-btn bad-text" @click="removeComponent(index)">移除</button>
+          </div>
+        </div>
+
+        <div class="card combination-section">
+          <div class="panel-title-row"><div><h2>2. 组合空间与执行约束</h2><span class="sub">先去重与相关性过滤，再进行预算有界的粗网格搜索。</span></div><span class="tag blue">路径预算 {{ form.path_budget }}</span></div>
+          <div class="combination-form-grid">
+            <label><span>最小组合数</span><input v-model.number="form.min_factors" type="number" min="2" :max="Math.max(2,components.length)"></label>
+            <label><span>最大组合数</span><input v-model.number="form.max_factors" type="number" min="2" :max="Math.max(2,components.length)"></label>
+            <label><span>最少收益机制</span><input v-model.number="form.min_mechanisms" type="number" min="1" :max="Math.max(1,mechanismCount)"></label>
+            <label><span>权重粗步长</span><select v-model.number="form.coarse_step"><option :value="0.05">5%</option><option :value="0.10">10%</option><option :value="0.20">20%</option><option :value="0.25">25%</option></select></label>
+            <label><span>最小有效权重</span><input v-model.number="form.min_weight" type="number" min="0.01" max="0.5" step="0.01"></label>
+            <label><span>单因子权重上限</span><input v-model.number="form.max_weight" type="number" min="0.1" max="1" step="0.05"></label>
+            <label><span>机制权重上限</span><input v-model.number="form.max_mechanism_weight" type="number" min="0.2" max="1" step="0.05"></label>
+            <label><span>收益路径相关上限</span><input v-model.number="form.max_pair_correlation" type="number" min="0" max="1" step="0.05"></label>
+            <label><span>搜索路径预算</span><input v-model.number="form.path_budget" type="number" min="10" max="20000" step="100"></label>
+            <label><span>进入验证的路径</span><input v-model.number="form.validation_budget" type="number" min="50" max="500" step="25"></label>
+            <label><span>股票池</span><input v-model.number="form.universe_n" type="number" min="100" max="5000" step="100"></label>
+            <label><span>调仓/预测周期</span><select v-model.number="form.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="20">20日</option></select></label>
+            <label><span>选股比例</span><input v-model.number="form.top_fraction" type="number" min="0.05" max="0.5" step="0.05"></label>
+            <label><span>基础成本 BPS</span><input v-model.number="form.cost_bps" type="number" min="0" max="200" step="5"></label>
+            <label><span>压力成本 BPS</span><input v-model.number="form.stress_cost_bps" type="number" min="0" max="500" step="5"></label>
+            <label v-if="capabilities?.market==='us'"><span>组合版本</span><select v-model="form.portfolio_mode"><option value="long_only">美股纯多</option><option value="long_short">美股多空</option></select></label>
+          </div>
+        </div>
+
+        <div class="card combination-section">
+          <div class="panel-title-row"><div><h2>3. 不重叠时间协议</h2><span class="sub">训练决定搜索，验证选择候选，评级只在胜者通过硬门槛后读取。</span></div><span class="tag green">边界自动Purge</span></div>
+          <div class="combination-window-grid">
+            <strong>训练</strong><input v-model="form.train_start" type="date"><span>至</span><input v-model="form.train_end" type="date">
+            <strong>验证</strong><input v-model="form.validation_start" type="date"><span>至</span><input v-model="form.validation_end" type="date">
+            <strong>冻结评级</strong><input v-model="form.rating_start" type="date"><span>至</span><input v-model="form.rating_end" type="date">
+          </div>
+        </div>
+      </div>
+
+      <aside class="combination-sidebar">
+        <div class="card combination-launch-card">
+          <div class="panel-title-row"><div><h2>协议检查</h2><span class="sub">创建后候选、方向、窗口和门槛全部冻结。</span></div><span class="tag" :class="canStart?'green':'amber'">{{ canStart?'可启动':'待补全' }}</span></div>
+          <div class="combination-checks">
+            <div><span :class="components.length>=2?'ok':'no'">●</span> 组件数量 2–12</div>
+            <div><span :class="form.min_factors<=form.max_factors && form.max_factors<=components.length?'ok':'no'">●</span> 组合数量可行</div>
+            <div><span :class="mechanismCount>=form.min_mechanisms?'ok':'no'">●</span> 收益机制覆盖</div>
+            <div><span :class="validWindows?'ok':'no'">●</span> 训练/验证/评级不重叠</div>
+            <div><span :class="form.search_mode!=='llm'||capabilities?.llm?.configured?'ok':'no'">●</span> LLM供应商</div>
+          </div>
+          <button class="btn primary combination-start" @click="startExperiment" :disabled="!canStart || creating">{{ creating?'正在冻结协议…':'冻结协议并开始优化' }}</button>
+          <small>未通过门槛会诚实输出 NO_COMBINATION，不强制产生冠军。</small>
+        </div>
+
+        <div v-if="current" class="card combination-live-card">
+          <div class="panel-title-row"><div><h2>#{{ current.id }} {{ current.name }}</h2><span class="sub">{{ current.protocol }}</span></div><span class="tag" :class="statusClass(current.status)">{{ current.status }}</span></div>
+          <div class="combination-progress"><i :style="{width:progressPercent+'%'}"></i></div>
+          <div class="combination-progress-copy"><span>{{ current.progress?.message || current.progress?.stage || '等待状态' }}</span><b>{{ progressPercent.toFixed(0) }}%</b></div>
+          <button v-if="['queued','running'].includes(current.status)" class="btn danger" @click="stopExperiment">安全停止</button>
+          <div v-if="current.error" class="selector-error" style="margin-top:10px">{{ current.error }}</div>
+        </div>
+
+        <div class="card combination-history-card">
+          <div class="panel-title-row"><div><h2>实验历史</h2><span class="sub">当前研究任务隔离</span></div><button class="text-btn" @click="loadHistory">刷新</button></div>
+          <div v-if="!history.length" class="combination-empty">暂无组合实验</div>
+          <div v-for="row in history" :key="row.id" class="combination-history-row" :class="{active:current?.id===row.id}" @click="openExperiment(row.id)">
+            <div><b>#{{ row.id }} {{ row.name }}</b><small>{{ row.search_mode }} · {{ row.portfolio_mode }} · {{ row.component_count }}因子</small></div>
+            <div><span class="tag" :class="statusClass(row.status)">{{ row.decision || row.status }}</span><small>{{ formatTime(row.created_at) }}</small></div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div v-if="current?.result?.protocol" class="combination-results">
+      <div class="combination-result-heading">
+        <div><div class="eyebrow">AUDITABLE RESULT</div><h2>组合实验结果</h2><p>结果哈希 {{ current.result.result_hash }} · {{ current.result.elapsed_seconds }} 秒</p></div>
+        <span class="combination-decision" :class="decisionClass(current.result.decision)">{{ current.result.decision }}</span>
+      </div>
+      <div class="metric-strip combination-metrics">
+        <div class="metric-card"><span>生成路径</span><b>{{ current.result.search?.generated_candidates || 0 }}</b><small>相关过滤后 {{ current.result.search?.correlation_filtered_candidates || 0 }}</small></div>
+        <div class="metric-card"><span>进入验证</span><b>{{ current.result.search?.validated_candidates || 0 }}</b><small>Top train only</small></div>
+        <div class="metric-card"><span>LLM有效提案</span><b>{{ current.result.llm_proposals_accepted || 0 }}</b><small>收到 {{ current.result.llm_proposals_received || 0 }}</small></div>
+        <div class="metric-card"><span>面板</span><b>{{ current.result.panel?.sessions || current.result.panel?.summary?.rows || '—' }}</b><small>{{ current.result.panel?.symbols || '—' }} symbols</small></div>
+      </div>
+
+      <div v-if="!winner && bestCandidate" class="warn-banner combination-candidate-warning">
+        没有候选通过全部验证门槛。下面仍展示验证排序第一的“最佳被拒候选”及完整权重，供诊断使用；它不是获批组合，冻结评级区间没有被读取。
+      </div>
+
+      <div v-if="bestCandidate" class="grid cols-2 combination-result-grid">
+        <div class="card">
+          <div class="panel-title-row"><div><h2>{{ winner?'胜者组件权重':'当前最佳候选权重（未通过）' }}</h2><span class="sub">组件数组为权威记录；零权重因子已隐藏</span></div><span class="tag" :class="winner?'blue':'red'">{{ bestCandidate.source }}</span></div>
+          <table><tr><th>组件</th><th>机制</th><th>方向</th><th>权重</th></tr>
+            <tr v-for="row in bestCandidateWeights" :key="row.key"><td><b>{{ row.name }}</b><small class="mono-expr">{{ row.expression }}</small></td><td>{{ row.mechanism }}</td><td>{{ row.direction>0?'+1':'-1' }}</td><td><b :class="winner?'green-text':'amber-text'">{{ pct(row.weight) }}</b></td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <div class="panel-title-row"><div><h2>训练与验证证据</h2><span class="sub">硬门槛先于综合分</span></div><span class="tag" :class="bestCandidate.all_rules_pass?'green':'red'">{{ bestCandidate.all_rules_pass?'全部通过':'存在失败' }}</span></div>
+          <div class="metric-strip combination-evidence">
+            <div class="metric-card"><span>验证净/主动年化</span><b>{{ pct(bestCandidate.validation?.ann_return) }}</b><small>训练 {{ pct(bestCandidate.training?.ann_return) }}</small></div>
+            <div class="metric-card"><span>验证Sharpe</span><b>{{ num(bestCandidate.validation?.sharpe) }}</b><small>最差年 {{ num(bestCandidate.validation?.worst_year_sharpe) }}</small></div>
+            <div class="metric-card"><span>Rank IC</span><b>{{ pct(bestCandidate.validation?.rank_ic_mean) }}</b><small>ICIR {{ num(bestCandidate.validation?.rank_icir) }}</small></div>
+            <div class="metric-card"><span>FDR q</span><b>{{ num(bestCandidate.validation?.rank_ic_fdr_q) }}</b><small>泛化差 {{ num(bestCandidate.generalization_gap) }}</small></div>
+          </div>
+          <div class="combination-rule-list"><div v-for="(passed,key) in bestCandidate.rules" :key="key"><span :class="passed?'ok':'no'">{{ passed?'✓':'✕' }}</span>{{ ruleLabel(key) }}</div></div>
+        </div>
+      </div>
+
+      <div v-if="current.result.rating" class="grid cols-2 combination-result-grid">
+        <div class="card">
+          <div class="panel-title-row"><div><h2>冻结评级：胜者</h2><span class="sub">向量筛选 + StepEvent逐事件复测</span></div><span class="tag green">账本 {{ current.result.rating.event?.integrity?.all_pass?'PASS':'FAIL' }}</span></div>
+          <div class="metric-strip combination-evidence">
+            <div class="metric-card"><span>向量主动/净年化</span><b>{{ pct(ratingMetric('ann')) }}</b></div>
+            <div class="metric-card"><span>向量Sharpe</span><b>{{ num(ratingMetric('sharpe')) }}</b></div>
+            <div class="metric-card"><span>步进总年化</span><b>{{ pct(current.result.rating.event?.ann_return) }}</b></div>
+            <div class="metric-card"><span>步进最大回撤</span><b>{{ pct(current.result.rating.event?.max_drawdown) }}</b></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="panel-title-row"><div><h2>等权全组件基准</h2><span class="sub">不参与搜索，只做诚实对照</span></div></div>
+          <div class="metric-strip combination-evidence">
+            <div class="metric-card"><span>步进总年化</span><b>{{ pct(current.result.equal_all_components_benchmark?.event?.ann_return) }}</b></div>
+            <div class="metric-card"><span>步进Sharpe</span><b>{{ num(current.result.equal_all_components_benchmark?.event?.sharpe) }}</b></div>
+            <div class="metric-card"><span>最大回撤</span><b>{{ pct(current.result.equal_all_components_benchmark?.event?.max_drawdown) }}</b></div>
+            <div class="metric-card"><span>执行成本</span><b>{{ money(current.result.equal_all_components_benchmark?.event?.total_execution_cost) }}</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card combination-finalists-card">
+        <div class="panel-title-row"><div><h2>验证候选榜</h2><span class="sub">按硬门槛、验证分、最差年度和Rank ICIR排序</span></div></div>
+        <div class="combination-table-wrap"><table><tr><th>#</th><th>来源</th><th>组合与权重</th><th>因子数</th><th>机制数</th><th>验证年化</th><th>Sharpe</th><th>最差年</th><th>Rank IC</th><th>ICIR</th><th>FDR q</th><th>泛化差</th><th>状态</th></tr>
+          <tr v-for="(row,index) in (current.result.finalists||[])" :key="index"><td>{{ index+1 }}</td><td>{{ row.source }}</td><td><span class="combination-weight-summary">{{ finalistWeightText(row) }}</span></td><td>{{ row.validation?.active_factors }}</td><td>{{ row.validation?.active_mechanisms }}</td><td>{{ pct(row.validation?.ann_return) }}</td><td>{{ num(row.validation?.sharpe) }}</td><td>{{ num(row.validation?.worst_year_sharpe) }}</td><td>{{ pct(row.validation?.rank_ic_mean) }}</td><td>{{ num(row.validation?.rank_icir) }}</td><td>{{ num(row.validation?.rank_ic_fdr_q) }}</td><td>{{ num(row.generalization_gap) }}</td><td><span class="tag" :class="row.all_rules_pass?'green':'red'">{{ row.all_rules_pass?'PASS':'REJECT' }}</span></td></tr>
+        </table></div>
+      </div>
+    </div>
+  </section>`,
+  setup() {
+    const capabilities = ref(null);
+    const library = ref([]);
+    const components = ref([]);
+    const history = ref([]);
+    const current = ref(null);
+    const factorQuery = ref("");
+    const selectedLibraryId = ref("");
+    const manualExpression = ref("");
+    const manualDirection = ref(1);
+    const addingManual = ref(false);
+    const creating = ref(false);
+    const error = ref("");
+    const form = reactive({
+      search_mode: "programmatic", portfolio_mode: "long_short",
+      min_factors: 2, max_factors: 5, min_mechanisms: 2,
+      coarse_step: 0.10, min_weight: 0.05, max_weight: 0.65,
+      max_mechanism_weight: 0.70, max_pair_correlation: 0.85,
+      path_budget: 3000, validation_budget: 250, universe_n: 500,
+      top_fraction: 0.20, horizon: 5, cost_bps: 15, stress_cost_bps: 50,
+      train_start: "2010-01-01", train_end: "2018-12-31",
+      validation_start: "2019-01-01", validation_end: "2022-12-31",
+      rating_start: "2023-01-01", rating_end: "2026-12-31",
+    });
+    let timer = null;
+
+    const filteredLibrary = computed(() => {
+      const q = factorQuery.value.trim().toLowerCase();
+      return library.value.filter(row => !q || `${row.name||''} ${row.expression||''}`.toLowerCase().includes(q)).slice(0,100);
+    });
+    const mechanismCount = computed(() => new Set(components.value.map(row => row.mechanism || "unknown")).size);
+    const validWindows = computed(() => form.train_start <= form.train_end && form.train_end < form.validation_start && form.validation_start <= form.validation_end && form.validation_end < form.rating_start && form.rating_start <= form.rating_end);
+    const canStart = computed(() => components.value.length >= 2 && components.value.length <= 12 && form.min_factors >= 2 && form.min_factors <= form.max_factors && form.max_factors <= components.value.length && mechanismCount.value >= form.min_mechanisms && validWindows.value && (form.search_mode !== "llm" || capabilities.value?.llm?.configured));
+    const progressPercent = computed(() => {
+      const p = current.value?.progress || {};
+      if (current.value?.status === "done") return 100;
+      return p.total ? Math.max(2, Math.min(99, 100 * Number(p.completed || 0) / Number(p.total))) : 2;
+    });
+    const winner = computed(() => current.value?.result?.winner || null);
+    const bestCandidate = computed(() => winner.value || current.value?.result?.finalists?.[0] || null);
+    const bestCandidateWeights = computed(() => {
+      const weights = bestCandidate.value?.weights || [];
+      const snapshot = current.value?.request_spec?.components || [];
+      return snapshot.map((row,index) => ({...row, weight:Number(weights[index]||0)})).filter(row => row.weight > 1e-10);
+    });
+
+    function finalistWeightText(candidate) {
+      const snapshot = current.value?.request_spec?.components || [];
+      const weights = candidate?.weights || [];
+      return snapshot
+        .map((row,index) => ({ name:row.name || row.key, weight:Number(weights[index] || 0) }))
+        .filter(row => row.weight > 1e-10)
+        .map(row => `${row.name} ${pct(row.weight)}`)
+        .join(" · ") || "—";
+    }
+    function ruleLabel(key) {
+      return ({
+        rank_ic_direction:"Rank IC方向一致",
+        rank_ic_fdr:"Rank IC多重检验",
+        worst_year_sharpe:"最差年度Sharpe",
+        positive_year_rate:"盈利年度比例",
+        stress_return:"压力成本收益",
+        minimum_mechanisms:"最少收益机制",
+      })[key] || key;
+    }
+
+    async function loadCapabilities() {
+      const q = appState.experimentId ? `?experiment_id=${appState.experimentId}` : "";
+      capabilities.value = await api(`/combination-experiments/capabilities${q}`, {cacheTtl:1000});
+      form.portfolio_mode = capabilities.value.portfolio_mode;
+    }
+    async function loadLibrary() {
+      const suffix = appState.experimentId ? `&experiment_id=${appState.experimentId}` : "";
+      const data = await api(`/factors?sort=grade${suffix}`, {cacheTtl:1000});
+      library.value = (data.factors || []).filter(row => row.expression);
+    }
+    async function loadHistory() {
+      const q = appState.experimentId ? `?experiment_id=${appState.experimentId}&limit=50` : "?limit=50";
+      const data = await api(`/combination-experiments${q}`, {cacheTtl:600});
+      history.value = data.experiments || [];
+      if (!current.value && history.value.length) await openExperiment(history.value[0].id);
+    }
+    function factorMechanism(row) {
+      return row.research_meta?.mechanism_family || row.fingerprint?.mechanism_family || row.public?.mechanism_family || "unknown";
+    }
+    function addLibraryFactor() {
+      const row = library.value.find(item => Number(item.id) === Number(selectedLibraryId.value));
+      if (!row || components.value.some(item => item.expression === row.expression)) return;
+      components.value.push({
+        key:`F${row.id}`, name:row.name || `Factor ${row.id}`, expression:row.expression,
+        direction:Number(row.research_meta?.direction || 1), mechanism:factorMechanism(row),
+        source:"factor_library", source_ref:`factor_id=${row.id}`,
+      });
+      selectedLibraryId.value = "";
+      form.max_factors = Math.min(5, components.value.length);
+      form.min_mechanisms = Math.min(2, mechanismCount.value);
+    }
+    async function addManualFactor() {
+      addingManual.value = true; error.value = "";
+      try {
+        const inspected = await api("/dsl/inspect", {method:"POST", body:{expression:manualExpression.value.trim(), experiment_id:appState.experimentId}});
+        if (components.value.some(item => item.expression === manualExpression.value.trim())) throw new Error("该表达式已经在候选池中");
+        const sequence = components.value.filter(row => row.source === "manual").length + 1;
+        components.value.push({
+          key:`M${String(sequence).padStart(2,"0")}`, name:`手工因子 ${sequence}`,
+          expression:manualExpression.value.trim(), direction:Number(manualDirection.value),
+          mechanism:inspected.mechanism_family || "unknown", source:"manual", source_ref:"",
+        });
+        manualExpression.value = "";
+        form.max_factors = Math.min(5, components.value.length);
+        form.min_mechanisms = Math.min(2, mechanismCount.value);
+      } catch (e) { error.value = e.message; }
+      finally { addingManual.value = false; }
+    }
+    function removeComponent(index) {
+      components.value.splice(index,1);
+      form.max_factors = Math.min(form.max_factors, components.value.length);
+      form.min_factors = Math.min(form.min_factors, Math.max(2,components.value.length));
+      form.min_mechanisms = Math.min(form.min_mechanisms, Math.max(1,mechanismCount.value));
+    }
+    async function startExperiment() {
+      creating.value = true; error.value = "";
+      try {
+        const body = {
+          ...JSON.parse(JSON.stringify(form)),
+          name:`${form.search_mode==='llm'?'LLM协作':'程序化'}组合 ${new Date().toLocaleString("zh-CN",{hour12:false})}`,
+          experiment_id:appState.experimentId,
+          market:capabilities.value?.market,
+          panel_glob:capabilities.value?.panel_glob,
+          components:components.value,
+          start:true,
+        };
+        current.value = await api("/combination-experiments", {method:"POST", body});
+        await loadHistory();
+      } catch (e) { error.value = e.message; }
+      finally { creating.value = false; }
+    }
+    async function openExperiment(id) {
+      try { current.value = await api(`/combination-experiments/${id}`, {cacheTtl:0}); }
+      catch (e) { error.value = e.message; }
+    }
+    async function stopExperiment() {
+      if (!current.value) return;
+      await api(`/combination-experiments/${current.value.id}/stop`, {method:"POST"});
+      await openExperiment(current.value.id);
+    }
+    async function refresh() {
+      if (current.value?.id && ["queued","running"].includes(current.value.status)) await openExperiment(current.value.id);
+      if (!current.value?.id || current.value.status === "done" || current.value.status === "error" || current.value.status === "stopped") await loadHistory();
+    }
+    function pct(value) { return value == null ? "—" : `${(Number(value)*100).toFixed(2)}%`; }
+    function num(value) { return value == null ? "—" : Number(value).toFixed(3); }
+    function money(value) { return value == null ? "—" : Number(value).toLocaleString("zh-CN",{maximumFractionDigits:0}); }
+    function formatTime(value) { return value ? new Date(value).toLocaleString("zh-CN",{hour12:false}) : "—"; }
+    function statusClass(value) { return value === "done" ? "green" : value === "error" || value === "stopped" ? "red" : "amber"; }
+    function decisionClass(value) { return value === "PASS" ? "pass" : value === "NO_COMBINATION" ? "reject" : "research"; }
+    function scenarioAt(replay) {
+      const scenarios = replay?.vector || {};
+      return scenarios[String(Number(current.value?.request_spec?.cost_bps || form.cost_bps))] || scenarios[String(parseInt(current.value?.request_spec?.cost_bps || form.cost_bps))] || Object.values(scenarios)[0] || {};
+    }
+    function ratingMetric(key) {
+      const scenario = scenarioAt(current.value?.result?.rating);
+      const longOnly = current.value?.request_spec?.portfolio_mode === "long_only";
+      if (key === "ann") return longOnly ? scenario.active_ann_return : scenario.ann_return;
+      if (key === "sharpe") return longOnly ? scenario.active_sharpe : scenario.sharpe;
+      return null;
+    }
+    async function initialise() {
+      error.value = "";
+      try { await Promise.all([loadCapabilities(), loadLibrary()]); await loadHistory(); }
+      catch (e) { error.value = e.message; }
+    }
+    watch(() => appState.experimentVersion, () => {
+      current.value=null; history.value=[]; components.value=[]; initialise();
+    });
+    onActivated(() => { initialise(); clearInterval(timer); timer=setInterval(refresh,3000); });
+    onDeactivated(() => clearInterval(timer));
+    onUnmounted(() => clearInterval(timer));
+    return {
+      appState, capabilities, library, components, history, current, factorQuery,
+      selectedLibraryId, manualExpression, manualDirection, addingManual, creating,
+      error, form, filteredLibrary, mechanismCount, validWindows, canStart,
+      progressPercent, winner, bestCandidate, bestCandidateWeights, finalistWeightText, ruleLabel,
+      addLibraryFactor, addManualFactor,
+      removeComponent, startExperiment, stopExperiment, openExperiment, loadHistory,
+      pct, num, money, formatTime, statusClass, decisionClass, ratingMetric,
+    };
+  },
+};
+
+/* ============ Important Research Documents ============ */
+const ResearchDocumentsView = {
+  template: `
+  <section class="documents-page">
+    <div class="documents-heading">
+      <div><div class="eyebrow">VERSIONED RESEARCH CONCLUSIONS / READ-ONLY ARCHIVE</div><h1>重要研究文档</h1><p>保存经过整理的关键研究结论。HTML报告与原始实验工件分离、按版本登记，不覆盖历史结论。</p></div>
+      <div class="documents-heading-actions"><span class="tag blue">{{ documents.length }} 份文档</span><button class="btn" @click="loadDocuments" :disabled="loading">{{ loading?'刷新中…':'刷新目录' }}</button></div>
+    </div>
+    <div v-if="error" class="selector-error">{{ error }}</div>
+    <div class="documents-layout">
+      <aside class="documents-sidebar card">
+        <div class="documents-search"><input v-model="query" placeholder="搜索标题、摘要或标签"></div>
+        <div v-if="!filteredDocuments.length && !loading" class="combination-empty">当前目录没有匹配文档。</div>
+        <button v-for="doc in filteredDocuments" :key="doc.slug" class="document-list-item" :class="{active:current?.slug===doc.slug}" @click="openDocument(doc)">
+          <span class="document-list-meta"><i>{{ doc.category }}</i><time>{{ doc.updated_at }}</time></span>
+          <b>{{ doc.title }}</b>
+          <small>{{ doc.summary }}</small>
+          <span class="document-tags"><em v-for="tag in doc.tags" :key="tag">{{ tag }}</em></span>
+        </button>
+      </aside>
+      <main class="document-reader card">
+        <template v-if="current">
+          <div class="document-reader-head">
+            <div><div class="eyebrow">{{ current.category }} · {{ current.status }}</div><h2>{{ current.title }}</h2><p>{{ current.subtitle }}</p></div>
+            <div><a class="btn" :href="current.html_url" target="_blank" rel="noopener">新窗口阅读</a></div>
+          </div>
+          <div class="document-integrity"><span>更新 {{ current.updated_at }}</span><span>{{ fileSize(current.size_bytes) }}</span><span>SHA256 {{ String(current.sha256||'').slice(0,16) }}</span></div>
+          <iframe class="document-frame" :key="current.sha256" :src="current.html_url" :title="current.title"></iframe>
+        </template>
+        <div v-else class="document-reader-empty"><h2>选择一份研究文档</h2><p>目录中的HTML报告将在这里以只读方式打开。</p></div>
+      </main>
+    </div>
+  </section>`,
+  setup() {
+    const documents = ref([]);
+    const current = ref(null);
+    const query = ref("");
+    const loading = ref(false);
+    const error = ref("");
+    const filteredDocuments = computed(() => {
+      const needle = query.value.trim().toLowerCase();
+      if (!needle) return documents.value;
+      return documents.value.filter(doc => `${doc.title} ${doc.subtitle} ${doc.summary} ${(doc.tags||[]).join(" ")}`.toLowerCase().includes(needle));
+    });
+    async function loadDocuments() {
+      loading.value = true; error.value = "";
+      try {
+        const data = await api("/research-documents", {cacheTtl:0});
+        documents.value = (data.documents || []).filter(doc => doc.available);
+        if (!current.value || !documents.value.some(doc => doc.slug === current.value.slug)) current.value = documents.value[0] || null;
+        else current.value = documents.value.find(doc => doc.slug === current.value.slug) || null;
+      } catch (e) { error.value = e.message; }
+      finally { loading.value = false; }
+    }
+    function openDocument(doc) { current.value = doc; }
+    function fileSize(value) {
+      const bytes = Number(value || 0);
+      if (!bytes) return "—";
+      return bytes < 1024 * 1024 ? `${(bytes/1024).toFixed(1)} KB` : `${(bytes/1024/1024).toFixed(1)} MB`;
+    }
+    onActivated(loadDocuments);
+    return {documents,current,query,loading,error,filteredDocuments,loadDocuments,openDocument,fileSize};
+  },
+};
+
 /* ============ App ============ */
 const App = {
-  components: { Dashboard, ResearchTree, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView, ObservabilityView, LeaderboardsView },
+  components: { Dashboard, ResearchTree, ResearchRecordsView, FactorLibrary, FactorLibraryWorkbench, BacktestView, SettingsView, ExperimentsView, ObservabilityView, LeaderboardsView, FactorToolsView, CombinationLabView, ResearchDocumentsView },
   template: `
   <div class="topbar">
     <div class="logo">⚒ FactorFactory</div>
@@ -1881,7 +2749,7 @@ const App = {
   </div>
   <div class="main" :class="{'main-report-view': tab==='leaderboards'}">
     <div v-if="appState.switching" class="task-switch-overlay"><div class="loading-ring"></div><span>正在切换任务上下文</span></div>
-    <KeepAlive :max="9"><component :is="activeComponent" :key="tab" /></KeepAlive>
+    <KeepAlive :max="12"><component :is="activeComponent" :key="tab" /></KeepAlive>
   </div>`,
   setup() {
     const savedTab = localStorage.getItem("factorfactory.tab");
@@ -1889,7 +2757,7 @@ const App = {
     appState.activeTab = tab.value;
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
-      { id: "factors", label: "因子库" }, { id: "leaderboards", label: "榜单" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
+      { id: "records", label: "研究记录" }, { id: "factors", label: "因子库" }, { id: "leaderboards", label: "榜单" }, { id: "tools", label: "因子工具" }, { id: "combinations", label: "组合优化" }, { id: "documents", label: "文档" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
       { id: "exps", label: "实验" }, { id: "diagnostics", label: "诊断" }, { id: "settings", label: "设置" },
     ];
     const engState = ref("…");
@@ -1897,8 +2765,8 @@ const App = {
     const tabsEl = ref(null);
     let timer = null, polling = false;
     const activeComponent = computed(() => ({
-      dash: Dashboard, tree: ResearchTree, factors: FactorLibraryWorkbench,
-      leaderboards: LeaderboardsView, screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
+      dash: Dashboard, tree: ResearchTree, records: ResearchRecordsView, factors: FactorLibraryWorkbench,
+      leaderboards: LeaderboardsView, tools: FactorToolsView, combinations: CombinationLabView, documents: ResearchDocumentsView, screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
       diagnostics: ObservabilityView, settings: SettingsView,
     })[tab.value] || Dashboard);
     async function poll() {
@@ -1933,6 +2801,11 @@ const App = {
         ?.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
     watch(tab, () => nextTick(revealActiveTab), { flush: "post" });
+    watch(() => appState.requestedTab, id => {
+      if (!id) return;
+      selectTab(id);
+      appState.requestedTab = null;
+    });
     onMounted(() => {
       poll();
       loadExps();

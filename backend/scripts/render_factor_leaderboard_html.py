@@ -224,6 +224,13 @@ def _presentation(
         scenario_engine == "vector_screen"
         or "vector_screen" in protocol_id
     )
+    external_source = (
+        snapshot.get("candidate_source_kind")
+        == "external_sqlite_factor_pool"
+    )
+    source_label = str(
+        snapshot.get("candidate_source_label") or "外部因子库"
+    )
     if vector_screen:
         common = {
             "market": market,
@@ -242,13 +249,23 @@ def _presentation(
                     "market_label": "美股",
                     "mode_label": "纯多头",
                     "title": (
-                        "FactorFactory · 美股纯多向量筛选与事件复核榜"
+                        "FactorFactory · 美股"
+                        + (
+                            f"纯多·{source_label}"
+                            if external_source
+                            else "纯多"
+                        )
+                        + "向量筛选与事件复核榜"
                     ),
                     "eyebrow": (
                         "US long-only vector screen · "
                         "top-3 step-event verification"
                     ),
-                    "heading_html": "美股纯多因子<br>向量筛选与事件复核榜",
+                    "heading_html": (
+                        f"美股纯多·{source_label}<br>向量筛选与事件复核榜"
+                        if external_source
+                        else "美股纯多因子<br>向量筛选与事件复核榜"
+                    ),
                     "description": (
                         "以 2020 年至最新交易日的完整窗口，对每个可迁移"
                         "量价 DSL 强制测试正反两个方向；全库使用向量引擎"
@@ -276,12 +293,21 @@ def _presentation(
             return common | {
                 "market_label": "美股",
                 "mode_label": "多空",
-                "title": "FactorFactory · 美股多空向量筛选与事件复核榜",
+                "title": (
+                    f"FactorFactory · 美股多空·{source_label}"
+                    "向量筛选与事件复核榜"
+                    if external_source
+                    else "FactorFactory · 美股多空向量筛选与事件复核榜"
+                ),
                 "eyebrow": (
                     "US long-short vector screen · "
                     "top-3 step-event verification"
                 ),
-                "heading_html": "美股多空因子<br>向量筛选与事件复核榜",
+                "heading_html": (
+                    f"美股多空·{source_label}<br>向量筛选与事件复核榜"
+                    if external_source
+                    else "美股多空因子<br>向量筛选与事件复核榜"
+                ),
                 "description": (
                     "以 2020 年至最新交易日的完整窗口，对每个可迁移"
                     "量价 DSL 强制测试正反两个方向；全库使用向量引擎"
@@ -310,11 +336,20 @@ def _presentation(
         return common | {
             "market_label": "A股",
             "mode_label": "纯多头",
-            "title": "FactorFactory · A股全任务向量筛选与事件复核榜",
+            "title": (
+                f"FactorFactory · A股{source_label}"
+                "向量筛选与事件复核榜"
+                if external_source
+                else "FactorFactory · A股全任务向量筛选与事件复核榜"
+            ),
             "eyebrow": (
                 "A-share vector screen · top-3 step-event verification"
             ),
-            "heading_html": "A股全任务因子<br>向量筛选与事件复核榜",
+            "heading_html": (
+                f"A股{source_label}<br>向量筛选与事件复核榜"
+                if external_source
+                else "A股全任务因子<br>向量筛选与事件复核榜"
+            ),
             "description": (
                 "以 2020 年至最新交易日的完整窗口，对全部历史 DSL"
                 "强制测试正反两个方向；全库使用向量引擎比较 "

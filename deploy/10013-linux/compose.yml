@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: factorfactory-10013-postgres
+    restart: unless-stopped
+    env_file:
+      - .postgres.env
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - factorfactory_10013_pgdata:/var/lib/postgresql/data
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factorfactory -d factor_factory"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/10013-linux/Dockerfile
+    image: factorfactory-10013:full-llm-v1
+    container_name: factorfactory-10013-app
+    restart: unless-stopped
+    env_file:
+      - .runtime.env
+    ports:
+      - "0.0.0.0:10013:10013"
+    volumes:
+      - ../../data:/data:ro
+      - ../../var:/app/var
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  factorfactory_10013_pgdata:
+    name: factorfactory_10013_pgdata

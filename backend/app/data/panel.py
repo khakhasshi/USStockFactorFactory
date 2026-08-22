@@ -42,11 +42,19 @@ class PanelStore:
     _instances: dict[str, "PanelStore"] = {}
     _registry_lock = threading.Lock()
 
-    def __init__(self, panel_glob: str | None = None, market: str | None = None) -> None:
+    def __init__(
+        self,
+        panel_glob: str | None = None,
+        market: str | None = None,
+        factor_fields: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         self.df: pl.DataFrame | None = None
         self.trading_dates: list[date] = []
         self.load_error: str = ""
         self.market = market or os.environ.get("FF_MARKET", "us")
+        self.factor_fields = tuple(sorted(set(
+            factor_fields or get_dsl_fields(self.market)
+        )))
         # An explicitly requested market must never inherit the process-wide
         # panel.  The single-port service normally boots with FF_MARKET=us,
         # while A-share backtests are selected per task at request time.
@@ -88,8 +96,16 @@ class PanelStore:
         self._inventory_cached_at = 0.0
 
     @classmethod
-    def get(cls, panel_glob: str | None = None, market: str | None = None) -> "PanelStore":
+    def get(
+        cls,
+        panel_glob: str | None = None,
+        market: str | None = None,
+        factor_fields: list[str] | tuple[str, ...] | None = None,
+    ) -> "PanelStore":
         resolved_market = market or os.environ.get("FF_MARKET", "us")
+        resolved_fields = tuple(sorted(set(
+            factor_fields or get_dsl_fields(resolved_market)
+        )))
         resolved_glob = (
             panel_glob
             or (
@@ -99,10 +115,15 @@ class PanelStore:
                 or default_panel_glob(resolved_market)
             )
         )
-        key = f"{resolved_market}::{resolved_glob}"
+        fields_key = ",".join(resolved_fields)
+        key = f"{resolved_market}::{resolved_glob}::{fields_key}"
         with cls._registry_lock:
             if key not in cls._instances:
-                cls._instances[key] = cls(resolved_glob, resolved_market)
+                cls._instances[key] = cls(
+                    resolved_glob,
+                    resolved_market,
+                    resolved_fields,
+                )
             return cls._instances[key]
 
     def ensure_loaded(self) -> pl.DataFrame:
@@ -218,20 +239,16 @@ class PanelStore:
         lf = pl.scan_parquet(panel_glob, hive_partitioning=True)
         base_cols = [
             "trade_date", "ts_code", "name", "open", "high", "low", "close",
-            "vol", "amount", "raw_open", "raw_close",
+            "vol", "amount", "raw_open", "raw_high", "raw_low", "raw_close",
         ]
-        # 额外字段: A股估值/市值/流动性/资金流向 (按存在性自适应)
-        extra_fields = [
-            "pe_ttm", "pb", "ps_ttm", "dv_ttm",
-            "total_mv", "circ_mv",
-            "turnover_rate", "volume_ratio",
-            "net_mf_amount", "buy_lg_amount", "sell_lg_amount",
-            "buy_elg_amount", "sell_elg_amount",
-            "float_share",
-        ]
+        # Normal service instances keep the native task whitelist.  External
+        # frozen-library workers can request a larger, explicit field set;
+        # those fields become part of the PanelStore cache identity and do not
+        # silently broaden the live research grammar.
+        extra_fields = list(self.factor_fields)
         # 质量过滤列: 按存在性自适应
         available = set(lf.collect_schema().names())
-        expected = set(get_dsl_fields(self.market)) | REQUIRED_PANEL_COLUMNS
+        expected = set(self.factor_fields) | REQUIRED_PANEL_COLUMNS
         missing = sorted(expected - available)
         if missing:
             raise ValueError(
@@ -246,12 +263,12 @@ class PanelStore:
             "can_buy_open_proxy", "can_sell_open_proxy",
             "up_limit", "down_limit", "adjustment_factor", "adj_factor",
         ]
-        cols = (
+        cols = list(dict.fromkeys(
             [column for column in base_cols if column in available]
             + [f for f in extra_fields if f in available]
             + [f for f in execution_fields if f in available]
             + quality_cols
-        )
+        ))
 
         lf = lf.select(cols)
         # 逐列过滤 (不存在的列跳过)
@@ -260,6 +277,10 @@ class PanelStore:
         lf = lf.drop(quality_cols) if quality_cols else lf
         if "raw_open" not in cols:
             lf = lf.with_columns(pl.col("open").alias("raw_open"))
+        if "raw_high" not in cols:
+            lf = lf.with_columns(pl.col("high").alias("raw_high"))
+        if "raw_low" not in cols:
+            lf = lf.with_columns(pl.col("low").alias("raw_low"))
         if "raw_close" not in cols:
             lf = lf.with_columns(pl.col("close").alias("raw_close"))
         if "adjustment_factor" not in cols:

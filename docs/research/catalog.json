@@ -1,0 +1,29 @@
+{
+  "schema": "factorfactory.research-documents/v1",
+  "documents": [
+    {
+      "slug": "ashare-four-top100-return-sources-20260822",
+      "file": "ashare-four-top100-return-sources-20260822.html",
+      "title": "A股四榜Top100收益来源与稳定性报告",
+      "subtitle": "400个榜位统一回放、收益路径去重、跨榜归因与三阶段稳定性审计",
+      "summary": "对内部两榜及外部A股/美股来源榜各Top100进行固定方向回放，区分88个相关簇、13.65个有效来源及7个下一轮研究袖套。",
+      "category": "因子研究",
+      "status": "research_only_full_window_diagnostic",
+      "published_at": "2026-08-22",
+      "updated_at": "2026-08-22",
+      "tags": ["A股", "四榜Top100", "收益来源", "去重", "稳定性", "RESEARCH_ONLY"]
+    },
+    {
+      "slug": "us-seven-return-source-representatives-20260822",
+      "file": "us-seven-return-source-representatives-20260822.html",
+      "title": "美股七个收益来源代表因子研究报告",
+      "subtitle": "四榜Top100去重、六袖套归因、两轮组合实验与程序化优化复核",
+      "summary": "冻结七个代表因子的方向、表达式、聚类来源和组合证据；明确七因子实际对应六个收益袖套，并记录最新验证失败。",
+      "category": "因子研究",
+      "status": "audited_research_conclusion",
+      "published_at": "2026-08-22",
+      "updated_at": "2026-08-22",
+      "tags": ["美股", "多因子", "收益来源", "去重", "稳定性", "NO_COMBINATION"]
+    }
+  ]
+}

@@ -119,6 +119,18 @@ def _report_record(
     mode = str(protocol.get("portfolio_mode") or spec.get("mode") or "unknown")
     market_label = {"ashare": "A股", "us": "美股"}.get(market, market)
     mode_label = {"long_only": "纯多", "long_short": "多空"}.get(mode, mode)
+    candidate_source_kind = str(
+        protocol.get("candidate_source_kind") or "internal_research"
+    )
+    candidate_source_label = str(
+        protocol.get("candidate_source_label") or ""
+    )
+    source_title = (
+        f" · {candidate_source_label}"
+        if candidate_source_kind == "external_sqlite_factor_pool"
+        and candidate_source_label
+        else ""
+    )
 
     ranking_window = protocol.get("ranking_window")
     if not isinstance(ranking_window, dict):
@@ -146,12 +158,17 @@ def _report_record(
     record = {
         "id": report_id,
         "directory_name": report_dir.name,
-        "title": f"{market_label} · {mode_label} · {protocol_label}",
+        "title": (
+            f"{market_label} · {mode_label} · {protocol_label}"
+            f"{source_title}"
+        ),
         "market": market,
         "market_label": market_label,
         "mode": mode,
         "mode_label": mode_label,
         "protocol": protocol_id,
+        "candidate_source_kind": candidate_source_kind,
+        "candidate_source_label": candidate_source_label or None,
         "protocol_label": protocol_label,
         "version_kind": version_kind,
         "description": description,

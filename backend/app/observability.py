@@ -1243,6 +1243,17 @@ def build_findings(snapshot: dict) -> list[dict]:
             ),
             "在 LLM 调用审计中按 role/phase 查看脱敏错误，并确认 provider、网络和返回 JSON。",
         )
+    if int(calls.get("semantic_rejections_1h") or 0) > 0:
+        add(
+            "info",
+            "recent_llm_semantic_rejections",
+            "最近一小时存在 LLM 候选语义拒绝",
+            (
+                f"{calls.get('semantic_rejections_1h')} / "
+                f"{calls.get('calls_1h', 0)} 次响应包含格式、机制或新颖性拒绝"
+            ),
+            "这是候选质量控制而非网络故障；按 validation_error 优化提示词或模型。",
+        )
     coverage = pipeline.get("feedback_coverage") or {}
     if (
         int(coverage.get("nodes_total") or 0) > 0

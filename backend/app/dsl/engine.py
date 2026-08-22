@@ -7,6 +7,7 @@
 
 import ast
 import hashlib
+import math
 import re
 
 import polars as pl
@@ -14,6 +15,8 @@ import polars as pl
 from ..config import DSL_FIELDS
 
 _BY_CODE = {"partition_by": "ts_code", "order_by": "trade_date"}
+MAX_EXPRESSION_LENGTH = 4000
+MAX_EXPRESSION_AST_NODES = 1000
 
 
 def _ts(expr: pl.Expr) -> pl.Expr:
@@ -31,9 +34,30 @@ def _rolling_corr(x: pl.Expr, y: pl.Expr, w: int) -> pl.Expr:
 
 
 def _win(node_w: ast.expr) -> int:
-    if not (isinstance(node_w, ast.Constant) and isinstance(node_w.value, int) and 1 <= node_w.value <= 250):
-        raise ValueError("窗口参数必须是 1..250 的整数字面量")
+    # The native research grammar advertises 1..250 to the search agents.
+    # Historical AutoAlpha libraries also contain conventional 251/252-session
+    # one-year windows.  Accept those two compatibility values without
+    # broadening the generated-search prompt or permitting arbitrary history.
+    if not (
+        isinstance(node_w, ast.Constant)
+        and isinstance(node_w.value, int)
+        and 1 <= node_w.value <= 252
+    ):
+        raise ValueError("窗口参数必须是 1..252 的整数字面量")
     return node_w.value
+
+
+def _number(node: ast.expr, *, name: str) -> float:
+    if not (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    ):
+        raise ValueError(f"{name}必须是数值字面量")
+    value = float(node.value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name}必须是有限数值")
+    return value
 
 
 OPERATORS_DOC = {
@@ -44,11 +68,13 @@ OPERATORS_DOC = {
     "ts_max(x, w)": "w 日滚动最大",
     "ts_rank(x, w)": "当前值在过去 w 日中的分位",
     "ts_delta(x, w)": "x - delay(x, w)",
+    "returns(x, w)": "x / delay(x, w) - 1",
     "ts_corr(x, y, w)": "w 日滚动相关系数",
     "delay(x, d)": "滞后 d 日",
     "rank(x)": "当日截面百分位排名",
     "zscore(x)": "当日截面 zscore",
     "winsor(x)": "当日截面 2.5 倍标准差截尾",
+    "winsor_mad(x, threshold)": "当日截面 threshold 倍 MAD 截尾",
     "log(x)": "log(|x|+1e-9)",
     "abs(x)": "绝对值",
     "sign(x)": "符号",
@@ -131,6 +157,12 @@ class _Builder:
         if fn == "delay":
             arity(2)
             return self._mat(_ts(self.build(a[0]).shift(_win(a[1]))))
+        if fn == "returns":
+            arity(2)
+            periods = _win(a[1])
+            x = self.build(a[0])
+            lagged = self._mat(_ts(x.shift(periods)))
+            return self._mat(x / (lagged + 1e-12) - 1.0)
         if fn in ("ts_mean", "ts_std", "ts_sum", "ts_min", "ts_max"):
             arity(2)
             w = _win(a[1])
@@ -182,6 +214,22 @@ class _Builder:
             x = self.build(a[0])
             m, s = x.mean().over("trade_date"), x.std().over("trade_date")
             return self._mat(x.clip(m - 2.5 * s, m + 2.5 * s))
+        if fn == "winsor_mad":
+            arity(2)
+            threshold = _number(a[1], name="winsor_mad threshold")
+            if not 0 < threshold <= 20:
+                raise ValueError("winsor_mad threshold 必须在 (0, 20] 内")
+            x = self.build(a[0])
+            median = self._mat(x.median().over("trade_date"))
+            mad = self._mat(
+                (x - median).abs().median().over("trade_date") * 1.4826
+            )
+            return self._mat(
+                x.clip(
+                    median - threshold * mad,
+                    median + threshold * mad,
+                )
+            )
         raise ValueError(f"未知算子: {fn}")
 
 
@@ -198,9 +246,14 @@ def _degenerate_check(root: ast.expr) -> None:
 
 def parse(expression: str, fields: list[str] | None = None) -> FactorPipeline:
     """解析 DSL 表达式为 FactorPipeline; 非法即抛 ValueError."""
-    if len(expression) > 500:
-        raise ValueError("表达式过长")
+    if len(expression) > MAX_EXPRESSION_LENGTH:
+        raise ValueError(f"表达式过长（最大 {MAX_EXPRESSION_LENGTH} 字符）")
     tree = ast.parse(expression, mode="eval")
+    node_count = sum(1 for _ in ast.walk(tree))
+    if node_count > MAX_EXPRESSION_AST_NODES:
+        raise ValueError(
+            f"表达式结构过于复杂（最大 {MAX_EXPRESSION_AST_NODES} 个语法节点）"
+        )
     _degenerate_check(tree.body)
     b = _Builder(fields)
     final = b.build(tree.body)
@@ -231,7 +284,7 @@ def _history_for_node(node: ast.expr) -> int:
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         fn = node.func.id
         child = max((_history_for_node(arg) for arg in node.args if not isinstance(arg, ast.Constant)), default=1)
-        if fn == "delay" and len(node.args) == 2:
+        if fn in {"delay", "returns"} and len(node.args) == 2:
             return child + _win(node.args[1])
         if fn in {"ts_mean", "ts_std", "ts_sum", "ts_min", "ts_max", "ts_rank", "ts_delta"} \
                 and len(node.args) == 2:
@@ -293,6 +346,11 @@ def _latex_for_node(node: ast.expr, parent_precedence: int = 0) -> str:
             return rf"\operatorname{{ZScore}}_{{cs}}\left({rendered[0]}\right)"
         if fn == "winsor":
             return rf"\operatorname{{Winsor}}_{{2.5\sigma}}\left({rendered[0]}\right)"
+        if fn == "winsor_mad":
+            return (
+                rf"\operatorname{{WinsorMAD}}_{{{rendered[1]}}}"
+                rf"\left({rendered[0]}\right)"
+            )
         if fn == "log":
             return rf"\log\left(\left|{rendered[0]}\right|+\epsilon\right)"
         if fn == "abs":
@@ -301,6 +359,8 @@ def _latex_for_node(node: ast.expr, parent_precedence: int = 0) -> str:
             return rf"\operatorname{{sgn}}\left({rendered[0]}\right)"
         if fn == "delay":
             return rf"\operatorname{{Delay}}_{{{rendered[1]}}}\left({rendered[0]}\right)"
+        if fn == "returns":
+            return rf"\operatorname{{Return}}_{{{rendered[1]}}}\left({rendered[0]}\right)"
         if fn == "ts_delta":
             return rf"\Delta_{{{rendered[1]}}}\left({rendered[0]}\right)"
         if fn == "ts_corr":
@@ -339,9 +399,24 @@ def expression_profile(expression: str) -> dict:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             operators.append(node.func.id)
-            for arg in node.args[1:]:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
-                    windows.append(arg.value)
+            if node.func.id in {
+                "delay",
+                "returns",
+                "ts_mean",
+                "ts_std",
+                "ts_sum",
+                "ts_min",
+                "ts_max",
+                "ts_rank",
+                "ts_delta",
+                "ts_corr",
+            }:
+                for arg in node.args[1:]:
+                    if (
+                        isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, int)
+                    ):
+                        windows.append(arg.value)
         elif isinstance(node, ast.Name) and not isinstance(getattr(node, "ctx", None), ast.Load):
             fields.append(node.id)
         elif isinstance(node, ast.Name):

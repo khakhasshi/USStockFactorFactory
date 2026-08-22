@@ -18,7 +18,12 @@ from app.config import (
     get_dsl_fields,
 )
 from app.dsl.engine import parse, validate
-from app.eval.harness import _prepare_daily, evaluate, evaluate_full
+from app.eval.harness import (
+    FROZEN_RATING_LAYER,
+    _prepare_daily,
+    evaluate,
+    evaluate_full,
+)
 from app.miner.agent import _build_system_prompt
 from app.config import DEFAULT_MINER_TEMPLATE
 
@@ -139,7 +144,7 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertIn("active", result["public"])
         self.assertIn("cost_stress", result["gate"])
 
-    def test_full_audit_has_four_layers_and_lifecycle(self):
+    def test_full_audit_has_four_isolation_layers_plus_2020_latest_rating(self):
         with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):
             result = evaluate_full(
                 "rank(close)",
@@ -152,7 +157,10 @@ class EvaluationV3Tests(unittest.TestCase):
                 market="ashare",
                 evaluation_overrides={"target_capital": 100_000.0},
             )
-        self.assertEqual(set(result["layers"]), {"public", "gate", "holdout", "vault"})
+        self.assertEqual(
+            set(result["layers"]),
+            {"public", "gate", "holdout", "vault", "rating"},
+        )
         self.assertTrue(result["eligibility"]["research_pass"])
         self.assertTrue(result["eligibility"]["holdout_pass"])
         self.assertTrue(result["eligibility"]["vault_pass"])
@@ -162,6 +170,20 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertIsNotNone(result["ranking"]["score"])
         self.assertIn("return_confidence", result["holdout"])
         self.assertGreater(result["holdout"]["cost_cushion_multiple"], 1.0)
+        self.assertEqual(result["rating"]["window_start"], "2020-01-01")
+        self.assertEqual(
+            result["rating"]["window_end"],
+            str(self.frame["trade_date"].max()),
+        )
+        self.assertEqual(
+            result["ranking"]["rating_window"]["end"],
+            str(self.frame["trade_date"].max()),
+        )
+        self.assertFalse(
+            result["ranking"]["rating_window"]["independent_out_of_sample"]
+        )
+        self.assertIsNone(result["ranking"]["score_pre_vault"])
+        self.assertIsNotNone(result["ranking"]["score_frozen_rating"])
 
     def test_long_short_reports_separate_legs_and_borrow(self):
         with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):
@@ -298,6 +320,31 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertEqual(daily.height, 2)
         self.assertAlmostEqual(float(daily["turnover"][0]), 1.0, places=6)
         self.assertAlmostEqual(float(daily["turnover"][1]), 2.0, places=6)
+
+    def test_rating_date_window_includes_latest_rows_outside_declared_layers(self):
+        latest = self.frame["trade_date"].max()
+        frame = self.frame.with_columns(
+            pl.when(pl.col("trade_date") == latest)
+            .then(pl.lit("NONE"))
+            .otherwise(pl.col("layer"))
+            .alias("layer")
+        )
+        with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(frame)):
+            daily, _ = _prepare_daily(
+                "rank(close)",
+                universe_n=100,
+                horizon=1,
+                portfolio_mode="long_only",
+                direction=1,
+                panel_glob="synthetic",
+                market="ashare",
+                layers=[],
+                cfg=evaluation_config("ashare"),
+                date_window=("2020-01-01", None),
+                layer_name_override=FROZEN_RATING_LAYER,
+            )
+        self.assertEqual(daily["trade_date"].max(), latest)
+        self.assertEqual(daily["layer"].unique().to_list(), [FROZEN_RATING_LAYER])
 
     def test_llm_prompt_receives_long_only_and_dual_direction_policy(self):
         prompt = _build_system_prompt(

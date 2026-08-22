@@ -5,20 +5,31 @@ Provider 配置存于 settings 表 key='llm_providers':
  "inner_provider": "...", "outer_provider": "..."}
 """
 
-import json
+import asyncio
 import hashlib
+import json
 import logging
+import os
 import time
 from typing import Any
 
 import httpx
 
-TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+REQUEST_TIMEOUT_SECONDS = max(
+    30.0,
+    float(os.environ.get("FF_LLM_TIMEOUT_SECONDS", "420")),
+)
+MAX_ATTEMPTS = max(1, int(os.environ.get("FF_LLM_MAX_ATTEMPTS", "2")))
+TIMEOUT = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=20.0)
 logger = logging.getLogger("llm.audit")
 
 
 class LLMError(Exception):
     pass
+
+
+class LLMTransportError(LLMError):
+    """Retryable provider-side or network failure."""
 
 
 class AuditedText(str):
@@ -173,85 +184,114 @@ async def chat(
         raise LLMError(error)
 
     output = ""
-    error = ""
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            if fmt == "anthropic":
-                url = (
-                    f"{base}/v1/messages"
-                    if not base.endswith("/v1")
-                    else f"{base}/messages"
-                )
-                resp = await client.post(
-                    url,
-                    headers={
-                        "x-api-key": key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json={
-                        "model": model,
-                        "max_tokens": 1800,
-                        "temperature": temperature,
-                        "system": system,
-                        "messages": [{"role": "user", "content": user}],
-                    },
-                )
-                if resp.status_code != 200:
-                    raise LLMError(
-                        f"anthropic {resp.status_code}: {resp.text[:300]}"
+    attempts_used = 0
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempts_used = attempt
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                if fmt == "anthropic":
+                    url = (
+                        f"{base}/v1/messages"
+                        if not base.endswith("/v1")
+                        else f"{base}/messages"
                     )
-                data = resp.json()
-                output = "".join(
-                    block.get("text", "")
-                    for block in data.get("content", [])
-                )
-            else:
-                url = (
-                    f"{base}/chat/completions"
-                    if "/chat/completions" not in base
-                    else base
-                )
-                resp = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {key}"},
-                    json={
-                        "model": model,
-                        "temperature": temperature,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                    },
-                )
-                if resp.status_code != 200:
-                    raise LLMError(
-                        f"openai {resp.status_code}: {resp.text[:300]}"
+                    resp = await client.post(
+                        url,
+                        headers={
+                            "x-api-key": key,
+                            "anthropic-version": "2023-06-01",
+                        },
+                        json={
+                            "model": model,
+                            "max_tokens": 1800,
+                            "temperature": temperature,
+                            "system": system,
+                            "messages": [{"role": "user", "content": user}],
+                        },
                     )
-                output = resp.json()["choices"][0]["message"]["content"]
-        audit_id = await _persist_audit(
-            provider=provider,
-            system=system,
-            user=user,
-            trace=trace,
-            status="response_ok",
-            response=output,
-            error="",
-            latency_ms=(time.perf_counter() - started) * 1000.0,
-        )
-        return AuditedText(output, audit_id)
-    except Exception as exc:
-        error = str(exc)
-        await _persist_audit(
-            provider=provider,
-            system=system,
-            user=user,
-            trace=trace,
-            status="transport_error",
-            response=output,
-            error=error,
-            latency_ms=(time.perf_counter() - started) * 1000.0,
-        )
-        raise
+                    if resp.status_code != 200:
+                        error_type = (
+                            LLMTransportError
+                            if resp.status_code == 429 or resp.status_code >= 500
+                            else LLMError
+                        )
+                        raise error_type(
+                            f"anthropic {resp.status_code}: {resp.text[:300]}"
+                        )
+                    data = resp.json()
+                    output = "".join(
+                        block.get("text", "")
+                        for block in data.get("content", [])
+                    )
+                else:
+                    url = (
+                        f"{base}/chat/completions"
+                        if "/chat/completions" not in base
+                        else base
+                    )
+                    resp = await client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {key}"},
+                        json={
+                            "model": model,
+                            "temperature": temperature,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": user},
+                            ],
+                        },
+                    )
+                    if resp.status_code != 200:
+                        error_type = (
+                            LLMTransportError
+                            if resp.status_code == 429 or resp.status_code >= 500
+                            else LLMError
+                        )
+                        raise error_type(
+                            f"openai {resp.status_code}: {resp.text[:300]}"
+                        )
+                    output = resp.json()["choices"][0]["message"]["content"]
+            audit_trace = {
+                **(trace or {}),
+                "transport_attempts": attempts_used,
+                "request_timeout_seconds": REQUEST_TIMEOUT_SECONDS,
+            }
+            audit_id = await _persist_audit(
+                provider=provider,
+                system=system,
+                user=user,
+                trace=audit_trace,
+                status="response_ok",
+                response=output,
+                error="",
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return AuditedText(output, audit_id)
+        except Exception as exc:
+            retryable = isinstance(
+                exc,
+                (httpx.TransportError, httpx.TimeoutException, LLMTransportError),
+            )
+            if retryable and attempt < MAX_ATTEMPTS:
+                await asyncio.sleep(min(15.0, 2.0 ** (attempt - 1)))
+                continue
+            audit_trace = {
+                **(trace or {}),
+                "transport_attempts": attempts_used,
+                "request_timeout_seconds": REQUEST_TIMEOUT_SECONDS,
+            }
+            await _persist_audit(
+                provider=provider,
+                system=system,
+                user=user,
+                trace=audit_trace,
+                status="transport_error",
+                response=output,
+                error=str(exc),
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            raise
+    raise LLMError("LLM request exhausted without a terminal result")
 
 
 def extract_json(text: str) -> dict:

@@ -9,6 +9,9 @@ from backend.app.factors.diversity import (
     mechanisms_for_market,
 )
 from backend.app.factors.semantics import audit_expression_semantics
+from backend.app.factors.return_source_governance import (
+    RETURN_SOURCE_GOVERNANCE_PROTOCOL,
+)
 from backend.app.miner.agent import random_expression_for_family
 from backend.app.miner.agent import propose
 from backend.app.orchestrator import Engine
@@ -60,7 +63,7 @@ class RandomTaskControlTests(unittest.IsolatedAsyncioTestCase):
     def test_proposal_mode_rejects_unknown_values(self):
         engine = Engine()
         engine.task_config = {"proposal_mode": "mixed"}
-        with self.assertRaisesRegex(ValueError, "llm 或 random"):
+        with self.assertRaisesRegex(ValueError, "llm、random 或 search_pool"):
             engine._proposal_mode()
 
     def test_candidate_evaluation_budget_is_explicit_and_validated(self):
@@ -71,6 +74,34 @@ class RandomTaskControlTests(unittest.IsolatedAsyncioTestCase):
         engine.task_config = {"candidate_evaluation_budget": -1}
         with self.assertRaisesRegex(ValueError, "非负整数"):
             engine._candidate_evaluation_budget()
+
+    def test_return_source_governance_is_opt_in_and_validated(self):
+        engine = Engine()
+        engine.task_config = {}
+        disabled = engine._return_source_governance()
+        self.assertFalse(disabled["enabled"])
+        self.assertEqual(disabled["meta_score_weight"], 0.0)
+
+        engine.task_config = {
+            "return_source_governance": {
+                "protocol": RETURN_SOURCE_GOVERNANCE_PROTOCOL,
+                "correlation_threshold": 0.87,
+                "meta_score_weight": 0.25,
+                "required_sources": 5,
+            }
+        }
+        enabled = engine._return_source_governance()
+        self.assertTrue(enabled["enabled"])
+        self.assertEqual(enabled["correlation_threshold"], 0.87)
+        self.assertEqual(enabled["meta_score_weight"], 0.25)
+        self.assertEqual(enabled["required_sources"], 5)
+        self.assertTrue(enabled["cross_experiment_admission"])
+
+        engine.task_config["return_source_governance"][
+            "correlation_threshold"
+        ] = 1.0
+        with self.assertRaisesRegex(ValueError, "correlation_threshold"):
+            engine._return_source_governance()
 
     def test_target_mechanisms_are_market_scoped_and_balanced(self):
         engine = Engine()

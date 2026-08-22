@@ -1,9 +1,10 @@
-"""Live-oriented factor ranking for Evaluation Protocol V4.
+"""Live-oriented factor ranking for Frozen Rating Protocol V4.3.
 
-The score deliberately excludes numeric FACTOR_VAULT outcomes.  PUBLIC,
-META_TRAIN and META_HOLDOUT determine the pre-vault rank; the vault is only a
-binary promotion seal.  This lets the system measure whether the frozen rank
-predicts the final layer without tuning the rank to that final layer.
+V4.3 ranks the direction-frozen factor on an explicit 2020-to-latest
+full-history view.  The four isolation layers remain available as independent
+hard gates and neither LLM receives the full-history result.  Because the
+rating includes META_TRAIN, HOLDOUT and Vault dates, it is labelled diagnostic
+NON_PIT research evidence rather than independent out-of-sample proof.
 """
 
 from __future__ import annotations
@@ -77,22 +78,28 @@ def build_live_ranking(
     portfolio_mode: str,
     cfg: dict,
 ) -> dict:
-    """Build a frozen pre-vault rank plus a binary vault promotion seal."""
+    """Build the full-history frozen rating plus independent hard-gate status."""
     public = layers.get("public") or {}
     gate = layers.get("gate") or {}
     holdout = layers.get("holdout") or {}
-    if not holdout.get("available"):
+    rating = layers.get("rating") or holdout
+    uses_full_history_rating = bool(layers.get("rating"))
+    if not rating.get("available"):
         return {
             "available": False,
             "score": None,
             "score_pre_vault": None,
-            "status": "missing_holdout",
-            "basis": "PUBLIC + META_TRAIN + META_HOLDOUT; Vault numeric outcomes excluded",
-            "failure_reasons": ["HOLDOUT 没有有效样本，无法生成实盘排序"],
+            "score_frozen_rating": None,
+            "rating_protocol_version": rating.get("rating_protocol_version"),
+            "status": "missing_rating_window",
+            "basis": "FROZEN_RATING 2020 through latest available panel date",
+            "failure_reasons": ["2020 至最新交易日没有有效样本，无法生成冻结评级"],
         }
 
-    relevant = _relevant_branch(holdout, portfolio_mode)
-    confidence = holdout.get("return_confidence") or {}
+    relevant = _relevant_branch(rating, portfolio_mode)
+    confidence = rating.get("return_confidence") or {}
+    holdout_relevant = _relevant_branch(holdout, portfolio_mode)
+    holdout_confidence = holdout.get("return_confidence") or {}
     target_sharpe = max(0.1, _safe_float(cfg.get("target_rank_sharpe"), 1.5))
     target_return = max(0.01, _safe_float(cfg.get("target_rank_ann_return"), 0.12))
     target_absolute_return = max(
@@ -113,8 +120,8 @@ def build_live_ranking(
         + 0.20 * _clip01(calmar / 1.5)
     )
     if portfolio_mode == "long_only":
-        absolute = holdout.get("net") or {}
-        absolute_confidence = holdout.get("absolute_return_confidence") or {}
+        absolute = rating.get("net") or {}
+        absolute_confidence = rating.get("absolute_return_confidence") or {}
         absolute_profitability = (
             0.55
             * _clip01(
@@ -149,10 +156,10 @@ def build_live_ranking(
         + 0.35 * _clip01(psr)
     )
 
-    profitable_era_rate = _safe_float(holdout.get("profitable_era_rate"))
-    profitable_year_rate = _safe_float(holdout.get("profitable_year_rate"))
-    worst_era_sharpe = _safe_float(holdout.get("worst_era_sharpe"), -99.0)
-    stress_sharpe = _worst_stress_sharpe(holdout)
+    profitable_era_rate = _safe_float(rating.get("profitable_era_rate"))
+    profitable_year_rate = _safe_float(rating.get("profitable_year_rate"))
+    worst_era_sharpe = _safe_float(rating.get("worst_era_sharpe"), -99.0)
+    stress_sharpe = _worst_stress_sharpe(rating)
     robustness = (
         0.40 * _clip01((stress_sharpe + 0.25) / 1.75)
         + 0.25 * _clip01(profitable_era_rate)
@@ -176,13 +183,13 @@ def build_live_ranking(
     )
     generalization = 0.75 * sharpe_retention + 0.25 * direction_preserved
 
-    cost_cushion = _safe_float(holdout.get("cost_cushion_multiple"))
+    cost_cushion = _safe_float(rating.get("cost_cushion_multiple"))
     turnover = _safe_float(
-        holdout.get("daily_turnover", holdout.get("turnover")),
+        rating.get("daily_turnover", rating.get("turnover")),
         99.0,
     )
     max_turnover = max(0.01, _safe_float(cfg.get("max_daily_turnover"), 0.5))
-    adv_participation = _safe_float(holdout.get("adv_participation_p95"), 99.0)
+    adv_participation = _safe_float(rating.get("adv_participation_p95"), 99.0)
     max_adv = max(1e-6, _safe_float(cfg.get("max_adv_participation"), 0.05))
     implementation = (
         0.45 * _clip01(cost_cushion / target_cost_cushion)
@@ -191,8 +198,8 @@ def build_live_ranking(
     )
 
     signal_quality = (
-        0.60 * _clip01(_safe_float(holdout.get("icir")) / 2.0)
-        + 0.40 * _clip01(_safe_float(holdout.get("monotonicity")))
+        0.60 * _clip01(_safe_float(rating.get("icir")) / 2.0)
+        + 0.40 * _clip01(_safe_float(rating.get("monotonicity")))
     )
     components = {
         "net_profitability_lcb": profitability,
@@ -217,7 +224,7 @@ def build_live_ranking(
         components["cost_regime_robustness"],
         components["implementability"],
     )
-    score_pre_vault = 100.0 * weighted * (0.70 + 0.30 * critical_floor)
+    rating_score_raw = 100.0 * weighted * (0.70 + 0.30 * critical_floor)
 
     if not eligibility.get("research_pass"):
         cap, status = 24.9, "research_rejected"
@@ -227,18 +234,18 @@ def build_live_ranking(
         cap, status = 64.9, "vault_rejected"
     elif not eligibility.get("capacity_pass"):
         cap, status = 79.9, "capacity_limited"
-    elif score_pre_vault >= 75.0:
+    elif rating_score_raw >= 75.0:
         cap, status = 100.0, "capital_priority_non_pit"
-    elif score_pre_vault >= 60.0:
+    elif rating_score_raw >= 60.0:
         cap, status = 100.0, "paper_priority"
     else:
         cap, status = 100.0, "passed_low_conviction"
-    score = min(score_pre_vault, cap)
+    score = min(rating_score_raw, cap)
 
     warnings: list[str] = []
     if return_t < hurdle_t:
         warnings.append(
-            f"HOLDOUT 收益 t={return_t:.2f} 未达到 {trial_count} 次检验校正门槛 {hurdle_t:.2f}"
+            f"冻结评级窗口收益 t={return_t:.2f} 未达到 {trial_count} 次检验校正门槛 {hurdle_t:.2f}"
         )
     if sharpe_retention < 0.5:
         warnings.append("HOLDOUT 费后 Sharpe 不足训练层保守值的 50%")
@@ -248,9 +255,28 @@ def build_live_ranking(
     return {
         "available": True,
         "score": round(score, 2),
-        "score_pre_vault": round(score_pre_vault, 2),
+        "score_frozen_rating": round(rating_score_raw, 2),
+        "rating_protocol_version": rating.get("rating_protocol_version"),
+        "score_pre_vault": (
+            None if uses_full_history_rating else round(rating_score_raw, 2)
+        ),
         "status": status,
-        "basis": "PUBLIC + META_TRAIN + META_HOLDOUT; Vault numeric outcomes excluded",
+        "basis": (
+            "FROZEN_RATING 2020 through latest available panel date; "
+            "full-window NON_PIT diagnostic; isolation-layer hard gates remain separate"
+            if uses_full_history_rating
+            else "PUBLIC + META_TRAIN + META_HOLDOUT; Vault numeric outcomes excluded"
+        ),
+        "rating_window": {
+            "start": rating.get("window_start"),
+            "end": rating.get("window_end"),
+            "policy": rating.get("window_policy") or (
+                "legacy_holdout" if not uses_full_history_rating else None
+            ),
+            "independent_out_of_sample": bool(
+                rating.get("independent_out_of_sample", not uses_full_history_rating)
+            ),
+        },
         "vault_seal": "pass" if eligibility.get("vault_pass") else "fail",
         "components": {
             name: round(value, 4) for name, value in components.items()
@@ -258,21 +284,27 @@ def build_live_ranking(
         "weights": weights,
         "evidence": {
             "portfolio_basis": "active" if portfolio_mode == "long_only" else "net",
-            "holdout_sharpe": relevant.get("sharpe"),
-            "holdout_ann_return": relevant.get("ann_return"),
-            "holdout_sharpe_lcb": confidence.get("sharpe_lcb"),
-            "holdout_ann_return_lcb": confidence.get("ann_return_lcb"),
-            "holdout_return_hac_t": confidence.get("hac_t_stat"),
-            "holdout_psr_gt_zero": confidence.get("probabilistic_sharpe_gt_zero"),
+            "rating_sharpe": relevant.get("sharpe"),
+            "rating_ann_return": relevant.get("ann_return"),
+            "rating_sharpe_lcb": confidence.get("sharpe_lcb"),
+            "rating_ann_return_lcb": confidence.get("ann_return_lcb"),
+            "rating_return_hac_t": confidence.get("hac_t_stat"),
+            "rating_psr_gt_zero": confidence.get("probabilistic_sharpe_gt_zero"),
+            "holdout_sharpe": holdout_relevant.get("sharpe"),
+            "holdout_ann_return": holdout_relevant.get("ann_return"),
+            "holdout_sharpe_lcb": holdout_confidence.get("sharpe_lcb"),
+            "holdout_ann_return_lcb": holdout_confidence.get("ann_return_lcb"),
+            "holdout_return_hac_t": holdout_confidence.get("hac_t_stat"),
+            "holdout_psr_gt_zero": holdout_confidence.get("probabilistic_sharpe_gt_zero"),
             "multiple_testing_trials": trial_count,
             "multiple_testing_hurdle_t": round(hurdle_t, 4),
-            "cost_breakeven_bps": holdout.get("cost_breakeven_bps"),
-            "cost_cushion_multiple": holdout.get("cost_cushion_multiple"),
+            "cost_breakeven_bps": rating.get("cost_breakeven_bps"),
+            "cost_cushion_multiple": rating.get("cost_cushion_multiple"),
             "worst_stress_sharpe": round(stress_sharpe, 4),
-            "profitable_era_rate": holdout.get("profitable_era_rate"),
-            "profitable_year_rate": holdout.get("profitable_year_rate"),
+            "profitable_era_rate": rating.get("profitable_era_rate"),
+            "profitable_year_rate": rating.get("profitable_year_rate"),
             "sharpe_retention": round(sharpe_retention, 4),
-            "adv_participation_p95": holdout.get("adv_participation_p95"),
+            "adv_participation_p95": rating.get("adv_participation_p95"),
             "absolute_long_only": absolute_snapshot,
         },
         "warnings": warnings,

@@ -1,13 +1,19 @@
 # FactorFactory
 
-支持 A 股与美股并行任务的 7×24 双层嵌套优化 (bi-level) LLM 因子挖掘工厂。外层 Meta-Optimizer 进化白名单约束的
-`MinerTemplate`（提示词、搜索策略、反馈上下文、示例优先级与 DSL 结构），内层 Miner 在该模板下进化因子表达式；
-Evaluation Protocol V4.2 把连续学习分、硬准入分、实盘排序分与最终校准分离；
+支持 A 股与美股并行任务的 7×24 三层研究架构：第一层算法搜索池、第二层 Researcher LLM、第三层 Governor LLM。
+兼容的双层任务仍可运行；Governor 只进化白名单约束的 `MinerTemplate`，Researcher 在该模板下审查并改进算法种子；
+Evaluation Protocol V4.2 + Frozen Rating V4.3 把连续学习分、硬准入分与 2020 至最新交易日冻结评级分离；
 每个新候选在训练安全层同时评价正反方向、按双向试验数惩罚后冻结方向，
 失败候选也保留可比较的严重程度，避免双层 LLM 面对一片 `0.000` 无法归因。
 设计蓝图见 [DESIGN.md](DESIGN.md)，事件回测的冻结口径见
 [docs/BACKTEST_PROTOCOL_V1.md](docs/BACKTEST_PROTOCOL_V1.md)，跨任务全因子榜单口径见
 [docs/FACTOR_LEADERBOARD_PROTOCOL_V1.md](docs/FACTOR_LEADERBOARD_PROTOCOL_V1.md)。
+美股 V667 的有界三臂对照、时间分层和判定标准见
+[docs/SCIENTIFIC_SEARCH_PROTOCOL_V667.md](docs/SCIENTIFIC_SEARCH_PROTOCOL_V667.md)。
+完整三层架构及 A–E 五组预注册消融见
+[docs/THREE_LAYER_ABCDE_PROTOCOL_V1.md](docs/THREE_LAYER_ABCDE_PROTOCOL_V1.md)。
+手工创建的无 LLM、随机→LLM、算法池→LLM、完整三层与自定义架构见
+[docs/MANUAL_RESEARCH_TASK_ARCHITECTURE_V1.md](docs/MANUAL_RESEARCH_TASK_ARCHITECTURE_V1.md)。
 
 ## 快速开始
 
@@ -46,21 +52,26 @@ createdb factor_factory      # 首次
 |---|---|
 | 总览 | 引擎启停、外层 meta-score 步进图 (候选 vs 在位)、在位 Miner 配置、实时日志 |
 | 研发树 | Miner 版本演化表 + 内层搜索树 (draft/improve 血缘, 可缩放, 点击看表达式) |
-| 因子库 | V4 四层审计、费后实盘排序及 Vault 校准诊断、F1–F5 生命周期、结构相似度分组、Web LaTeX |
+| 研究记录 | 任务内全部候选的训练安全排名、失败原因与改进血缘；明确不是正式因子库 |
+| 因子库 | V4 四层隔离审计、2020 至最新费后冻结评级、F1–F5 生命周期、结构相似度分组、Web LaTeX |
 | 选股器 | 单次 Polars 懒执行的多因子或直接 DSL 截面选股；历史窗裁剪、结果缓存与逐股因子归因 |
 | 回测 | `t` 收盘信号 → `t+1` 原始开盘成交的步进事件引擎、逐日状态、事件流、交割单与完整性门 |
 | 诊断 | 滚动窗口 P50/P95/P99、显式 SLO、5xx 与请求 ID、进程/事件循环、数据库连接池、面板 schema/DSL 契约、双层 LLM 调用/反馈血缘、协议隔离、worker 心跳与跨重启事故日志 |
-| 设置 | A股/美股研究任务、纯多头/多空、冻结信号方向、成本/容量/OOS 门槛及模型接入 |
+| 设置 | 可审计手工任务架构、A股/美股、纯多头/多空、冻结信号方向、成本/容量/OOS 门槛及模型接入 |
 
 ## 架构
 
 - **外层**: 白名单内进化 `MinerTemplate`；先读取同协议的跨任务/多种子报告与上轮结果反思，
-  再做最小可归因改动。候选与在位者使用同一冻结历史基线，按多种子单边统计门接受或拒绝。
-- **内层**: LLM (未配置时随机基线) 起草/改进 DSL 因子表达式 → 任务市场专属 AST 白名单
+  再做单字段最小可归因改动。候选与在位者使用同一冻结历史基线和相同 seed cohort，
+  按单边精确符号翻转检验接受或拒绝；无改动提案直接短路。
+- **内层**: Researcher LLM 起草/改进 DSL 因子表达式 → 任务市场专属 AST 白名单
   → 评估 RankIC/HAC、真实组合换手、费后收益、市场 Beta、分层单调性与成本压力。下一轮会收到
-  保守有效指标、评分组件、明确失败原因、改进目标与先前反思，不再只看到 score/ICIR。
+  保守有效指标、评分组件、明确失败原因、改进目标与先前反思，不再只看到 score/ICIR。架构显式启用
+  LLM 但 provider 未配置时 worker 立即熔断，不会把结果伪装成随机基线；无 LLM 基线使用独立模板。
 - **数据隔离**: INNER_PUBLIC + META_TRAIN 只以预声明的保守聚合反馈进入双层循环；原始明细不进 prompt。
   META_HOLDOUT(2023-2024) / FACTOR_VAULT(2025+) 仅由显式完整审计读取，永不进入 Miner 或外层反馈。
+  显式完整审计另建 `FROZEN_RATING` 视图，固定从 2020-01-01 自动延伸至面板最新交易日；它跨越
+  META_TRAIN/HOLDOUT/Vault，因此是全窗口 NON-PIT 评级，不宣称独立样本外证据。
 - **协议与种子隔离**: 历史协议数据只读保留；当前上下文、meta-score 与外层比较只查询同一
   `evaluation_protocol`。每个种子看到同一冻结历史基线和本种子增量，不会从其他种子继续学习。
 - **单一研究引擎**: UI/API 的新运行只允许 V2；V1 代码与既有结果仅作历史审计，不能再写入当前协议。
@@ -68,10 +79,10 @@ createdb factor_factory      # 首次
   `supported/refuted/inconclusive`、证据、经验、避免模式、下一实验与停止条件，供下一步读取。
 - **生命周期**: F1 discovery → F2 research-pass → F3 OOS-pass → F4 paper-candidate →
   F5 live-candidate-non-pit。F5 仍是 `NON_PIT_RESEARCH`，不是生产批准。
-- **V4.2 方向与实盘排序**: 新候选在训练安全层同时评价 +1/-1，按两次试验计数后冻结方向；
-  0–100 分以 HOLDOUT 费后收益/Sharpe 下置信界、收益 HAC、多重检验门槛、
-  成本盈亏平衡、压力成本、跨 era 盈利率、泛化衰减和容量为核心；Vault 数值不进入公式，
-  仅用于检验冻结排序与后续费后结果的 Spearman、Top 组盈利率和分组单调性。
+- **V4.2 方向 + Rating V4.3 冻结评级**: 新候选在训练安全层同时评价 +1/-1，按两次试验计数后冻结方向；
+  0–100 分在 2020 至最新交易日窗口计算费后收益/Sharpe 下置信界、收益 HAC、多重检验门槛、
+  成本盈亏平衡、压力成本、跨 era 盈利率、泛化衰减和容量。由于评级窗口包含 Vault 日期，
+  不再对同一 Vault 声称独立排序校准；HOLDOUT 与 Vault 仍分别执行不可绕过的准入硬门槛。
 - **交互性能**: 页面使用 KeepAlive、GET 去重/短缓存和非重载任务切换；列表 API 只返回指标摘要，
   worker 状态不再重复携带日志，元信息接口也不触发冷面板全量加载。
 - **可观测性**: `/api/health/live` 提供轻量存活检查，`/api/health/ready` 验证数据库与任务面板，
@@ -104,3 +115,6 @@ createdb factor_factory      # 首次
 
 > 数据免责: 当前 V4 按用户要求不把 PIT 纳入评分，但面板仍标记为非 PIT 当前成分并集。
 > 所有等级都属于 `NON_PIT_RESEARCH`，不等同于生产或实盘批准。
+# 双层/三层 7×24 研究服务
+
+理想连续研究架构已拆分为两个本机服务：10011 运行双层算法池与 Researcher，10012 运行三层算法池、Researcher 与低频 Governor。任务、无限预算、自动恢复、LLM 心跳和 2020–2026 冻结评级边界见 [设计与运维说明](docs/IDEAL_CONTINUOUS_RESEARCH_SERVICES_V1.md)。
