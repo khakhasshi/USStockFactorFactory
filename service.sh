@@ -19,6 +19,7 @@ llm_max_attempts="${FF_LLM_MAX_ATTEMPTS:-2}"
 skip_historical_feedback_backfill="${FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL:-0}"
 database_url="${FF_DATABASE_URL:-}"
 backtest_artifact_root="${FF_BACKTEST_ARTIFACT_ROOT:-}"
+python_runtime="${FF_PYTHON:-}"
 log_dir="$service_root/var/log"
 log_file="$log_dir/factorfactory-${service_port}.log"
 service_label="com.factorfactory.${service_port}"
@@ -84,6 +85,7 @@ start_service() {
   )
   [[ -n "$database_url" ]] && launch_environment+=("FF_DATABASE_URL=$database_url")
   [[ -n "$backtest_artifact_root" ]] && launch_environment+=("FF_BACKTEST_ARTIFACT_ROOT=$backtest_artifact_root")
+  [[ -n "$python_runtime" ]] && launch_environment+=("FF_PYTHON=$python_runtime")
 
   launchctl submit \
     -l "$service_label" \

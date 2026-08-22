@@ -34,6 +34,14 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE experiments ADD COLUMN IF NOT EXISTS research_config JSONB NOT NULL DEFAULT '{}'::jsonb"
         ))
+        # SQLAlchemy's generic JSON type creates JSON on a brand-new PostgreSQL
+        # database, while later migrations use JSONB containment operators.
+        # Existing installations are already JSONB; this conversion is
+        # lossless and idempotent for both bootstrap paths.
+        await conn.execute(text(
+            "ALTER TABLE experiments ALTER COLUMN research_config TYPE JSONB "
+            "USING research_config::jsonb"
+        ))
         await conn.execute(text(
             "ALTER TABLE backtests ADD COLUMN IF NOT EXISTS experiment_id INTEGER NOT NULL DEFAULT 1"
         ))
@@ -118,6 +126,20 @@ async def init_db() -> None:
             "ALTER TABLE trials ADD COLUMN IF NOT EXISTS evaluation_protocol "
             "VARCHAR(32) NOT NULL DEFAULT 'legacy_unoriented'"
         ))
+        for statement in (
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS node_id INTEGER",
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS parent_node_id INTEGER",
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS expression TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS search_method VARCHAR(64) NOT NULL DEFAULT ''",
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS mechanism VARCHAR(64) NOT NULL DEFAULT ''",
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS selected BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE trials ADD COLUMN IF NOT EXISTS failure_reason TEXT NOT NULL DEFAULT ''",
+            "CREATE INDEX IF NOT EXISTS ix_trials_node_id ON trials (node_id)",
+            "CREATE INDEX IF NOT EXISTS ix_trials_search_method ON trials (search_method)",
+            "CREATE INDEX IF NOT EXISTS ix_trials_mechanism ON trials (mechanism)",
+            "CREATE INDEX IF NOT EXISTS ix_trials_selected ON trials (selected)",
+        ):
+            await conn.execute(text(statement))
         # Recover protocol lineage from immutable payloads without changing
         # historical scores or deleting interrupted work.
         await conn.execute(text(
@@ -206,8 +228,8 @@ async def init_db() -> None:
             "  AND f.evaluation_protocol = 'legacy_unoriented'"
         ))
         await conn.execute(text(
-            "INSERT INTO experiments (id, name, description, status) VALUES "
-            "(1, '实验1-初始双层挖掘', '2026-08 首轮: 旧评分函数(exp换手衰减, 无退化检测), 328因子/31外层步; 已冻结存档', 'archived') "
+            "INSERT INTO experiments (id, name, description, status, research_config) VALUES "
+            "(1, '实验1-初始双层挖掘', '2026-08 首轮: 旧评分函数(exp换手衰减, 无退化检测), 328因子/31外层步; 已冻结存档', 'archived', '{}'::jsonb) "
             "ON CONFLICT (id) DO NOTHING"
         ))
         await conn.execute(text(

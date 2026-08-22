@@ -128,6 +128,13 @@ class Trial(Base):
     evaluation_protocol: Mapped[str] = mapped_column(
         String(32), default=EVALUATION_PROTOCOL_VERSION, index=True
     )
+    node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"), nullable=True, index=True)
+    parent_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expression: Mapped[str] = mapped_column(Text, default="")
+    search_method: Mapped[str] = mapped_column(String(64), default="", index=True)
+    mechanism: Mapped[str] = mapped_column(String(64), default="", index=True)
+    selected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    failure_reason: Mapped[str] = mapped_column(Text, default="")
     statistic: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

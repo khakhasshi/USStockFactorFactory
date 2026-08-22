@@ -4,7 +4,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-[ -d .venv ] || python3 -m venv .venv
+runtime_python="${FF_PYTHON:-$PWD/.venv/bin/python}"
+if [[ -z "${FF_PYTHON:-}" ]]; then
+  [ -d .venv ] || python3 -m venv .venv
+fi
 
 requirements_file="backend/requirements.txt"
 requirements_stamp=".venv/.factorfactory-requirements.sha256"
@@ -12,12 +15,12 @@ requirements_hash="$(shasum -a 256 "$requirements_file" | awk '{print $1}')"
 installed_hash=""
 [ ! -f "$requirements_stamp" ] || installed_hash="$(<"$requirements_stamp")"
 
-if [[ "$installed_hash" != "$requirements_hash" ]] || ! .venv/bin/python -c \
+if [[ -z "${FF_PYTHON:-}" ]] && { [[ "$installed_hash" != "$requirements_hash" ]] || ! "$runtime_python" -c \
   "import asyncpg, fastapi, httpx, numpy, polars, psutil, sqlalchemy, uvicorn" \
-  >/dev/null 2>&1; then
-  .venv/bin/python -m pip install -q -r "$requirements_file"
+>/dev/null 2>&1; }; then
+  "$runtime_python" -m pip install -q -r "$requirements_file"
   print -r -- "$requirements_hash" > "$requirements_stamp"
 fi
 
 cd backend
-exec ../.venv/bin/python -m app.main
+exec "$runtime_python" -m app.main
