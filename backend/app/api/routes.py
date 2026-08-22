@@ -16,6 +16,11 @@ from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
 from ..backtest.engine import run_backtest
+from ..blind_review import (
+    build_review_packets,
+    deterministic_code_review,
+    seal_reviews,
+)
 from ..combination_lab import (
     COMBINATION_LAB_PROTOCOL,
     CombinationLabManager,
@@ -75,6 +80,7 @@ from ..factors.return_source_governance import (
 from ..factors.semantics import audit_expression_semantics, field_contract
 from ..factors.similarity import (
     build_similarity_index,
+    expression_similarity,
     expression_fingerprint,
     nearest_factors,
 )
@@ -124,6 +130,16 @@ from ..research_documents import (
     research_document_metadata,
     resolve_research_document,
 )
+from ..document_dsl import document_to_dsl
+from ..mechanism_catalog import catalog as mechanism_catalog
+from ..research_overfit import (
+    cscv_pbo,
+    deflated_sharpe_ratio,
+    effective_trial_count,
+    harvey_liu_haircut,
+    winner_curse,
+)
+from ..residual_beam import residual_oof_beam_search
 from ..research_architecture import (
     RESEARCH_ARCHITECTURE_SCHEMA,
     architecture_catalog,
@@ -1594,6 +1610,12 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             expression_hash=(factor.fingerprint or {}).get("expr_hash", "audit"),
             layer="FULL_AUDIT_V4",
             task_name=factor.task_name,
+            node_id=factor.node_id,
+            expression=factor.expression,
+            search_method="manual_full_audit",
+            mechanism=infer_mechanism(factor.expression),
+            selected=bool(audit["eligibility"].get("eligible")),
+            failure_reason="; ".join(audit["eligibility"].get("reasons") or []),
             statistic={
                 "grade": audit["eligibility"]["grade"],
                 "stage": audit["eligibility"]["stage"],
@@ -2322,6 +2344,243 @@ async def research_document_html(slug: str):
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(500, f"研究文档读取失败: {exc}") from exc
     return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
+# ---------- 内部研究智能（非产品化） ----------
+
+
+class DocumentToDslRequest(BaseModel):
+    text: str = Field(min_length=20, max_length=200_000)
+    market: str
+    max_candidates: int = Field(default=3, ge=1, le=3)
+
+
+class ResidualBeamRequest(BaseModel):
+    target: list[float]
+    incumbent_predictions: list[list[float]]
+    candidates: dict[str, list[float]]
+    folds: int = Field(default=5, ge=2, le=20)
+    beam_width: int = Field(default=5, ge=1, le=50)
+    turnover: dict[str, float] = Field(default_factory=dict)
+    complexity: dict[str, float] = Field(default_factory=dict)
+
+
+class OverfitDiagnosticsRequest(BaseModel):
+    period_return_matrix: list[list[float]]
+    observed_sharpe: float
+    observations: int = Field(ge=2)
+    skewness: float = 0.0
+    kurtosis: float = Field(default=3.0, ge=1.0)
+
+
+class BlindReviewPacketRequest(BaseModel):
+    expression: str = Field(min_length=1, max_length=2_000)
+    hypothesis: str = Field(default="", max_length=2_000)
+    market: str
+
+
+class BlindReviewSealRequest(BaseModel):
+    packets: dict
+    method_review: dict
+    code_review: dict
+
+
+@router.get("/research-intelligence/mechanisms")
+async def research_mechanisms(market: str | None = None):
+    try:
+        return mechanism_catalog(market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/research-intelligence/document-to-dsl")
+async def research_document_to_dsl(req: DocumentToDslRequest):
+    try:
+        result = document_to_dsl(
+            req.text,
+            market=req.market,
+            max_candidates=req.max_candidates,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # Similarity is evidence, never a score adjustment.
+    async with SessionLocal() as session:
+        existing = list(
+            (
+                await session.scalars(
+                    select(Node.expression)
+                    .where(Node.status == "ok")
+                    .order_by(Node.id.desc())
+                    .limit(2_000)
+                )
+            ).all()
+        )
+    for candidate in result["candidates"]:
+        nearest = max(
+            (
+                expression_similarity(candidate["expression"], expression)
+                for expression in existing
+            ),
+            default=0.0,
+        )
+        candidate["nearest_internal_expression_similarity"] = round(nearest, 6)
+        candidate["duplicate_review_required"] = nearest >= 0.90
+    return result
+
+
+@router.post("/research-intelligence/residual-beam")
+async def research_residual_beam(req: ResidualBeamRequest):
+    try:
+        return await asyncio.to_thread(
+            residual_oof_beam_search,
+            target=req.target,
+            incumbent_predictions=req.incumbent_predictions,
+            candidates=req.candidates,
+            folds=req.folds,
+            beam_width=req.beam_width,
+            turnover=req.turnover,
+            complexity=req.complexity,
+        )
+    except (ValueError, ArithmeticError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/research-intelligence/overfit-diagnostics")
+async def research_overfit_diagnostics(req: OverfitDiagnosticsRequest):
+    matrix = req.period_return_matrix
+    if not matrix or any(len(row) != len(matrix[0]) for row in matrix):
+        raise HTTPException(400, "period_return_matrix 必须为非空矩形")
+    effective = await asyncio.to_thread(effective_trial_count, matrix)
+    values = [value for row in matrix for value in row]
+    score_std = st.pstdev(values) if len(values) > 1 else 0.0
+    return {
+        "scope": "caller_supplied_non_frozen_period_returns",
+        "actual_trials": len(matrix[0]),
+        "effective_trials": effective,
+        "dsr": deflated_sharpe_ratio(
+            req.observed_sharpe,
+            observations=req.observations,
+            effective_trials=effective,
+            skewness=req.skewness,
+            kurtosis=req.kurtosis,
+            sharpe_std=score_std,
+        ),
+        "pbo": cscv_pbo(matrix),
+        "harvey_liu": harvey_liu_haircut(
+            req.observed_sharpe,
+            observations=req.observations,
+            trials=effective,
+        ),
+        "winner_curse": winner_curse(
+            req.observed_sharpe,
+            effective_trials=effective,
+            score_std=score_std,
+        ),
+    }
+
+
+@router.get("/research-intelligence/trial-ledger")
+async def research_trial_ledger(experiment_id: int):
+    async with SessionLocal() as session:
+        experiment = await session.get(Experiment, experiment_id)
+        if experiment is None:
+            raise HTTPException(404, "研究任务不存在")
+        trials = list(
+            (
+                await session.scalars(
+                    select(Trial)
+                    .where(Trial.experiment_id == experiment_id)
+                    .order_by(Trial.id)
+                )
+            ).all()
+        )
+        nodes = list(
+            (
+                await session.scalars(
+                    select(Node)
+                    .where(Node.experiment_id == experiment_id, Node.status == "ok")
+                    .order_by(Node.id)
+                )
+            ).all()
+        )
+    method_counts: dict[str, int] = {}
+    mechanism_counts: dict[str, int] = {}
+    for trial in trials:
+        method = trial.search_method or "legacy_unrecorded"
+        mechanism = trial.mechanism or "legacy_unrecorded"
+        method_counts[method] = method_counts.get(method, 0) + 1
+        mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+    by_task: dict[str, dict] = {}
+    for task_name in sorted({node.task_name for node in nodes}):
+        task_nodes = [node for node in nodes if node.task_name == task_name]
+        vectors = []
+        valid_nodes = []
+        for node in task_nodes:
+            signature = (node.public_metrics or {}).get("training_return_path_signature") or {}
+            vector = list(signature.get("vector") or [])
+            if vector:
+                vectors.append(vector)
+                valid_nodes.append(node)
+        same_length = len({len(row) for row in vectors}) == 1 if vectors else False
+        matrix = list(map(list, zip(*vectors))) if same_length else []
+        effective = effective_trial_count(matrix) if matrix else float(len(task_nodes) or 1)
+        pbo = cscv_pbo(matrix) if matrix else {"available": False, "reason": "no_comparable_training_signatures"}
+        best = max(valid_nodes or task_nodes, key=lambda node: float(node.public_score or 0.0), default=None)
+        branch = dict((best.public_metrics or {}).get("active") or (best.public_metrics or {}).get("net") or {}) if best else {}
+        sharpe = float(branch.get("sharpe") or 0.0)
+        observations = int((best.public_metrics or {}).get("n_days") or 2) if best else 2
+        by_task[task_name] = {
+            "actual_trials": len(task_nodes),
+            "comparable_return_paths": len(vectors) if same_length else 0,
+            "return_path_scope": "compressed_public_plus_meta_train_not_frozen_rating",
+            "effective_trials": effective,
+            "best_node_id": best.id if best else None,
+            "best_training_sharpe": sharpe,
+            "dsr": deflated_sharpe_ratio(
+                sharpe,
+                observations=observations,
+                effective_trials=effective,
+            ),
+            "pbo": pbo,
+        }
+    return {
+        "schema": "factorfactory.actual-trial-ledger/v1",
+        "experiment_id": experiment_id,
+        "append_only_trials": len(trials),
+        "selected_trials": sum(bool(trial.selected) for trial in trials),
+        "search_method_counts": method_counts,
+        "mechanism_family_counts": mechanism_counts,
+        "tasks": by_task,
+        "disclosure": "历史试验在新字段上线前只保留原statistic；不会伪造回填表达式和搜索方法。",
+    }
+
+
+@router.post("/research-intelligence/blind-review/packets")
+async def blind_review_packets(req: BlindReviewPacketRequest):
+    if req.market not in {"us", "ashare"}:
+        raise HTTPException(400, "market 必须是 us 或 ashare")
+    packets = build_review_packets(
+        expression=req.expression,
+        hypothesis=req.hypothesis,
+        market=req.market,
+    )
+    packets["deterministic_code_review"] = deterministic_code_review(
+        req.expression, req.market
+    )
+    packets["llm_status"] = "optional_pending_independent_reviewers"
+    return packets
+
+
+@router.post("/research-intelligence/blind-review/seal")
+async def blind_review_seal(req: BlindReviewSealRequest):
+    try:
+        return seal_reviews(
+            packets=req.packets,
+            method_review=req.method_review,
+            code_review=req.code_review,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ---------- 设置 ----------

@@ -21,6 +21,31 @@ SERVICE_ARCHITECTURE = os.environ.get(
     "FF_SERVICE_ARCHITECTURE",
     "",
 ).strip().lower()
+
+
+def service_accepts_task(
+    task_config: dict | None,
+    *,
+    service_instance: str | None = None,
+    service_architecture: str | None = None,
+) -> bool:
+    """Return whether this runtime may manually start a persisted task.
+
+    Architecture-specific services remain isolated to their own task binding.
+    The architecture-neutral main service is the deliberate compatibility host:
+    it may manually resume historical tasks created by retired service instances.
+    Unbound legacy tasks retain their existing compatibility with every runtime.
+    """
+    instance = SERVICE_INSTANCE if service_instance is None else service_instance
+    architecture = (
+        SERVICE_ARCHITECTURE
+        if service_architecture is None
+        else service_architecture
+    )
+    task_service = str((task_config or {}).get("service_instance") or "").strip()
+    return not task_service or task_service == instance or not architecture.strip()
+
+
 AUTOSTART_RESEARCH = os.environ.get(
     "FF_AUTOSTART_RESEARCH",
     "",

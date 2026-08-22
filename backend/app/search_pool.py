@@ -15,6 +15,7 @@ import random
 from dataclasses import dataclass
 
 from .factors.similarity import expression_similarity
+from .factors.return_path import return_path_correlation
 from .miner.agent import mutate_expression, random_expression_for_family
 
 
@@ -24,6 +25,7 @@ DEFAULT_SEARCH_ALGORITHMS = (
     "evolutionary",
     "surrogate_kernel",
     "q_learning",
+    "residual_oof_beam",
 )
 
 
@@ -92,6 +94,47 @@ def _ucb_algorithm(
 
 def _best_node(nodes: list[dict]) -> dict | None:
     return max(nodes, key=_reward, default=None)
+
+
+def _residual_beam_parent(nodes: list[dict]) -> tuple[dict | None, dict]:
+    """Choose a high-score path that is least explained by other strong paths.
+
+    This scheduler consumes only compressed PUBLIC+META_TRAIN return paths. It
+    is a safe continuous-search proxy; exact OOF residual ranking is performed
+    by ``residual_beam.residual_oof_beam_search`` when prediction matrices are
+    available and is never inferred from the frozen rating layer.
+    """
+    viable = []
+    for node in nodes:
+        signature = (node.get("public_metrics") or {}).get(
+            "training_return_path_signature"
+        ) or {}
+        if signature.get("available"):
+            viable.append((node, signature))
+    if not viable:
+        return _best_node(nodes), {
+            "residual_scope": "fallback_no_comparable_training_paths",
+            "beam_candidates": 0,
+        }
+    scored = []
+    for node, signature in viable:
+        correlations = [
+            abs(value)
+            for other, other_signature in viable
+            if other.get("id") != node.get("id")
+            and (value := return_path_correlation(signature, other_signature)) is not None
+        ]
+        independence = 1.0 - max(correlations, default=0.0)
+        score = 0.7 * _reward(node) + 0.3 * independence
+        scored.append((score, independence, int(node.get("id") or 0), node))
+    score, independence, _, parent = max(scored)
+    return parent, {
+        "residual_scope": "compressed_public_plus_meta_train_path_proxy",
+        "exact_oof_required_for_promotion": True,
+        "beam_candidates": len(scored),
+        "parent_independence": round(independence, 6),
+        "parent_residual_proxy_score": round(score, 6),
+    }
 
 
 def _surrogate_candidate(
@@ -190,11 +233,19 @@ def propose_search_seed(
         expression, algorithm_meta = _surrogate_candidate(
             family, fields, nodes, rng
         )
-    else:
+    elif algorithm == "q_learning":
         action, algorithm_meta = _q_action(nodes, rng)
         expression = (
             mutate_expression(str(parent["expression"]), fields=fields, rng=rng)
             if action == "mutate" and parent
+            else random_expression_for_family(family, fields, rng)
+        )
+    else:
+        parent, algorithm_meta = _residual_beam_parent(nodes)
+        action = "mutate" if parent else "fresh"
+        expression = (
+            mutate_expression(str(parent["expression"]), fields=fields, rng=rng)
+            if parent
             else random_expression_for_family(family, fields, rng)
         )
 

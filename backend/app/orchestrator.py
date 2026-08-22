@@ -35,9 +35,11 @@ from .config import (
     SERVICE_INSTANCE,
     get_dsl_fields,
     resolve_engine_tasks,
+    service_accepts_task,
 )
 from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
+from .blind_review import deterministic_code_review
 from .dsl.engine import normalize_hash
 from .eval.harness import evaluate
 from .feedback import (
@@ -583,6 +585,20 @@ class Engine:
             )
         return int(value or 0)
 
+    def _dynamic_evaluation_overrides(self) -> dict:
+        overrides = dict(self.task_config.get("evaluation_config") or {})
+        governance = dict(self.task_config.get("overfit_governance") or {})
+        if governance.get("dynamic_actual_trials"):
+            actual = int(self.status.get("candidate_evaluations") or 0) + 1
+            direction_multiplier = (
+                2 if self._direction_policy() == "both_train_select" else 1
+            )
+            overrides["multiple_testing_trials"] = max(
+                int(overrides.get("multiple_testing_trials") or 1),
+                actual * direction_multiplier,
+            )
+        return overrides
+
     async def _llm_call_count(self) -> int:
         async with SessionLocal() as session:
             value = await session.scalar(
@@ -733,16 +749,15 @@ class Engine:
         async with SessionLocal() as s:
             exp = await s.get(Experiment, self.exp_id)
             self.task_config = dict(exp.research_config or {}) if exp else {}
-        task_service = str(
-            self.task_config.get("service_instance") or ""
-        ).strip()
-        if task_service and task_service != SERVICE_INSTANCE:
+        task_service = str(self.task_config.get("service_instance") or "").strip()
+        if not service_accepts_task(self.task_config):
             self.running = False
             return {
                 "ok": False,
                 "msg": (
                     f"研究任务 {self.exp_id} 绑定服务 {task_service}，"
-                    f"当前实例为 {SERVICE_INSTANCE}"
+                    f"当前实例为 {SERVICE_INSTANCE}；"
+                    "只有架构中立的统一主服务可以手动接管历史实例任务"
                 ),
             }
         if SERVICE_ARCHITECTURE in {"two_layer", "three_layer"}:
@@ -937,6 +952,12 @@ class Engine:
             incumbent = await self._ensure_incumbent_v2()
             self.status["state"] = "running"
             cfg = await self._config_v2()
+
+            # Unlimited campaigns must restore the real cumulative trial count;
+            # otherwise restarts silently reset the multiple-testing burden.
+            self.status["candidate_evaluations"] = (
+                await self._candidate_evaluation_count()
+            )
 
             if await self._stop_if_evaluation_budget_reached(refresh=True):
                 return
@@ -1968,7 +1989,7 @@ class Engine:
                         task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
                         self._panel_glob(), task.get("cost_bps", 15),
                         self.task_config.get("market", "us"),
-                        self.task_config.get("evaluation_config"),
+                        self._dynamic_evaluation_overrides(),
                         task.get(
                             "direction_policy",
                             self._direction_policy(),
@@ -2025,6 +2046,24 @@ class Engine:
                     expression_hash=normalize_hash(expr) if node.status == "ok" else "invalid",
                     layer="INNER_PUBLIC+META_TRAIN", task_name=task["name"],
                     evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                    node_id=node.id,
+                    parent_node_id=node.parent_id,
+                    expression=expr,
+                    search_method=str(
+                        (node.proposal_meta or {}).get("search_algorithm")
+                        or node.source
+                    ),
+                    mechanism=str(
+                        (node.proposal_meta or {}).get("target_family") or ""
+                    ),
+                    selected=bool(
+                        (node.public_metrics.get("discovery") or {}).get("passed")
+                    ),
+                    failure_reason=node.error or "; ".join(
+                        (node.public_metrics.get("discovery") or {}).get(
+                            "failure_reasons", []
+                        )[:4]
+                    ),
                     statistic={
                         "public_score": node.public_score,
                         "learning_score": node.public_score,
@@ -2336,6 +2375,17 @@ class Engine:
                     "task_signature": task_signature,
                     "task_snapshot": task_snapshot,
                     "return_source_governance": governance,
+                    "double_blind_review": {
+                        "protocol": "factorfactory.double-blind-review/v1",
+                        "method_review": "pending_optional_llm_shortlist_review",
+                        "code_review": deterministic_code_review(
+                            node.expression,
+                            self.task_config.get("market", "us"),
+                        ),
+                        "promotion_policy": (
+                            "research_record_allowed_formal_promotion_requires_both"
+                        ),
+                    },
                 },
                 fingerprint={
                     "miner_version_id": node.miner_version_id, "outer_step": node.outer_step_no,
@@ -2833,7 +2883,7 @@ class Engine:
                     task.get("mode", DEFAULT_PORTFOLIO_MODE), task.get("direction", 1),
                     self._panel_glob(), task.get("cost_bps", 15),
                     self.task_config.get("market", "us"),
-                    self.task_config.get("evaluation_config"),
+                    self._dynamic_evaluation_overrides(),
                     task.get(
                         "direction_policy",
                         self._direction_policy(),
@@ -2884,6 +2934,24 @@ class Engine:
                     expression_hash=normalize_hash(expr) if node.status == "ok" else "invalid",
                     layer="INNER_PUBLIC+META_TRAIN", task_name=task["name"],
                     evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                    node_id=node.id,
+                    parent_node_id=node.parent_id,
+                    expression=expr,
+                    search_method=str(
+                        (node.proposal_meta or {}).get("search_algorithm")
+                        or node.source
+                    ),
+                    mechanism=str(
+                        (node.proposal_meta or {}).get("target_family") or ""
+                    ),
+                    selected=bool(
+                        (node.public_metrics.get("discovery") or {}).get("passed")
+                    ),
+                    failure_reason=node.error or "; ".join(
+                        (node.public_metrics.get("discovery") or {}).get(
+                            "failure_reasons", []
+                        )[:4]
+                    ),
                     statistic={
                         "public_score": node.public_score,
                         "learning_score": node.public_score,
