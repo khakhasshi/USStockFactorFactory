@@ -8,7 +8,11 @@ service_port="${FF_PORT:-10010}"
 service_host="${FF_HOST:-127.0.0.1}"
 service_instance="${FF_SERVICE_INSTANCE:-factorfactory-${service_port}}"
 service_architecture="${FF_SERVICE_ARCHITECTURE:-}"
-research_autostart="${FF_AUTOSTART_RESEARCH:-0}"
+default_research_autostart=0
+if [[ "$service_port" == "10010" ]]; then
+  default_research_autostart=1
+fi
+research_autostart="${FF_AUTOSTART_RESEARCH:-$default_research_autostart}"
 parallel_evaluations="${FF_MAX_PARALLEL_EVALUATIONS:-2}"
 llm_timeout_seconds="${FF_LLM_TIMEOUT_SECONDS:-420}"
 llm_max_attempts="${FF_LLM_MAX_ATTEMPTS:-2}"

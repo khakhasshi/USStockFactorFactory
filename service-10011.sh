@@ -1,12 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
 
-cd "$(dirname "$0")"
-export FF_PORT=10011
-export FF_SERVICE_INSTANCE="factorfactory-two-layer-ideal"
-export FF_SERVICE_ARCHITECTURE="two_layer"
-export FF_AUTOSTART_RESEARCH=1
-export FF_MAX_PARALLEL_EVALUATIONS=1
-export FF_LLM_TIMEOUT_SECONDS=420
-export FF_LLM_MAX_ATTEMPTS=2
-exec ./service.sh "${1:-status}" "${2:-}"
+print -u2 "10011 已退役：双层理想任务及完整研究历史已迁移到 10010。"
+print -u2 "请使用 ./service.sh ${1:-status} 管理统一服务。"
+exit 3
