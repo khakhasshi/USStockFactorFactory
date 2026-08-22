@@ -1,7 +1,8 @@
 """统一 LLM 客户端: 支持 openai (chat/completions) 与 anthropic (messages) 两种接口格式.
 
 Provider 配置存于 settings 表 key='llm_providers':
-{"providers": [{"name","format":"openai|anthropic","base_url","api_key","model"}],
+{"providers": [{"name","format":"openai|anthropic","base_url","api_key","model",
+"thinking":{"type":"enabled|disabled"}}],
  "inner_provider": "...", "outer_provider": "..."}
 """
 
@@ -22,6 +23,32 @@ REQUEST_TIMEOUT_SECONDS = max(
 MAX_ATTEMPTS = max(1, int(os.environ.get("FF_LLM_MAX_ATTEMPTS", "2")))
 TIMEOUT = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=20.0)
 logger = logging.getLogger("llm.audit")
+
+
+def _openai_payload(
+    provider: dict,
+    system: str,
+    user: str,
+    temperature: float,
+) -> dict[str, Any]:
+    """Build an OpenAI-compatible payload with bounded provider extensions."""
+    payload: dict[str, Any] = {
+        "model": provider.get("model", ""),
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    thinking = provider.get("thinking")
+    thinking_type = (
+        str(thinking.get("type") or "").strip().lower()
+        if isinstance(thinking, dict)
+        else ""
+    )
+    if thinking_type in {"enabled", "disabled"}:
+        payload["thinking"] = {"type": thinking_type}
+    return payload
 
 
 class LLMError(Exception):
@@ -232,14 +259,12 @@ async def chat(
                     resp = await client.post(
                         url,
                         headers={"Authorization": f"Bearer {key}"},
-                        json={
-                            "model": model,
-                            "temperature": temperature,
-                            "messages": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": user},
-                            ],
-                        },
+                        json=_openai_payload(
+                            provider,
+                            system,
+                            user,
+                            temperature,
+                        ),
                     )
                     if resp.status_code != 200:
                         error_type = (
