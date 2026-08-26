@@ -10,6 +10,7 @@ import hashlib
 import math
 import re
 
+import numpy as np
 import polars as pl
 
 from ..config import DSL_FIELDS
@@ -70,7 +71,17 @@ OPERATORS_DOC = {
     "ts_delta(x, w)": "x - delay(x, w)",
     "returns(x, w)": "x / delay(x, w) - 1",
     "ts_corr(x, y, w)": "w 日滚动相关系数",
+    "ts_quantile(x, w, q)": "w 日滚动 q 分位数",
+    "ts_slope(x, w)": "w 日线性回归斜率（Qlib 兼容）",
+    "ts_rsquare(x, w)": "w 日线性回归 R²（Qlib 兼容）",
+    "ts_resi(x, w)": "w 日线性回归当前残差（Qlib 兼容）",
+    "ts_argmax(x, w)": "w 日窗口最大值首次出现位置，1..w（Qlib 兼容）",
+    "ts_argmin(x, w)": "w 日窗口最小值首次出现位置，1..w（Qlib 兼容）",
     "delay(x, d)": "滞后 d 日",
+    "maximum(x, y)": "逐元素较大值",
+    "minimum(x, y)": "逐元素较小值",
+    "gt(x, y)": "逐元素 x>y，输出 0/1",
+    "lt(x, y)": "逐元素 x<y，输出 0/1",
     "rank(x)": "当日截面百分位排名",
     "zscore(x)": "当日截面 zscore",
     "winsor(x)": "当日截面 2.5 倍标准差截尾",
@@ -152,6 +163,15 @@ class _Builder:
         if fn == "sign":
             arity(1)
             return self.build(a[0]).sign()
+        if fn in {"maximum", "minimum", "gt", "lt"}:
+            arity(2)
+            left, right = self.build(a[0]), self.build(a[1])
+            if fn == "maximum":
+                return pl.max_horizontal(left, right)
+            if fn == "minimum":
+                return pl.min_horizontal(left, right)
+            comparison = left > right if fn == "gt" else left < right
+            return comparison.cast(pl.Float64)
 
         # 窗口算子: 操作数先构建 (其内部窗口已物化为临时列), 结果整体再物化
         if fn == "delay":
@@ -199,6 +219,83 @@ class _Builder:
             arity(3)
             w = _win(a[2])
             return self._mat(_ts(_rolling_corr(self.build(a[0]), self.build(a[1]), w)))
+        if fn == "ts_quantile":
+            arity(3)
+            w = _win(a[1])
+            quantile = _number(a[2], name="ts_quantile q")
+            if not 0.0 <= quantile <= 1.0:
+                raise ValueError("ts_quantile q 必须在 [0, 1] 内")
+            x = self.build(a[0])
+            return self._mat(
+                _ts(
+                    x.rolling_quantile(
+                        quantile,
+                        interpolation="linear",
+                        window_size=w,
+                        min_samples=w,
+                    )
+                )
+            )
+        if fn in {"ts_slope", "ts_rsquare", "ts_resi"}:
+            arity(2)
+            w = _win(a[1])
+            if w < 2:
+                raise ValueError(f"{fn} 窗口必须至少为 2")
+            x = self.build(a[0])
+            sum_y = self._mat(_ts(x.rolling_sum(w, min_samples=w)))
+            sum_y2 = self._mat(_ts((x * x).rolling_sum(w, min_samples=w)))
+            sum_xy = self._mat(
+                _ts(
+                    x.rolling_sum(
+                        w,
+                        weights=[float(i) for i in range(1, w + 1)],
+                        min_samples=w,
+                    )
+                )
+            )
+            n = float(w)
+            sum_x = n * (n + 1.0) / 2.0
+            sum_x2 = n * (n + 1.0) * (2.0 * n + 1.0) / 6.0
+            numerator = n * sum_xy - sum_x * sum_y
+            x_denominator = n * sum_x2 - sum_x * sum_x
+            slope = self._mat(numerator / (x_denominator + 1e-12))
+            if fn == "ts_slope":
+                return slope
+            y_denominator = n * sum_y2 - sum_y * sum_y
+            if fn == "ts_rsquare":
+                return self._mat(
+                    (numerator * numerator)
+                    / (x_denominator * y_denominator + 1e-12)
+                )
+            intercept = self._mat(sum_y / n - slope * (sum_x / n))
+            return self._mat(x - (slope * n + intercept))
+        if fn in {"ts_argmax", "ts_argmin"}:
+            arity(2)
+            w = _win(a[1])
+            x = self.build(a[0])
+
+            def rolling_positions(series: pl.Series) -> pl.Series:
+                values = np.asarray(series.to_numpy(), dtype=float)
+                output = np.full(values.shape[0], np.nan, dtype=float)
+                if values.shape[0] < w:
+                    return pl.Series(output)
+                windows = np.lib.stride_tricks.sliding_window_view(values, w)
+                valid = np.isfinite(windows).all(axis=1)
+                if fn == "ts_argmax":
+                    positions = np.argmax(windows, axis=1) + 1
+                else:
+                    positions = np.argmin(windows, axis=1) + 1
+                output[w - 1 :] = np.where(valid, positions, np.nan)
+                return pl.Series(output)
+
+            return self._mat(
+                _ts(
+                    x.map_batches(
+                        rolling_positions,
+                        return_dtype=pl.Float64,
+                    )
+                )
+            )
         if fn == "rank":
             arity(1)
             x = self.build(a[0])
@@ -260,9 +357,55 @@ def parse(expression: str, fields: list[str] | None = None) -> FactorPipeline:
     return FactorPipeline(b.stages, final)
 
 
-def normalize_hash(expression: str) -> str:
+def _flatten_root_multiplication(node: ast.expr) -> list[ast.expr]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        return [
+            *_flatten_root_multiplication(node.left),
+            *_flatten_root_multiplication(node.right),
+        ]
+    return [node]
+
+
+def _direction_invariant_root_key(node: ast.expr) -> str:
+    """Canonicalise only a global sign; nonlinear nested signs stay distinct."""
+    while isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        node = node.operand
+    factors = _flatten_root_multiplication(node)
+    if len(factors) == 1:
+        return ast.dump(node, include_attributes=False)
+    keys = []
+    for factor in factors:
+        while isinstance(factor, ast.UnaryOp) and isinstance(
+            factor.op, ast.USub
+        ):
+            factor = factor.operand
+        if (
+            isinstance(factor, ast.Constant)
+            and isinstance(factor.value, (int, float))
+            and not isinstance(factor.value, bool)
+            and abs(float(factor.value)) == 1.0
+        ):
+            continue
+        keys.append(ast.dump(factor, include_attributes=False))
+    if not keys:
+        return "GLOBAL_SCALAR"
+    if len(keys) == 1:
+        return keys[0]
+    return "ROOT_MUL(" + "|".join(sorted(keys)) + ")"
+
+
+def normalize_hash(
+    expression: str,
+    *,
+    direction_invariant: bool = False,
+) -> str:
     tree = ast.parse(expression, mode="eval")
-    return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:16]
+    key = (
+        _direction_invariant_root_key(tree.body)
+        if direction_invariant
+        else ast.dump(tree, include_attributes=False)
+    )
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def validate(expression: str, fields: list[str] | None = None) -> str | None:

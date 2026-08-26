@@ -23,6 +23,7 @@ from app.eval.harness import (
     _prepare_daily,
     evaluate,
     evaluate_full,
+    preflight_expression,
 )
 from app.miner.agent import _build_system_prompt
 from app.config import DEFAULT_MINER_TEMPLATE
@@ -143,6 +144,34 @@ class EvaluationV3Tests(unittest.TestCase):
         self.assertNotIn("vault", result)
         self.assertIn("active", result["public"])
         self.assertIn("cost_stress", result["gate"])
+
+    def test_constant_cross_section_is_rejected_before_tie_order_can_trade(self):
+        with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):
+            with self.assertRaisesRegex(ValueError, "有效评估样本为空"):
+                evaluate(
+                    "1",
+                    universe_n=100,
+                    horizon=5,
+                    portfolio_mode="long_only",
+                    direction=1,
+                    panel_glob="synthetic",
+                    cost_bps=20,
+                    market="ashare",
+                )
+
+    def test_cheap_preflight_rejects_constant_and_accepts_varying_signal(self):
+        with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):
+            constant = preflight_expression(
+                "1", 100, 5, "synthetic", "ashare", sample_modulus=1
+            )
+            varying = preflight_expression(
+                "rank(close)", 100, 5, "synthetic", "ashare", sample_modulus=1
+            )
+        self.assertFalse(constant["accepted"])
+        self.assertEqual(constant["usable_dates"], 0)
+        self.assertTrue(varying["accepted"])
+        self.assertGreater(varying["finite_coverage"], 0.9)
+        self.assertFalse(varying["evaluation_performed"])
 
     def test_full_audit_has_four_isolation_layers_plus_2020_latest_rating(self):
         with patch("app.eval.harness.PanelStore.get", return_value=_SyntheticPanel(self.frame)):

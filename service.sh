@@ -14,11 +14,15 @@ if [[ "$service_port" == "10010" ]]; then
 fi
 research_autostart="${FF_AUTOSTART_RESEARCH:-$default_research_autostart}"
 parallel_evaluations="${FF_MAX_PARALLEL_EVALUATIONS:-2}"
+polars_max_threads="${POLARS_MAX_THREADS:-}"
 llm_timeout_seconds="${FF_LLM_TIMEOUT_SECONDS:-420}"
 llm_max_attempts="${FF_LLM_MAX_ATTEMPTS:-2}"
 skip_historical_feedback_backfill="${FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL:-0}"
 database_url="${FF_DATABASE_URL:-}"
 backtest_artifact_root="${FF_BACKTEST_ARTIFACT_ROOT:-}"
+backtest_backend="${FF_BACKTEST_BACKEND:-}"
+rust_kernel_library="${FF_RUST_KERNEL_LIBRARY:-}"
+rust_alignment_tolerance="${FF_RUST_ALIGNMENT_ABS_TOLERANCE:-}"
 python_runtime="${FF_PYTHON:-}"
 log_dir="$service_root/var/log"
 log_file="$log_dir/factorfactory-${service_port}.log"
@@ -83,8 +87,12 @@ start_service() {
     "FF_LLM_MAX_ATTEMPTS=$llm_max_attempts"
     "FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL=$skip_historical_feedback_backfill"
   )
+  [[ -n "$polars_max_threads" ]] && launch_environment+=("POLARS_MAX_THREADS=$polars_max_threads")
   [[ -n "$database_url" ]] && launch_environment+=("FF_DATABASE_URL=$database_url")
   [[ -n "$backtest_artifact_root" ]] && launch_environment+=("FF_BACKTEST_ARTIFACT_ROOT=$backtest_artifact_root")
+  [[ -n "$backtest_backend" ]] && launch_environment+=("FF_BACKTEST_BACKEND=$backtest_backend")
+  [[ -n "$rust_kernel_library" ]] && launch_environment+=("FF_RUST_KERNEL_LIBRARY=$rust_kernel_library")
+  [[ -n "$rust_alignment_tolerance" ]] && launch_environment+=("FF_RUST_ALIGNMENT_ABS_TOLERANCE=$rust_alignment_tolerance")
   [[ -n "$python_runtime" ]] && launch_environment+=("FF_PYTHON=$python_runtime")
 
   launchctl submit \

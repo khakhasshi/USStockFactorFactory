@@ -23,6 +23,7 @@ def research_record_payload(
     *,
     task_rank: int | None = None,
     formal_factor_id: int | None = None,
+    research_factor_id: int | None = None,
 ) -> dict[str, Any]:
     public = dict(node.public_metrics or {})
     discovery = dict(public.get("discovery") or {})
@@ -35,6 +36,11 @@ def research_record_payload(
         or feedback.get("factor_admission")
         or {}
     )
+    search_policy = dict(proposal.get("search_policy") or {})
+    search_health = dict(search_policy.get("search_health") or {})
+    pre_eval_rejection = str(
+        proposal.get("pre_evaluation_rejection") or ""
+    )
     return {
         "schema_version": RESEARCH_RECORD_SCHEMA_VERSION,
         "id": node.id,
@@ -46,6 +52,8 @@ def research_record_payload(
         ),
         "formal_factor_id": formal_factor_id,
         "formal_factor_admitted": formal_factor_id is not None,
+        "research_factor_id": research_factor_id,
+        "research_candidate_registered": research_factor_id is not None,
         "evaluation_protocol": node.evaluation_protocol,
         "miner_version_id": node.miner_version_id,
         "outer_step_no": node.outer_step_no,
@@ -91,6 +99,51 @@ def research_record_payload(
         "improvement_targets": list(feedback.get("improvement_targets") or []),
         "reflection": str(proposal.get("reflection") or ""),
         "targeted_failures": list(proposal.get("targeted_failures") or []),
+        "search_audit": {
+            "algorithm": proposal.get("search_algorithm"),
+            "group": proposal.get("search_group"),
+            "search_epoch": proposal.get("search_epoch", 0),
+            "health_state": proposal.get("search_health_state"),
+            "reset_triggered": bool(proposal.get("search_reset_triggered")),
+            "reset_reasons": list(proposal.get("search_reset_reasons") or []),
+            "normalized_expression_hash": proposal.get(
+                "normalized_expression_hash"
+            ),
+            "novelty_retries": int(
+                proposal.get("campaign_novelty_retries") or 0
+            ),
+            "pre_evaluation_rejection": pre_eval_rejection or None,
+            "evaluation_performed": bool(
+                proposal.get("evaluation_performed", node.status != "rejected")
+            ),
+            "budget_charged": bool(
+                proposal.get("budget_charged", node.status != "rejected")
+            ),
+            "recent_duplicate_rate": search_health.get(
+                "recent_duplicate_rate"
+            ),
+            "unique_since_gate_record": search_health.get(
+                "unique_since_gate_record"
+            ),
+            "elite_archive_node_ids": list(
+                proposal.get("elite_archive_node_ids") or []
+            ),
+            "qlib": {
+                "upstream_commit": proposal.get("qlib_upstream_commit"),
+                "alpha158_feature": proposal.get("qlib_feature"),
+                "alpha158_family": proposal.get("qlib_feature_family"),
+                "joint_model_ready": proposal.get("joint_model_ready"),
+                "joint_model_protocol": proposal.get("joint_model_protocol"),
+                "distillation_kind": proposal.get("distillation_kind"),
+                "distillation_components": list(
+                    proposal.get("distillation_components") or []
+                ),
+                "candidate_pool_count": proposal.get(
+                    "qlib_candidate_count"
+                ),
+                "holdout_vault_consumed": False,
+            },
+        },
         "factor_admission": redact_value(admission),
         "created_at": str(node.created_at),
         "interpretation_boundary": (
@@ -107,13 +160,25 @@ def task_research_summary(records: Iterable[dict[str, Any]]) -> list[dict[str, A
     summaries = []
     for task_name, rows in sorted(grouped.items()):
         valid = [row for row in rows if row.get("status") == "ok"]
+        pre_eval_rejected = [
+            row for row in rows
+            if (row.get("search_audit") or {}).get("pre_evaluation_rejection")
+        ]
         sources = Counter(str(row.get("source") or "unknown") for row in rows)
+        qlib_rows = [
+            row for row in rows
+            if any(
+                value not in (None, "", [], False)
+                for value in ((row.get("search_audit") or {}).get("qlib") or {}).values()
+            )
+        ]
         summaries.append({
             "task_name": task_name,
             "records": len(rows),
             "valid": len(valid),
             "passed": sum(bool(row.get("discovery_passed")) for row in valid),
             "formal_factors": sum(bool(row.get("formal_factor_admitted")) for row in rows),
+            "pre_eval_rejected": len(pre_eval_rejected),
             "best_learning_score": round(
                 max((float(row.get("learning_score") or 0.0) for row in valid), default=0.0),
                 4,
@@ -123,5 +188,10 @@ def task_research_summary(records: Iterable[dict[str, Any]]) -> list[dict[str, A
                 4,
             ),
             "source_counts": dict(sources.most_common()),
+            "qlib_candidates": len(qlib_rows),
+            "qlib_joint_distillations": sum(
+                bool(((row.get("search_audit") or {}).get("qlib") or {}).get("joint_model_ready"))
+                for row in qlib_rows
+            ),
         })
     return summaries

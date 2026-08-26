@@ -51,6 +51,7 @@ LAYER_ALIASES = {
     "META_HOLDOUT": "holdout",
     "FACTOR_VAULT": "vault",
 }
+SIGNAL_PREFLIGHT_PROTOCOL = "factorfactory.signal-preflight/v1"
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -339,6 +340,19 @@ def _prepare_factor_base(
         .filter((pl.col("univ_rank") <= universe_n) & pl.col(fwd).is_finite())
         .with_columns(pl.len().over("trade_date").alias("_eligible_n"))
         .filter(pl.col("factor").is_finite())
+        # A constant or numerically near-constant cross-section has no ranking
+        # information.  Without this guard, deterministic tie ordering can
+        # manufacture a portfolio from row order (the US Alpha158 VWAP0 proxy
+        # exposed this failure mode).  Require economically non-trivial daily
+        # dispersion before ranks, deciles, IC, or turnover are constructed.
+        .with_columns(
+            pl.col("factor").std().over("trade_date").alias("_factor_std"),
+            pl.col("factor").abs().mean().over("trade_date").alias("_factor_abs_mean"),
+        )
+        .filter(
+            pl.col("_factor_std")
+            > (pl.col("_factor_abs_mean") + 1.0) * 1e-10
+        )
         .with_columns(
             pl.col("factor").rank(method="average").over("trade_date").alias("_factor_rank"),
             pl.col(fwd).rank(method="average").over("trade_date").alias("_return_rank"),
@@ -367,6 +381,105 @@ def _prepare_factor_base(
         .cache()
     )
     return base, fwd
+
+
+def _preflight_decision(
+    daily: pl.DataFrame,
+    *,
+    min_finite_coverage: float = 0.02,
+    min_usable_dates: int = 8,
+    min_unique_values: int = 3,
+) -> dict:
+    eligible = int(daily["eligible_n"].sum()) if daily.height else 0
+    finite = int(daily["finite_n"].sum()) if daily.height else 0
+    coverage = finite / eligible if eligible else 0.0
+    usable = daily.filter(
+        (pl.col("finite_n") >= min_unique_values)
+        & (pl.col("unique_n") >= min_unique_values)
+        & pl.col("factor_std").is_finite()
+        & (
+            pl.col("factor_std")
+            > (pl.col("factor_abs_mean").fill_null(0.0) + 1.0) * 1e-10
+        )
+    ) if daily.height else daily
+    usable_rate = usable.height / daily.height if daily.height else 0.0
+    reasons: list[str] = []
+    if eligible == 0:
+        reasons.append("廉价预筛：没有可评价样本")
+    if coverage < min_finite_coverage:
+        reasons.append("廉价预筛：有限值覆盖率不足")
+    if usable.height < min_usable_dates:
+        reasons.append("廉价预筛：非常数有效日期不足")
+    return {
+        "accepted": not reasons,
+        "failure_reasons": reasons,
+        "eligible_observations": eligible,
+        "finite_observations": finite,
+        "finite_coverage": round(coverage, 6),
+        "observed_dates": daily.height,
+        "usable_dates": usable.height,
+        "usable_date_rate": round(usable_rate, 6),
+        "thresholds": {
+            "min_finite_coverage": min_finite_coverage,
+            "min_usable_dates": min_usable_dates,
+            "min_unique_values_per_date": min_unique_values,
+        },
+    }
+
+
+def preflight_expression(
+    expression: str,
+    universe_n: int,
+    horizon: int,
+    panel_glob: str | None,
+    market: str,
+    *,
+    sample_modulus: int = 8,
+) -> dict:
+    """Reject obvious null/constant/low-coverage signals before full V4.2.
+
+    Sampling is deterministic by security and keeps every historical row for
+    selected names, so rolling DSL operators retain their causal warm-up.  The
+    result never contributes a score or an evaluation trial.
+    """
+    started = time.perf_counter()
+    df = PanelStore.get(panel_glob, market).ensure_loaded()
+    fwd = f"fwd_{horizon}"
+    if fwd not in df.columns:
+        raise ValueError(f"不支持的 horizon: {horizon}")
+    pipe = parse(expression, get_dsl_fields(market))
+    modulus = max(1, int(sample_modulus))
+    source = df.lazy().filter(pl.col("layer").is_in(DISCOVERY_LAYERS))
+    if modulus > 1:
+        source = source.filter(
+            (pl.col("ts_code").hash(seed=1729) % modulus) == 0
+        )
+    daily = (
+        pipe.apply(source)
+        .filter((pl.col("univ_rank") <= universe_n) & pl.col(fwd).is_finite())
+        .group_by("trade_date")
+        .agg(
+            pl.len().alias("eligible_n"),
+            pl.col("factor").is_finite().sum().alias("finite_n"),
+            pl.col("factor").filter(pl.col("factor").is_finite()).n_unique().alias("unique_n"),
+            pl.col("factor").filter(pl.col("factor").is_finite()).std().alias("factor_std"),
+            pl.col("factor").filter(pl.col("factor").is_finite()).abs().mean().alias("factor_abs_mean"),
+        )
+        .collect()
+    )
+    decision = _preflight_decision(daily)
+    return {
+        "schema": SIGNAL_PREFLIGHT_PROTOCOL,
+        **decision,
+        "sample_policy": {
+            "security_hash_modulus": modulus,
+            "layers": list(DISCOVERY_LAYERS),
+            "rolling_history_preserved": True,
+        },
+        "evaluation_performed": False,
+        "budget_charged": False,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+    }
 
 
 def _prepare_direction_work(
@@ -548,7 +661,7 @@ def _collect_direction_frames(
     portfolio_mode: str,
     directions: list[int],
     cfg: dict,
-) -> dict[int, tuple[pl.DataFrame, pl.DataFrame]]:
+) -> tuple[dict[int, tuple[pl.DataFrame, pl.DataFrame]], dict]:
     lazy_frames: list[pl.LazyFrame] = []
     for direction in directions:
         work = _prepare_direction_work(
@@ -566,6 +679,23 @@ def _collect_direction_frames(
         )
         lazy_frames.extend([daily_lazy, decile_lazy])
 
+    # Direction-invariant, bounded signal-rank sketch for second-level dedupe.
+    # The deterministic security hash prevents the daily mean percentile
+    # (always about 0.5) from erasing cross-sectional identity.
+    signal_sketch_lazy = (
+        base.with_columns(
+            pl.when((pl.col("ts_code").hash(seed=1729) % 2) == 0)
+            .then(pl.col("_factor_pct") - 0.5)
+            .otherwise(0.5 - pl.col("_factor_pct"))
+            .alias("_signed_rank_sketch"),
+            ((pl.col("_date_seq") - 1) % 32).cast(pl.Int16).alias("_sketch_bucket"),
+        )
+        .group_by("layer", "_sketch_bucket")
+        .agg(pl.col("_signed_rank_sketch").mean().alias("value"))
+        .sort("layer", "_sketch_bucket")
+    )
+    lazy_frames.append(signal_sketch_lazy)
+
     # collect_all performs common-subplan elimination across every orientation.
     # The direction-neutral cache above therefore executes exactly once.
     # Common-subplan and common-subexpression elimination are enabled in the
@@ -580,7 +710,16 @@ def _collect_direction_frames(
                 "有效评估样本为空：表达式可能全为 null、常数或覆盖率不足"
             )
         output[direction] = (daily, deciles)
-    return output
+    sketch = frames[-1]
+    signature = {
+        "schema": "factorfactory.signal-rank-sketch/v1",
+        "available": sketch.height >= 8,
+        "direction_invariant_comparison": "absolute_correlation",
+        "layers": sorted(sketch["layer"].unique().to_list()) if sketch.height else [],
+        "buckets": 32,
+        "vector": [round(float(value), 10) for value in sketch["value"].to_list()],
+    }
+    return output, signature
 
 
 def _prepare_direction_batch(
@@ -609,7 +748,7 @@ def _prepare_direction_batch(
         layer_name_override=layer_name_override,
     )
     planned = time.perf_counter()
-    frames = _collect_direction_frames(
+    frames, signal_signature = _collect_direction_frames(
         base,
         fwd,
         horizon,
@@ -625,6 +764,7 @@ def _prepare_direction_batch(
         "direction_count": len(directions),
         "factor_materializations": 1,
         "execution": "polars_native_shared_subplan",
+        "signal_rank_signature": signal_signature,
     }
 
 

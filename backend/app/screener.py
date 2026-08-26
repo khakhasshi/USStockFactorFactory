@@ -99,6 +99,7 @@ def _cache_key(
         "date": str(target_date),
         "factors": [
             {
+                "name": row.get("name"),
                 "expression": row["expression"],
                 "weight": float(row.get("weight", 1.0)),
                 "direction": int(row.get("direction", 1)),
@@ -248,6 +249,7 @@ def screen_cross_section(
             weight = float(factor.get("weight", 1.0)) / total_weight
             rank_score = float(row[f"_screen_rank_{index}"])
             components.append({
+                "name": factor.get("name") or f"因子{index + 1}",
                 "expression": factor["expression"],
                 "direction": int(factor.get("direction", 1)),
                 "weight": round(weight, 6),

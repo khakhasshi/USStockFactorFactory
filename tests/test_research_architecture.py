@@ -32,6 +32,9 @@ def test_preset_is_authoritative_and_derives_runtime_protocol():
         "memory_mode": "cold",
     })
 
+    qlib = resolved.pop("qlib_integration")
+    assert qlib["enabled"] is False
+    assert qlib["effective"] is False
     assert resolved == {
         "architecture_schema": RESEARCH_ARCHITECTURE_SCHEMA,
         "architecture_template": "random_researcher",
@@ -54,7 +57,12 @@ def test_no_llm_and_full_three_layer_presets_are_explicit():
     assert no_llm["proposal_mode"] == "search_pool"
     assert no_llm["memory_mode"] == "cold"
     assert no_llm["layer2_enabled"] is False
-    assert full["search_algorithms"] == list(DEFAULT_SEARCH_ALGORITHMS)
+    assert full["search_algorithms"] == [
+        *DEFAULT_SEARCH_ALGORITHMS,
+        "qlib_alpha158_prior",
+        "qlib_joint_residual_distill",
+    ]
+    assert full["qlib_integration"]["effective"] is True
     assert [full[f"layer{i}_enabled"] for i in (1, 2, 3)] == [True, True, True]
 
 

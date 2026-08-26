@@ -131,11 +131,13 @@ def manifest() -> list[dict]:
                 "scope": "public_plus_meta_train_only",
             },
             "residual_search": {
-                "protocol": "factorfactory.residual-oof-beam/v1",
+                "protocol": "factorfactory.residual-oof-beam/v2",
                 "exact_oof_endpoint": "/api/research-intelligence/residual-beam",
-                "continuous_proxy": "compressed_training_return_path",
-                "beam_width": 5,
-                "promotion_requires_exact_oof": True,
+                "continuous_mode": "sample_level_cross_sectional_time_ordered_oof",
+                "automated_layers": ["INNER_PUBLIC", "META_TRAIN"],
+                "whole_date_folds": True,
+                "beam_width": 12,
+                "proxy_fallback_forbidden": True,
             },
             "mechanism_lens": {
                 "protocol": "factorfactory.mechanism-lens/v1",

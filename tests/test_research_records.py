@@ -64,17 +64,21 @@ def test_research_record_is_training_safe_and_explicitly_non_formal():
     assert payload["formal_factor_admitted"] is False
     assert payload["learning_score"] == 0.73
     assert payload["metrics"]["icir"] == 0.81
+    assert payload["search_audit"]["evaluation_performed"] is True
     assert "gate_metrics" not in payload
     assert "sealed_holdout_sharpe" not in str(payload)
     assert "not formal factor" in payload["interpretation_boundary"]
 
 
 def test_research_record_can_link_to_formal_factor_without_changing_boundary():
-    payload = research_record_payload(_node(), task_rank=1, formal_factor_id=17)
+    payload = research_record_payload(
+        _node(), task_rank=1, formal_factor_id=17, research_factor_id=17
+    )
 
     assert payload["record_tier"] == "formal_factor"
     assert payload["formal_factor_admitted"] is True
     assert payload["formal_factor_id"] == 17
+    assert payload["research_candidate_registered"] is True
     assert "production approval" in payload["interpretation_boundary"]
 
 
@@ -84,10 +88,15 @@ def test_task_summary_aggregates_counts_and_best_scores():
         research_record_payload(
             _node(
                 id=2,
-                status="error",
-                source="llm_rejected",
+                status="rejected",
+                source="search_pool",
                 public_score=0.0,
                 public_metrics={"discovery": {"learning_score": 0.0}},
+                proposal_meta={
+                    "pre_evaluation_rejection": "duplicate_normalized_ast",
+                    "evaluation_performed": False,
+                    "budget_charged": False,
+                },
             ),
             task_rank=2,
         ),
@@ -97,5 +106,6 @@ def test_task_summary_aggregates_counts_and_best_scores():
     assert summary["records"] == 2
     assert summary["valid"] == 1
     assert summary["passed"] == 0
+    assert summary["pre_eval_rejected"] == 1
     assert summary["best_learning_score"] == 0.73
-    assert summary["source_counts"] == {"random": 1, "llm_rejected": 1}
+    assert summary["source_counts"] == {"random": 1, "search_pool": 1}

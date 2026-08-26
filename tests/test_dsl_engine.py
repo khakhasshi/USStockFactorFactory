@@ -7,7 +7,7 @@ import polars as pl
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.dsl.engine import parse, validate
+from app.dsl.engine import normalize_hash, parse, validate
 
 
 def _reference_ts_rank(series: pl.Series) -> float | None:
@@ -98,6 +98,24 @@ class DslEngineTests(unittest.TestCase):
     def test_external_one_year_windows_accept_252_but_not_more(self):
         self.assertIsNone(validate("ts_mean(close, 252)", ["close"]))
         self.assertIn("1..252", validate("ts_mean(close, 253)", ["close"]))
+
+    def test_direction_invariant_hash_removes_global_sign_only(self):
+        base = "sign(ts_delta(close, 1)) * rank(ts_mean(close, 20))"
+        variants = [
+            f"-({base})",
+            f"(-1) * ({base})",
+            "rank(ts_mean(close, 20)) * (-1) * sign(ts_delta(close, 1))",
+        ]
+        expected = normalize_hash(base, direction_invariant=True)
+        self.assertTrue(all(
+            normalize_hash(value, direction_invariant=True) == expected
+            for value in variants
+        ))
+        self.assertNotEqual(normalize_hash(base), normalize_hash(variants[0]))
+        self.assertNotEqual(
+            normalize_hash("rank(-close)", direction_invariant=True),
+            normalize_hash("rank(close)", direction_invariant=True),
+        )
 
 
 if __name__ == "__main__":

@@ -161,7 +161,7 @@ if _MARKET == "ashare":
     # A股 DSL 字段: 价量 + 估值 + 市值 + 流动性 + 资金流向
     DSL_FIELDS = [
         # 价量
-        "open", "high", "low", "close", "vol", "amount",
+        "open", "high", "low", "close", "vwap", "vol", "amount",
         # 估值
         "pe_ttm", "pb", "ps_ttm", "dv_ttm",
         # 市值
@@ -176,12 +176,12 @@ if _MARKET == "ashare":
         "float_share",
     ]
     ASHARE_DSL_FIELDS = DSL_FIELDS
-    US_DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
+    US_DSL_FIELDS = ["open", "high", "low", "close", "vwap", "vol", "amount"]
 else:
-    DSL_FIELDS = ["open", "high", "low", "close", "vol", "amount"]
+    DSL_FIELDS = ["open", "high", "low", "close", "vwap", "vol", "amount"]
     US_DSL_FIELDS = DSL_FIELDS
     ASHARE_DSL_FIELDS = [
-        "open", "high", "low", "close", "vol", "amount",
+        "open", "high", "low", "close", "vwap", "vol", "amount",
         "pe_ttm", "pb", "ps_ttm", "dv_ttm", "total_mv", "circ_mv",
         "turnover_rate", "volume_ratio", "net_mf_amount",
         "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",

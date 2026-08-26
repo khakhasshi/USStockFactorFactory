@@ -30,6 +30,7 @@ REQUIRED_PANEL_COLUMNS = {
     "vol",
     "amount",
 }
+DERIVED_PANEL_COLUMNS = {"vwap"}
 
 PANEL_META = {
     "pit_quality": "non_pit_current_constituents",
@@ -248,7 +249,7 @@ class PanelStore:
         extra_fields = list(self.factor_fields)
         # 质量过滤列: 按存在性自适应
         available = set(lf.collect_schema().names())
-        expected = set(self.factor_fields) | REQUIRED_PANEL_COLUMNS
+        expected = (set(self.factor_fields) - DERIVED_PANEL_COLUMNS) | REQUIRED_PANEL_COLUMNS
         missing = sorted(expected - available)
         if missing:
             raise ValueError(
@@ -288,6 +289,27 @@ class PanelStore:
                 lf = lf.with_columns(pl.col("adj_factor").alias("adjustment_factor"))
             else:
                 lf = lf.with_columns(pl.lit(1.0).alias("adjustment_factor"))
+        # Qlib Alpha158 requires VWAP. Neither native panel stores a canonical
+        # adjusted VWAP, so derive the only causal proxy available at t:
+        # turnover / volume, transformed by the same adjustment factor as OHLC.
+        # The US panel often labels amount as close_times_volume_proxy; its
+        # VWAP0 is therefore explicitly reported as low-fidelity downstream.
+        if "vwap" in self.factor_fields:
+            vwap_proxy = (
+                pl.col("amount")
+                / (pl.col("vol") + 1e-12)
+                * pl.col("adjustment_factor")
+            )
+            lf = lf.with_columns(
+                pl.when(
+                    (pl.col("vol") > 0)
+                    & vwap_proxy.is_finite()
+                    & (vwap_proxy > 0)
+                )
+                .then(vwap_proxy)
+                .otherwise(pl.col("close"))
+                .alias("vwap")
+            )
         if "can_buy_open_proxy" not in cols:
             lf = lf.with_columns(pl.lit(True).alias("can_buy_open_proxy"))
         if "can_sell_open_proxy" not in cols:
@@ -422,8 +444,12 @@ class PanelStore:
                 missing_required = sorted(
                     set(required_columns) - set(schema_columns)
                 )
+                # Virtual fields such as ``vwap`` are derived causally during
+                # panel materialisation and therefore must not make the raw
+                # parquet inventory look unhealthy.
                 missing_dsl = sorted(
-                    set(expected_dsl_fields) - set(schema_columns)
+                    (set(expected_dsl_fields) - DERIVED_PANEL_COLUMNS)
+                    - set(schema_columns)
                 )
                 schema_status = (
                     "error"
@@ -479,7 +505,9 @@ class PanelStore:
                     "required_columns": sorted(REQUIRED_PANEL_COLUMNS),
                     "missing_required_columns": sorted(REQUIRED_PANEL_COLUMNS),
                     "expected_dsl_fields": get_dsl_fields(self.market),
-                    "missing_dsl_fields": get_dsl_fields(self.market),
+                    "missing_dsl_fields": sorted(
+                        set(get_dsl_fields(self.market)) - DERIVED_PANEL_COLUMNS
+                    ),
                 }
             self._inventory_cache = result
             self._inventory_cached_at = now

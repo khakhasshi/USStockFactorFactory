@@ -31,17 +31,20 @@ from .config import (
     DEFAULT_MINER_TEMPLATE,
     DEFAULT_PORTFOLIO_MODE,
     EVALUATION_PROTOCOL_VERSION,
+    FROZEN_RATING_PROTOCOL_VERSION,
     SERVICE_ARCHITECTURE,
     SERVICE_INSTANCE,
     get_dsl_fields,
     resolve_engine_tasks,
     service_accepts_task,
 )
+from .compute_progress import COMPUTE_PROGRESS
 from .data.panel import PanelStore
 from .db import SessionLocal, get_active_experiment_id
 from .blind_review import deterministic_code_review
+from .factor_lifecycle import factor_evidence_state
 from .dsl.engine import normalize_hash
-from .eval.harness import evaluate
+from .eval.harness import evaluate, preflight_expression
 from .feedback import (
     build_feedback_envelope,
     combine_seed_feedback,
@@ -69,7 +72,12 @@ from .meta.agent import (
     reflect_on_outcome,
     validate_template,
 )
-from .miner.agent import propose, propose_batch
+from .miner.agent import (
+    mutate_expression,
+    propose,
+    propose_batch,
+    random_expression_for_family,
+)
 from .models import (
     EngineEvent,
     Experiment,
@@ -83,8 +91,22 @@ from .models import (
 )
 from .observability import redact_text, redact_value, utc_now
 from .runtime_identity import runtime_identity
+from .qlib_joint import (
+    PROTOCOL as QLIB_JOINT_PROTOCOL,
+    JointModelSpec,
+    latest_joint_result,
+    run_joint_alpha158,
+)
+from .residual_beam import build_dsl_residual_oof_artifact
 from .scientific_governor import propose_scientific_directive
-from .search_pool import DEFAULT_SEARCH_ALGORITHMS, propose_search_seed
+from .search_pool import (
+    DEFAULT_SEARCH_HEALTH_CONFIG,
+    DEFAULT_SEARCH_ALGORITHMS,
+    SEARCH_GROUP_WEIGHTS,
+    SEARCH_POLICY_SCHEMA,
+    SUPPORTED_SEARCH_ALGORITHMS,
+    propose_search_seed,
+)
 
 
 # Five experiments may be logically live at once, but full-panel Polars
@@ -96,6 +118,9 @@ _EVALUATION_SEMAPHORE = asyncio.Semaphore(
 _PANEL_LOAD_SEMAPHORE = asyncio.Semaphore(
     max(1, int(os.environ.get("FF_MAX_PARALLEL_PANEL_LOADS", "2")))
 )
+_MAX_SEARCH_POOL_NOVELTY_RETRIES = 12
+_RETRY_ALGORITHM_BACKOFF_AFTER = 2
+_RETRY_FAMILY_ESCAPE_EVERY = 6
 
 
 class Engine:
@@ -146,6 +171,10 @@ class Engine:
         self._mode: str = "v1"  # "v1" 或 "v2"
         self.task_config: dict = {}
         self._runtime_identity: dict = runtime_identity()
+        self._qlib_joint_by_task: dict[str, dict] = {}
+        self._qlib_joint_refresh_counts: dict[str, int] = {}
+        self._residual_oof_by_task: dict[str, dict] = {}
+        self._residual_oof_refresh_counts: dict[str, int] = {}
 
     @classmethod
     def get(cls) -> "Engine":
@@ -368,6 +397,38 @@ class Engine:
             if acquired:
                 _EVALUATION_SEMAPHORE.release()
 
+    async def _run_shared_preflight(self, *args):
+        """Use the same memory governor, but do not label this as a backtest."""
+        queued_at = time.monotonic()
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    await asyncio.wait_for(
+                        _EVALUATION_SEMAPHORE.acquire(), timeout=15.0
+                    )
+                    acquired = True
+                except TimeoutError:
+                    self._set_phase(
+                        self.status.get("phase") or "candidate_mining",
+                        current_operation="signal_preflight_queue",
+                        preflight_queue_seconds=round(
+                            time.monotonic() - queued_at, 3
+                        ),
+                    )
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation="signal_preflight",
+            )
+            return await self._run_blocking_with_heartbeat(
+                preflight_expression,
+                *args,
+                operation="signal_preflight",
+            )
+        finally:
+            if acquired:
+                _EVALUATION_SEMAPHORE.release()
+
     async def log(self, msg: str, level: str = "info") -> None:
         now = utc_now()
         safe_msg = redact_text(msg, 4000)
@@ -439,6 +500,13 @@ class Engine:
     def _layer3_enabled(self) -> bool:
         return bool(self.task_config.get("layer3_enabled", True))
 
+    def _pure_algorithm_architecture(self) -> bool:
+        return bool(
+            self._layer1_enabled()
+            and not self._layer2_enabled()
+            and not self._layer3_enabled()
+        )
+
     def _full_llm_architecture(self) -> bool:
         return bool(self.task_config.get("full_llm_architecture", False))
 
@@ -454,10 +522,415 @@ class Engine:
         if not isinstance(configured, (list, tuple)):
             raise ValueError("研究任务 search_algorithms 必须为算法名称列表")
         algorithms = tuple(str(value).strip() for value in configured if str(value).strip())
-        unknown = sorted(set(algorithms) - set(DEFAULT_SEARCH_ALGORITHMS))
+        unknown = sorted(set(algorithms) - set(SUPPORTED_SEARCH_ALGORITHMS))
         if not algorithms or unknown:
             raise ValueError(f"研究任务 search_algorithms 非法: {unknown or 'empty'}")
         return algorithms
+
+    def _qlib_integration(self) -> dict:
+        config = self.task_config.get("qlib_integration") or {}
+        return dict(config) if isinstance(config, dict) else {}
+
+    def _targeted_research_branches(self) -> tuple[dict, ...]:
+        raw = self.task_config.get("targeted_research_branches") or []
+        if not isinstance(raw, list):
+            raise ValueError("targeted_research_branches 必须为列表")
+        branches: list[dict] = []
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict) or not item.get("enabled", True):
+                continue
+            branch = dict(item)
+            branch_id = str(branch.get("branch_id") or f"branch-{index + 1}")
+            seed_node_id = int(branch.get("seed_node_id") or 0)
+            share = float(branch.get("share") or 0.0)
+            task_name = str(branch.get("task_name") or "").strip()
+            if seed_node_id <= 0 or not task_name:
+                raise ValueError(f"专属研究分支 {branch_id} 缺少 seed_node_id/task_name")
+            if not 0.0 < share <= 0.50:
+                raise ValueError(f"专属研究分支 {branch_id}.share 必须在 (0, 0.5]")
+            if str(branch.get("algorithm") or "residual_oof_beam") != "residual_oof_beam":
+                raise ValueError(f"专属研究分支 {branch_id} 当前只支持 residual_oof_beam")
+            if "residual_oof_beam" not in self._search_algorithms():
+                raise ValueError(f"专属研究分支 {branch_id} 要求启用 residual_oof_beam")
+            branch.update({
+                "branch_id": branch_id,
+                "seed_node_id": seed_node_id,
+                "task_name": task_name,
+                "share": share,
+                "algorithm": "residual_oof_beam",
+                "mode": "residual_conditional_gate",
+            })
+            branches.append(branch)
+        return tuple(branches)
+
+    def _targeted_branch_for_slot(
+        self,
+        *,
+        task_name: str,
+        step_no: int,
+        seed: int,
+        slot: int,
+    ) -> dict | None:
+        for branch in self._targeted_research_branches():
+            if branch["task_name"] != task_name:
+                continue
+            draw = random.Random(
+                f"{self.exp_id}:{branch['branch_id']}:{step_no}:{seed}:{slot}"
+            ).random()
+            if draw < float(branch["share"]):
+                return branch
+        return None
+
+    def _qlib_joint_task_key(self, task: dict) -> str:
+        return (
+            f"exp-{self.exp_id}-{task.get('name')}-"
+            f"{self.task_config.get('market', 'us')}-"
+            f"u{int(task.get('universe_n') or 500)}-"
+            f"h{int(task.get('horizon') or 5)}"
+        )
+
+    async def _prepare_qlib_joint_for_task(self, task: dict) -> None:
+        """Refresh one training-safe joint model artifact when due.
+
+        Failures degrade only this search arm.  The ordinary factor discovery
+        worker remains available and the error is visible in runtime status.
+        """
+        integration = self._qlib_integration()
+        if not integration.get("joint_model_enabled"):
+            return
+        if "qlib_joint_residual_distill" not in self._search_algorithms():
+            return
+        task_name = str(task.get("name") or "task")
+        task_key = self._qlib_joint_task_key(task)
+        async with SessionLocal() as session:
+            rows = list((await session.execute(
+                select(Node.expression, Node.public_score)
+                .where(
+                    Node.experiment_id == self.exp_id,
+                    Node.task_name == task_name,
+                    Node.status == "ok",
+                )
+                .order_by(Node.public_score.desc(), Node.id.desc())
+                .limit(200)
+            )).all())
+        unique = []
+        seen = set()
+        for expression, _ in rows:
+            key = self._normalized_expression_hash(str(expression or ""))
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(str(expression))
+        current_count = len(seen)
+        refresh_every = int(integration.get("model_refresh_unique_evals") or 100)
+        last_count = self._qlib_joint_refresh_counts.get(task_name, -refresh_every)
+        cached = self._qlib_joint_by_task.get(task_name) or latest_joint_result(task_key)
+        cache_current = bool(
+            cached and cached.get("schema") == QLIB_JOINT_PROTOCOL
+        )
+        if cache_current:
+            self._qlib_joint_by_task[task_name] = cached
+            cached_count = cached.get("source_unique_evaluations")
+            if cached_count is not None and task_name not in self._qlib_joint_refresh_counts:
+                self._qlib_joint_refresh_counts[task_name] = int(cached_count)
+                last_count = int(cached_count)
+        if cache_current and current_count - last_count < refresh_every:
+            return
+        self._set_phase(
+            self.status.get("phase") or "candidate_mining",
+            current_operation="qlib_joint_oof_training",
+            current_task=task_name,
+            qlib_joint={
+                "state": "training",
+                "task": task_name,
+                "unique_evaluations": current_count,
+                "automated_layers": ["INNER_PUBLIC", "META_TRAIN"],
+            },
+        )
+        progress_job_id = f"qlib-joint:{task_key}"
+        COMPUTE_PROGRESS.start(
+            progress_job_id,
+            kind="qlib_joint",
+            title=f"Qlib联合模型 · 任务#{self.exp_id} · {task_name}",
+            phase="queued",
+            message="研究引擎触发联合模型刷新",
+            experiment_id=self.exp_id,
+            metadata={"task_key": task_key, "task_name": task_name},
+        )
+
+        def joint_progress(payload: dict) -> None:
+            COMPUTE_PROGRESS.update(
+                progress_job_id,
+                phase=payload.get("phase"),
+                message=payload.get("message"),
+                completed=payload.get("completed"),
+                total=payload.get("total"),
+            )
+
+        try:
+            joint_task = asyncio.create_task(
+                asyncio.to_thread(
+                    run_joint_alpha158,
+                    JointModelSpec(
+                        market=str(self.task_config.get("market") or "us"),
+                        panel_glob=self._panel_glob(),
+                        universe_n=int(task.get("universe_n") or 500),
+                        horizon=int(task.get("horizon") or 5),
+                        max_rows=int(
+                            integration.get("max_training_rows") or 250_000
+                        ),
+                        min_meta_dates=int(
+                            integration.get("min_meta_dates") or 60
+                        ),
+                        include_low_fidelity_vwap=bool(
+                            integration.get("include_low_fidelity_vwap", False)
+                        ),
+                    ),
+                    task_key=task_key,
+                    incumbent_expressions=unique[:5],
+                    source_unique_evaluations=current_count,
+                    progress_callback=joint_progress,
+                ),
+                name=f"qlib-joint.{self.exp_id}.{task_name}",
+            )
+            while not joint_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(joint_task), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    COMPUTE_PROGRESS.update(
+                        progress_job_id,
+                        metadata={"worker_heartbeat": str(utc_now())},
+                    )
+                    self._touch_progress(
+                        current_operation="qlib_joint_oof_training"
+                    )
+            result = await joint_task
+            self._qlib_joint_by_task[task_name] = result
+            self._qlib_joint_refresh_counts[task_name] = current_count
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                progress=True,
+                current_operation="qlib_joint_ready",
+                qlib_joint={
+                    "state": "ready",
+                    "task": task_name,
+                    "candidates": len(result.get("distilled_candidates") or []),
+                    "search_eligible": bool(result.get("search_eligible")),
+                    "inner_oof": result.get("inner_public_oof"),
+                    "meta_train": result.get("meta_train"),
+                    "holdout_vault_consumed": False,
+                    "artifact_path": result.get("artifact_path"),
+                },
+            )
+            await self.log(
+                f"Qlib联合模型就绪: task={task_name} "
+                f"candidates={len(result.get('distilled_candidates') or [])} "
+                f"holdout_vault=false"
+            )
+            COMPUTE_PROGRESS.finish(
+                progress_job_id,
+                message="联合模型与DSL蒸馏完成",
+                metadata={"search_eligible": bool(result.get("search_eligible"))},
+            )
+        except Exception as exc:  # noqa: BLE001
+            COMPUTE_PROGRESS.finish(
+                progress_job_id,
+                state="failed",
+                message="Qlib联合模型失败，普通搜索继续",
+                error=str(exc),
+            )
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation="qlib_joint_degraded",
+                qlib_joint={
+                    "state": "degraded",
+                    "task": task_name,
+                    "error": redact_text(str(exc), 1000),
+                    "fallback": "alpha158_prior_and_ordinary_search_continue",
+                },
+            )
+            await self.log(f"Qlib联合模型降级: {exc}", "warning")
+
+    async def _prepare_residual_oof_for_task(self, task: dict) -> None:
+        """Build a real training-layer residual beam for one task when due."""
+        algorithms = set(self._search_algorithms())
+        if not algorithms.intersection(
+            {"residual_oof_beam", "gbdt_residual_distill"}
+        ):
+            return
+        task_name = str(task.get("name") or "task")
+        async with SessionLocal() as session:
+            rows = list((await session.execute(
+                select(
+                    Node.id,
+                    Node.expression,
+                    Node.public_score,
+                    Node.proposal_meta,
+                )
+                .where(
+                    Node.experiment_id == self.exp_id,
+                    Node.task_name == task_name,
+                    Node.status == "ok",
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+                .order_by(Node.public_score.desc(), Node.id.desc())
+                .limit(240)
+            )).all())
+        unique_rows = []
+        seen = set()
+        for node_id, expression, score, proposal_meta in rows:
+            key = self._normalized_expression_hash(str(expression or ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append({
+                "id": int(node_id),
+                "expression": str(expression),
+                "score": float(score or 0.0),
+                "family": str((proposal_meta or {}).get("target_family") or ""),
+            })
+        current_count = len(unique_rows)
+        refresh_every = int(
+            (self.task_config.get("search_policy") or {}).get(
+                "residual_oof_refresh_unique_evals", 40
+            )
+        )
+        last_count = self._residual_oof_refresh_counts.get(
+            task_name, -refresh_every
+        )
+        if (
+            task_name in self._residual_oof_by_task
+            and current_count - last_count < refresh_every
+        ):
+            return
+        fields = get_dsl_fields(self.task_config.get("market"))
+        candidate_rows = []
+        candidate_hashes = set(seen)
+        candidate_rng = random.Random(
+            f"residual-oof:{self.exp_id}:{task_name}:{current_count}"
+        )
+        for family in mechanisms_for_market(
+            self.task_config.get("market", "us")
+        ):
+            for _ in range(2):
+                expression = random_expression_for_family(
+                    family, fields, candidate_rng
+                )
+                key = self._normalized_expression_hash(expression)
+                if key and key not in candidate_hashes:
+                    candidate_hashes.add(key)
+                    candidate_rows.append({
+                        "expression": expression,
+                        "family": family,
+                        "source": "residual_grammar_probe",
+                    })
+        for row in unique_rows[:8]:
+            expression = mutate_expression(
+                row["expression"], fields=fields, rng=candidate_rng
+            )
+            key = self._normalized_expression_hash(expression)
+            if key and key not in candidate_hashes:
+                candidate_hashes.add(key)
+                candidate_rows.append({
+                    "expression": expression,
+                    "family": row["family"] or None,
+                    "source": "residual_incumbent_mutation",
+                    "parent_node_id": row["id"],
+                })
+        if not candidate_rows:
+            return
+        job_id = f"residual-oof:exp-{self.exp_id}:{task_name}"
+        COMPUTE_PROGRESS.start(
+            job_id,
+            kind="residual_oof_beam",
+            title=f"真实Residual OOF · 任务#{self.exp_id} · {task_name}",
+            phase="queued",
+            message="构造训练层逐样本残差矩阵",
+            experiment_id=self.exp_id,
+            metadata={"task_name": task_name},
+        )
+
+        def progress(payload: dict) -> None:
+            COMPUTE_PROGRESS.update(
+                job_id,
+                phase=payload.get("phase"),
+                completed=payload.get("completed"),
+                total=payload.get("total"),
+                message="编译真实 Residual OOF 候选",
+            )
+
+        try:
+            self._set_phase(
+                self.status.get("phase") or "candidate_mining",
+                current_operation="residual_oof_training",
+                current_task=task_name,
+            )
+            artifact = await asyncio.to_thread(
+                build_dsl_residual_oof_artifact,
+                market=str(self.task_config.get("market") or "us"),
+                panel_glob=self._panel_glob(),
+                universe_n=int(task.get("universe_n") or 500),
+                horizon=int(task.get("horizon") or 5),
+                incumbent_expressions=[
+                    row["expression"] for row in unique_rows[:5]
+                ],
+                candidate_rows=candidate_rows,
+                folds=5,
+                beam_width=min(12, len(candidate_rows)),
+                max_rows=150_000,
+                security_sample_modulus=4,
+                progress_callback=progress,
+            )
+            artifact["source_unique_evaluations"] = current_count
+            self._residual_oof_by_task[task_name] = artifact
+            self._residual_oof_refresh_counts[task_name] = current_count
+            self.status["residual_oof"] = {
+                "state": "ready",
+                "task": task_name,
+                "rows": artifact.get("rows"),
+                "dates": artifact.get("dates"),
+                "candidates": len(artifact.get("candidates") or []),
+                "strictly_past_only": True,
+                "date_grouped_folds": artifact.get("date_grouped_folds"),
+                "holdout_vault_consumed": False,
+            }
+            COMPUTE_PROGRESS.finish(
+                job_id,
+                message="真实 Residual OOF Beam 已就绪",
+                metadata=self.status["residual_oof"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status["residual_oof"] = {
+                "state": "degraded",
+                "task": task_name,
+                "error": redact_text(str(exc), 1000),
+                "fallback": "other_layer1_arms_continue_without_proxy_claim",
+            }
+            COMPUTE_PROGRESS.finish(
+                job_id,
+                state="failed",
+                message="真实 Residual OOF 构造失败；其他算法继续",
+                error=str(exc),
+            )
+            await self.log(f"真实 Residual OOF 降级: {exc}", "warning")
+
+    def _compute_core_budget(self) -> int:
+        """Report the enforceable Polars pool cap for this service process."""
+        host_cores = max(1, os.cpu_count() or 1)
+        hard_cap = max(1, host_cores // 2)
+        configured = self.task_config.get("compute_core_budget", hard_cap)
+        try:
+            requested = max(1, int(configured))
+        except (TypeError, ValueError):
+            requested = hard_cap
+        env_cap = os.environ.get("POLARS_MAX_THREADS")
+        if env_cap:
+            try:
+                requested = min(requested, max(1, int(env_cap)))
+            except ValueError:
+                pass
+        return min(requested, hard_cap)
 
     def _memory_mode(self) -> str:
         mode = str(self.task_config.get("memory_mode") or "adaptive").strip().lower()
@@ -566,6 +1039,28 @@ class Engine:
         return tuple(focus * focus_repeats + remaining + tail) or allowed
 
     async def _factor_count(self) -> int:
+        """Count only factors that have completed the formal evidence chain."""
+        async with SessionLocal() as session:
+            rows = list((await session.scalars(
+                select(Factor).where(
+                    Factor.experiment_id == self.exp_id,
+                    Factor.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+            )).all())
+        return sum(
+            1
+            for factor in rows
+            if factor_evidence_state(
+                factor,
+                current_code_review=deterministic_code_review(
+                    factor.expression,
+                    str((factor.research_meta or {}).get("market") or "us"),
+                ),
+                current_rating_protocol=FROZEN_RATING_PROTOCOL_VERSION,
+            )["formal_factor"]
+        )
+
+    async def _research_candidate_count(self) -> int:
         async with SessionLocal() as session:
             value = await session.scalar(
                 select(func.count(Factor.id)).where(
@@ -581,21 +1076,90 @@ class Engine:
                 select(func.count(Node.id)).where(
                     Node.experiment_id == self.exp_id,
                     Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                    Node.status != "rejected",
                 )
             )
         return int(value or 0)
 
+    async def _pre_eval_rejection_count(self, rejection_code: str | None = None) -> int:
+        async with SessionLocal() as session:
+            values = await session.scalars(
+                select(Node.proposal_meta).where(
+                    Node.experiment_id == self.exp_id,
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                    Node.status == "rejected",
+                )
+            )
+            codes = [
+                str((value or {}).get("pre_evaluation_rejection") or "")
+                for value in values
+            ]
+        if rejection_code is None:
+            return sum(bool(code) for code in codes)
+        return sum(code == rejection_code for code in codes)
+
+    def _update_research_efficiency_status(self) -> None:
+        """Expose real evaluated throughput separately from proposal churn."""
+        evaluated = int(self.status.get("candidate_evaluations") or 0)
+        duplicates = int(self.status.get("pre_eval_duplicate_rejections") or 0)
+        signals = int(self.status.get("pre_eval_signal_rejections") or 0)
+        hidden = int(self.status.get("hidden_novelty_resamples") or 0)
+        base_evaluated = int(
+            getattr(self, "_session_start_candidate_evaluations", evaluated)
+        )
+        base_duplicates = int(
+            getattr(self, "_session_start_duplicate_rejections", duplicates)
+        )
+        base_signals = int(
+            getattr(self, "_session_start_signal_rejections", signals)
+        )
+        base_hidden = int(
+            getattr(self, "_session_start_hidden_resamples", hidden)
+        )
+        evaluated_delta = max(0, evaluated - base_evaluated)
+        duplicate_delta = max(0, duplicates - base_duplicates)
+        signal_delta = max(0, signals - base_signals)
+        hidden_delta = max(0, hidden - base_hidden)
+        attempts_delta = (
+            evaluated_delta + duplicate_delta + signal_delta + hidden_delta
+        )
+        elapsed = (
+            max(0.0, time.monotonic() - self._started_monotonic)
+            if self._started_monotonic is not None
+            else 0.0
+        )
+        self.status.update({
+            "session_candidate_evaluations": evaluated_delta,
+            "session_duplicate_rejections": duplicate_delta,
+            "session_signal_preflight_rejections": signal_delta,
+            "session_hidden_novelty_resamples": hidden_delta,
+            "effective_evaluations_per_hour": round(
+                evaluated_delta * 3600.0 / elapsed, 3
+            ) if elapsed > 0 else 0.0,
+            "duplicate_waste_rate": round(
+                (duplicate_delta + hidden_delta) / attempts_delta, 6
+            ) if attempts_delta else 0.0,
+            "hidden_resample_waste_rate": round(
+                hidden_delta / attempts_delta, 6
+            ) if attempts_delta else 0.0,
+            "signal_preflight_rejection_rate": round(
+                signal_delta / attempts_delta, 6
+            ) if attempts_delta else 0.0,
+        })
+
     def _dynamic_evaluation_overrides(self) -> dict:
         overrides = dict(self.task_config.get("evaluation_config") or {})
         governance = dict(self.task_config.get("overfit_governance") or {})
-        if governance.get("dynamic_actual_trials"):
-            actual = int(self.status.get("candidate_evaluations") or 0) + 1
-            direction_multiplier = (
-                2 if self._direction_policy() == "both_train_select" else 1
+        dynamic_enabled = bool(governance.get("dynamic_actual_trials")) or bool(
+            self._qlib_integration().get(
+                "dynamic_trial_governance_enabled", False
             )
+        )
+        if dynamic_enabled:
+            actual = int(self.status.get("candidate_evaluations") or 0) + 1
             overrides["multiple_testing_trials"] = max(
                 int(overrides.get("multiple_testing_trials") or 1),
-                actual * direction_multiplier,
+                actual,
             )
         return overrides
 
@@ -720,6 +1284,7 @@ class Engine:
         count = await self._factor_count()
         self.status.update({
             "factor_count": count,
+            "formal_factor_count": count,
             "target_factor_count": target,
             "factor_target_progress": round(count / target, 6),
         })
@@ -727,7 +1292,7 @@ class Engine:
             return False
         self.status["stop_reason"] = "target_factor_count_reached"
         await self.log(
-            f"研究目标完成: 当前协议因子库 {count}/{target}，worker 自动停止",
+            f"正式研究因子目标完成: {count}/{target}，worker 自动停止",
             "info",
         )
         self.running = False
@@ -749,6 +1314,15 @@ class Engine:
         async with SessionLocal() as s:
             exp = await s.get(Experiment, self.exp_id)
             self.task_config = dict(exp.research_config or {}) if exp else {}
+        existing_candidate_evaluations = await self._candidate_evaluation_count()
+        existing_factor_count = await self._factor_count()
+        existing_research_candidate_count = await self._research_candidate_count()
+        existing_duplicate_rejections = await self._pre_eval_rejection_count(
+            "duplicate_normalized_ast"
+        )
+        existing_signal_rejections = await self._pre_eval_rejection_count(
+            "signal_preflight_failed"
+        )
         task_service = str(self.task_config.get("service_instance") or "").strip()
         if not service_accepts_task(self.task_config):
             self.running = False
@@ -796,6 +1370,12 @@ class Engine:
         self._mode = mode
         now = utc_now()
         self._started_monotonic = time.monotonic()
+        self._session_start_candidate_evaluations = existing_candidate_evaluations
+        self._session_start_duplicate_rejections = existing_duplicate_rejections
+        self._session_start_signal_rejections = existing_signal_rejections
+        self._session_start_hidden_resamples = int(
+            self.status.get("hidden_novelty_resamples") or 0
+        )
         self.status.update({
             "state": "starting",
             "started_at": now,
@@ -827,12 +1407,23 @@ class Engine:
                 if self._proposal_mode() == "random"
                 else "llm_memory" if self._memory_mode() == "adaptive" else "llm_cold"
             ),
-            "three_layer": {
+                "three_layer": {
                 "layer1_enabled": self._layer1_enabled(),
                 "layer2_enabled": self._layer2_enabled(),
                 "layer3_enabled": self._layer3_enabled(),
                 "search_algorithms": list(self._search_algorithms())
                 if self._layer1_enabled() else [],
+                "search_policy": {
+                    "schema": SEARCH_POLICY_SCHEMA,
+                    "scheduler": "unique_quota_gate_delta_ucb1",
+                    "group_weights": SEARCH_GROUP_WEIGHTS,
+                    "health_defaults": DEFAULT_SEARCH_HEALTH_CONFIG,
+                    "activation_node_id": int(
+                        (self.task_config.get("search_policy") or {}).get(
+                            "activation_node_id", 0
+                        ) or 0
+                    ),
+                } if self._layer1_enabled() else None,
                 "full_llm_architecture": self._full_llm_architecture(),
                 "scientific_governor_enabled": (
                     self._scientific_governor_enabled()
@@ -843,10 +1434,25 @@ class Engine:
                     else []
                 ),
             },
+            "targeted_research_branches": list(
+                self._targeted_research_branches()
+            ),
             "runtime_identity": self._runtime_identity,
+            "compute_policy": {
+                "host_logical_cores": max(1, os.cpu_count() or 1),
+                "task_core_budget": self._compute_core_budget(),
+                "polars_max_threads": int(
+                    os.environ.get("POLARS_MAX_THREADS")
+                    or self._compute_core_budget()
+                ),
+                "full_evaluation_parallelism": int(
+                    os.environ.get("FF_MAX_PARALLEL_EVALUATIONS", "2")
+                ),
+                "policy": "half_host_core_cap_shared_polars_pool",
+            },
             "target_factor_count": self._target_factor_count(),
             "candidate_evaluation_budget": self._candidate_evaluation_budget(),
-            "candidate_evaluations": 0,
+            "candidate_evaluations": existing_candidate_evaluations,
             "candidate_evaluation_progress": 0.0,
             "budget_mode": (
                 "unlimited" if self._continuous_operation() else "bounded"
@@ -854,8 +1460,17 @@ class Engine:
             "service_instance": SERVICE_INSTANCE,
             "service_architecture": SERVICE_ARCHITECTURE or None,
             "target_mechanisms": list(self._target_mechanisms()),
-            "factor_count": 0,
+            "factor_count": existing_factor_count,
+            "formal_factor_count": existing_factor_count,
+            "research_candidate_count": existing_research_candidate_count,
             "factor_target_progress": 0.0,
+            "pre_eval_duplicate_rejections": existing_duplicate_rejections,
+            "pre_eval_signal_rejections": existing_signal_rejections,
+            "effective_evaluations_per_hour": 0.0,
+            "duplicate_waste_rate": 0.0,
+            "recent_unique_yield_rate": None,
+            "search_space_exhausted": False,
+            "search_health": None,
             "stop_reason": None,
         })
         self._set_phase("starting", progress=True)
@@ -952,11 +1567,36 @@ class Engine:
             incumbent = await self._ensure_incumbent_v2()
             self.status["state"] = "running"
             cfg = await self._config_v2()
+            self.status.update({
+                "effective_portfolio_mode": self._portfolio_mode(),
+                "resolved_tasks": [
+                    {
+                        "name": task["name"],
+                        "market": task["market"],
+                        "portfolio_mode": task["mode"],
+                        "universe_n": task["universe_n"],
+                        "horizon": task["horizon"],
+                        "cost_bps": task["cost_bps"],
+                        "direction_policy": task["direction_policy"],
+                    }
+                    for task in cfg["tasks"]
+                ],
+            })
 
             # Unlimited campaigns must restore the real cumulative trial count;
             # otherwise restarts silently reset the multiple-testing burden.
             self.status["candidate_evaluations"] = (
                 await self._candidate_evaluation_count()
+            )
+            self.status["pre_eval_duplicate_rejections"] = (
+                await self._pre_eval_rejection_count(
+                    "duplicate_normalized_ast"
+                )
+            )
+            self.status["pre_eval_signal_rejections"] = (
+                await self._pre_eval_rejection_count(
+                    "signal_preflight_failed"
+                )
             )
 
             if await self._stop_if_evaluation_budget_reached(refresh=True):
@@ -993,6 +1633,10 @@ class Engine:
                 self._set_phase("stopped", progress=True)
 
     async def _outer_step_v2(self, step_no: int, incumbent: MinerVersion, cfg: dict):
+        if self._pure_algorithm_architecture():
+            return await self._algorithm_evidence_epoch_v2(
+                step_no, incumbent, cfg
+            )
         self._set_phase(
             "outer_proposal",
             progress=True,
@@ -1619,6 +2263,60 @@ class Engine:
                 incumbent = await s.get(MinerVersion, cand.id)
         return incumbent, cfg
 
+    async def _algorithm_evidence_epoch_v2(
+        self,
+        step_no: int,
+        incumbent: MinerVersion,
+        cfg: dict,
+    ) -> tuple[MinerVersion, dict]:
+        """Run an L1-only evidence epoch without fabricating an outer A/B arm."""
+        budget = int(cfg["baseline_warmup_budget"])
+        n_seeds = int(cfg["n_seeds_per_candidate"])
+        self._set_phase(
+            "algorithm_evidence_epoch",
+            progress=True,
+            current_operation="layer1_training_evidence",
+            current_seed=None,
+            current_budget_index=0,
+            current_budget_total=budget * n_seeds,
+        )
+        feedback_baseline = await self._feedback_baseline_v2(
+            [task["name"] for task in cfg["tasks"]]
+        )
+        results: list[dict] = []
+        for seed in range(n_seeds):
+            if not self.running:
+                break
+            results.append(await self._mining_session_v2(
+                incumbent,
+                step_no,
+                budget,
+                cfg,
+                seed,
+                feedback_baseline,
+            ))
+        if results:
+            score = st.mean(row["score"] for row in results)
+            report = combine_seed_feedback(results)
+            incumbent = await self._update_score(incumbent.id, score)
+            async with SessionLocal() as session:
+                row = await session.get(MinerVersion, incumbent.id)
+                row.feedback_summary = report
+                await session.commit()
+            self.status["algorithm_evidence_epoch"] = {
+                "step_no": step_no,
+                "budget_per_seed": budget,
+                "completed_seeds": len(results),
+                "required_seeds": n_seeds,
+                "score": round(score, 6),
+                "outer_ab_created": False,
+            }
+            await self.log(
+                f"[V2] 算法证据轮 {step_no}: 完成 {len(results)}/{n_seeds} "
+                f"个 seed，score={score:.4f}；未创建空 MinerTemplate A/B"
+            )
+        return incumbent, cfg
+
     async def _mining_session_v2(
         self,
         miner: MinerVersion,
@@ -1639,10 +2337,33 @@ class Engine:
         task_best_scores: dict[str, float] = {}
         session_envelopes: list[dict] = []
 
+        # Refresh one task per session so the three configured horizons share
+        # compute fairly instead of blocking startup on three full fits.
+        if tasks and self._qlib_integration().get("joint_model_enabled"):
+            refresh_task = tasks[(seed + step_no) % len(tasks)]
+            await self._prepare_qlib_joint_for_task(refresh_task)
+        if tasks and set(self._search_algorithms()).intersection(
+            {"residual_oof_beam", "gbdt_residual_distill"}
+        ):
+            refresh_task = tasks[(seed + step_no) % len(tasks)]
+            await self._prepare_residual_oof_for_task(refresh_task)
+
         # 固定种子确保可复现
         rng = random.Random(seed * 10000 + step_no * 100)
         session_start_node_id = await self._max_node_id()
-        campaign_expressions = await self._experiment_expressions()
+        campaign_expression_hashes = {
+            task["name"]: await self._experiment_expression_hashes(task["name"])
+            for task in tasks
+        }
+        search_allocation_history = (
+            await self._search_allocation_history_v2(
+                [task["name"] for task in tasks],
+                max_node_id=session_start_node_id,
+            )
+            if self._layer1_enabled()
+            else {}
+        )
+        targeted_seed_nodes = await self._targeted_seed_nodes_v2()
         proposal_queue: dict[int, tuple[dict, tuple[str, str, str, dict]]] = {}
         market = self.task_config.get("market", "us")
 
@@ -1655,16 +2376,26 @@ class Engine:
                 min_node_id=session_start_node_id,
             )
             feedback_nodes = self._merge_feedback_nodes(
-                (feedback_baseline or {}).get(task["name"], []),
+                self._merge_feedback_nodes(
+                    targeted_seed_nodes.get(task["name"], []),
+                    (feedback_baseline or {}).get(task["name"], []),
+                ),
                 session_nodes,
             )
             proposal_feedback_nodes = (
                 feedback_nodes if self._memory_mode() == "adaptive" else []
             )
             family_schedule = self._mechanism_schedule(template, market)
-            target_family = family_schedule[
-                (seed * budget + slot) % len(family_schedule)
-            ]
+            targeted_branch = self._targeted_branch_for_slot(
+                task_name=task["name"],
+                step_no=step_no,
+                seed=seed,
+                slot=slot,
+            )
+            target_family = str(
+                (targeted_branch or {}).get("family")
+                or family_schedule[(seed * budget + slot) % len(family_schedule)]
+            )
             base_node = max(
                 (
                     node
@@ -1678,9 +2409,25 @@ class Engine:
                 key=lambda node: float(node.get("public_score") or 0.0),
                 default=None,
             )
+            if targeted_branch:
+                base_node = next(
+                    (
+                        node for node in feedback_nodes
+                        if int(node.get("id") or 0)
+                        == int(targeted_branch["seed_node_id"])
+                        and node.get("status") == "ok"
+                    ),
+                    None,
+                )
+                if base_node is None:
+                    raise ValueError(
+                        f"专属研究分支 {targeted_branch['branch_id']} 找不到"
+                        f"节点 {targeted_branch['seed_node_id']}"
+                    )
             op = (
                 "improve"
-                if base_node and rng.random() >= float(cfg["draft_ratio"])
+                if targeted_branch
+                or (base_node and rng.random() >= float(cfg["draft_ratio"]))
                 else "draft"
             )
             search_seed = None
@@ -1691,12 +2438,54 @@ class Engine:
                         cfg.get("algorithm_inspiration_share", 0.30)
                     )
                 if use_algorithm_inspiration:
-                    search_seed = propose_search_seed(
+                    search_seed = await asyncio.to_thread(
+                        propose_search_seed,
                         family=target_family,
                         fields=get_dsl_fields(self.task_config.get("market")),
                         feedback_nodes=feedback_nodes,
                         algorithms=self._search_algorithms(),
                         rng=rng,
+                        allocation_history=self._merge_feedback_nodes(
+                            search_allocation_history.get(task["name"], []),
+                            session_nodes,
+                        ),
+                        health_config=self.task_config.get("search_policy"),
+                        qlib_candidate_pool=bool(
+                            self._qlib_integration().get(
+                                "gbdt_candidate_pool_enabled", False
+                            )
+                        ),
+                        qlib_joint_candidates=(
+                            list(
+                                (
+                                    self._qlib_joint_by_task.get(task["name"]) or {}
+                                ).get("distilled_candidates") or []
+                            )
+                            if (
+                                self._qlib_joint_by_task.get(task["name"]) or {}
+                            ).get("search_eligible")
+                            else []
+                        ),
+                        residual_oof_candidates=list(
+                            (
+                                self._residual_oof_by_task.get(task["name"])
+                                or {}
+                            ).get("candidates") or []
+                        ),
+                        excluded_expression_hashes=set(
+                            campaign_expression_hashes[task["name"]]
+                        ),
+                        adaptive_allocation=bool(
+                            self._qlib_integration().get(
+                                "adaptive_budget_enabled", False
+                            )
+                        ),
+                        qlib_prior_share=float(
+                            self._qlib_integration().get(
+                                "structural_prior_share", 0.10
+                            )
+                        ),
+                        targeted_branch=targeted_branch,
                     )
             return {
                 "slot": slot,
@@ -1708,6 +2497,7 @@ class Engine:
                 "request_id": f"step-{step_no}:seed-{seed}:slot-{slot + 1}",
                 "rng": rng,
                 "search_seed": search_seed,
+                "targeted_branch": targeted_branch,
             }
 
         for i in range(budget):
@@ -1857,26 +2647,105 @@ class Engine:
                 current_operation=f"proposal:{op}",
             )
             novelty_retries = 0
+            retry_algorithms: list[str] = []
+            retry_avoided_algorithms: set[str] = set()
+            retry_family = target_family
+            retry_targeted_branch = assignment.get("targeted_branch")
+            retry_feedback_nodes: list[dict] | None = None
+            retry_allocation_nodes: list[dict] | None = None
+            mechanism_schedule = self._mechanism_schedule(template, market)
             while (
                 source == "search_pool"
-                and expr in campaign_expressions
-                and novelty_retries < 32
+                and self._normalized_expression_hash(expr)
+                in campaign_expression_hashes[task["name"]]
+                and novelty_retries < _MAX_SEARCH_POOL_NOVELTY_RETRIES
             ):
                 novelty_retries += 1
-                replacement = propose_search_seed(
-                    family=target_family,
-                    fields=get_dsl_fields(self.task_config.get("market")),
-                    feedback_nodes=self._merge_feedback_nodes(
+                previous_algorithm = str(
+                    (proposal_meta or {}).get("search_algorithm") or ""
+                )
+                if previous_algorithm:
+                    retry_algorithms.append(previous_algorithm)
+                    if retry_algorithms.count(previous_algorithm) >= (
+                        _RETRY_ALGORITHM_BACKOFF_AFTER
+                    ):
+                        retry_avoided_algorithms.add(previous_algorithm)
+                # A mechanism-local grammar can be genuinely exhausted.  Every
+                # six misses, escape to the next mechanism family. Keep the
+                # per-slot algorithm backoff: a new family is not permission
+                # for the same exhausted finite arm to consume the slot again.
+                if (
+                    novelty_retries % _RETRY_FAMILY_ESCAPE_EVERY == 0
+                    and mechanism_schedule
+                ):
+                    family_index = mechanism_schedule.index(retry_family)
+                    retry_family = mechanism_schedule[
+                        (family_index + 1) % len(mechanism_schedule)
+                    ]
+                    op = "draft"
+                    base_node = None
+                    retry_targeted_branch = None
+                if retry_feedback_nodes is None:
+                    retry_session_nodes = await self._feedback_nodes_v2(
+                        miner.id,
+                        task["name"],
+                        seed=seed,
+                        min_node_id=session_start_node_id,
+                    )
+                    retry_feedback_nodes = self._merge_feedback_nodes(
                         (feedback_baseline or {}).get(task["name"], []),
-                        await self._feedback_nodes_v2(
-                            miner.id,
-                            task["name"],
-                            seed=seed,
-                            min_node_id=session_start_node_id,
-                        ),
-                    ),
+                        retry_session_nodes,
+                    )
+                    retry_allocation_nodes = self._merge_feedback_nodes(
+                        search_allocation_history.get(task["name"], []),
+                        retry_session_nodes,
+                    )
+                replacement = await asyncio.to_thread(
+                    propose_search_seed,
+                    family=retry_family,
+                    fields=get_dsl_fields(self.task_config.get("market")),
+                    feedback_nodes=retry_feedback_nodes,
                     algorithms=self._search_algorithms(),
                     rng=rng,
+                    allocation_history=retry_allocation_nodes,
+                    health_config=self.task_config.get("search_policy"),
+                    avoid_algorithms=retry_avoided_algorithms,
+                    qlib_candidate_pool=bool(
+                        self._qlib_integration().get(
+                            "gbdt_candidate_pool_enabled", False
+                            )
+                        ),
+                    qlib_joint_candidates=(
+                        list(
+                            (
+                                self._qlib_joint_by_task.get(task["name"]) or {}
+                            ).get("distilled_candidates") or []
+                        )
+                        if (
+                            self._qlib_joint_by_task.get(task["name"]) or {}
+                        ).get("search_eligible")
+                        else []
+                    ),
+                    residual_oof_candidates=list(
+                        (
+                            self._residual_oof_by_task.get(task["name"])
+                            or {}
+                        ).get("candidates") or []
+                    ),
+                    excluded_expression_hashes=set(
+                        campaign_expression_hashes[task["name"]]
+                    ),
+                    adaptive_allocation=bool(
+                        self._qlib_integration().get(
+                            "adaptive_budget_enabled", False
+                        )
+                    ),
+                    qlib_prior_share=float(
+                        self._qlib_integration().get(
+                            "structural_prior_share", 0.10
+                        )
+                    ),
+                    targeted_branch=retry_targeted_branch,
                 )
                 assignment["search_seed"] = replacement
                 expr = replacement.expression
@@ -1887,12 +2756,14 @@ class Engine:
                     "targeted_failures": [],
                     "expected_effect": "保持第一层试验的表达式级新颖性",
                     "change_axis": "new_draft",
-                    "declared_family": target_family,
+                    "declared_family": retry_family,
                     "family_match": True,
                 }
+                target_family = retry_family
             while (
                 source == "random"
-                and expr in campaign_expressions
+                and self._normalized_expression_hash(expr)
+                in campaign_expression_hashes[task["name"]]
                 and novelty_retries < 32
             ):
                 novelty_retries += 1
@@ -1926,25 +2797,59 @@ class Engine:
                 if assignment.get("search_seed") is not None
                 else {}
             )
+            expression_hash = self._normalized_expression_hash(expr)
+            exact_duplicate = bool(
+                expression_hash
+                and expression_hash in campaign_expression_hashes[task["name"]]
+            )
             proposal_meta = {
                 **seed_meta,
                 **(proposal_meta or {}),
                 "campaign_novelty_retries": novelty_retries,
-                "campaign_exact_duplicate": expr in campaign_expressions,
+                "campaign_novelty_retry_limit": (
+                    _MAX_SEARCH_POOL_NOVELTY_RETRIES
+                    if source == "search_pool" else 32
+                ),
+                "campaign_retry_algorithms": retry_algorithms,
+                "campaign_family_escape": target_family != assignment["target_family"],
+                "candidate_space_exhausted": bool(
+                    exact_duplicate
+                    and novelty_retries >= (
+                        _MAX_SEARCH_POOL_NOVELTY_RETRIES
+                        if source == "search_pool" else 32
+                    )
+                ),
+                "campaign_exact_duplicate": exact_duplicate,
+                "normalized_expression_hash": expression_hash,
+                "evaluation_performed": not exact_duplicate,
+                "budget_charged": not exact_duplicate,
                 "experiment_arm": self.status.get("experiment_arm"),
                 "memory_mode": self._memory_mode(),
                 "runtime_identity": self._runtime_identity,
                 "cohort_id": f"step-{step_no}:seed-{seed}:slot-{i + 1}",
                 "architecture_layer": (
                     1 if self._full_llm_architecture()
-                    else (proposal_meta or {}).get("architecture_layer", 2)
+                    else 2 if self._layer2_enabled()
+                    else 1 if self._layer1_enabled()
+                    else (proposal_meta or {}).get("architecture_layer", 1)
                 ),
                 "llm_role": (
                     "mechanism_scientist"
                     if self._full_llm_architecture()
-                    else "inner"
+                    else "researcher" if self._layer2_enabled()
+                    else None
                 ),
-                "direct_expression_authority": self._full_llm_architecture(),
+                "proposal_authority": (
+                    "mechanism_scientist_llm"
+                    if self._full_llm_architecture()
+                    else "researcher_llm" if self._layer2_enabled()
+                    else "layer1_algorithm" if self._layer1_enabled()
+                    else "structured_random"
+                ),
+                "direct_expression_authority": bool(
+                    self._full_llm_architecture()
+                    or (self._layer1_enabled() and not self._layer2_enabled())
+                ),
                 "scientific_directive_id": (
                     (template.get("_scientific_governor_directive") or {}).get(
                         "directive_id"
@@ -1961,8 +2866,16 @@ class Engine:
                     else "new_draft"
                 ),
             }
-            campaign_expressions.add(expr)
-
+            self.status["proposal_generation_attempts"] = int(
+                self.status.get("proposal_generation_attempts") or 0
+            ) + novelty_retries + 1
+            self.status["hidden_novelty_resamples"] = int(
+                self.status.get("hidden_novelty_resamples") or 0
+            ) + novelty_retries
+            if retry_avoided_algorithms:
+                self.status["slot_algorithm_backoffs"] = int(
+                    self.status.get("slot_algorithm_backoffs") or 0
+                ) + len(retry_avoided_algorithms)
             node = Node(
                 experiment_id=self.exp_id,
                 miner_version_id=miner.id, outer_step_no=step_no,
@@ -1972,6 +2885,46 @@ class Engine:
                 seed=seed,
                 proposal_meta=proposal_meta,
             )
+            search_health_status = (
+                (proposal_meta.get("search_policy") or {}).get("search_health")
+                or {}
+            )
+            if search_health_status:
+                self.status["search_health"] = search_health_status
+                self.status["recent_unique_yield_rate"] = round(
+                    1.0 - float(
+                        search_health_status.get("recent_duplicate_rate") or 0.0
+                    ),
+                    6,
+                )
+                self.status["search_space_exhausted"] = bool(
+                    search_health_status.get("state")
+                    == "duplicate_space_exhausted"
+                    or proposal_meta.get("candidate_space_exhausted")
+                )
+            if exact_duplicate and expression_hash is not None:
+                proposal_meta["pre_evaluation_rejection"] = (
+                    "duplicate_normalized_ast"
+                )
+                node.proposal_meta = proposal_meta
+                await self._persist_pre_eval_duplicate_v2(
+                    node,
+                    expression_hash=expression_hash,
+                    seed=seed,
+                )
+                if (
+                    int(self.status.get("pre_eval_duplicate_rejections") or 0)
+                    % 10 == 1
+                ):
+                    await self.log(
+                        f"[V2 s{seed}] 回测前去重熔断: "
+                        f"累计 {self.status['pre_eval_duplicate_rejections']} 个；"
+                        "评价预算未扣除",
+                        "warning",
+                    )
+                continue
+            if expression_hash is not None:
+                campaign_expression_hashes[task["name"]].add(expression_hash)
             try:
                 if source == "llm_rejected":
                     raise ValueError(
@@ -1980,6 +2933,34 @@ class Engine:
                             or "LLM 批量候选未通过语义验证"
                         )
                     )
+                preflight = await self._run_shared_preflight(
+                    expr,
+                    task["universe_n"],
+                    task["horizon"],
+                    self._panel_glob(),
+                    self.task_config.get("market", "us"),
+                )
+                proposal_meta["signal_preflight"] = preflight
+                node.proposal_meta = proposal_meta
+                if not preflight.get("accepted"):
+                    proposal_meta["pre_evaluation_rejection"] = (
+                        "signal_preflight_failed"
+                    )
+                    node.proposal_meta = proposal_meta
+                    await self._persist_pre_eval_signal_rejection_v2(
+                        node,
+                        expression_hash=expression_hash or expr,
+                        seed=seed,
+                        preflight=preflight,
+                    )
+                    if int(self.status.get("pre_eval_signal_rejections") or 0) % 10 == 1:
+                        await self.log(
+                            f"[V2 s{seed}] 廉价信号预筛拒绝: "
+                            f"累计 {self.status['pre_eval_signal_rejections']} 个；"
+                            "常数/空值/低覆盖候选未进入完整回测",
+                            "warning",
+                        )
+                    continue
                 self._set_phase(
                     self.status.get("phase") or "candidate_mining",
                     current_operation="factor_evaluation",
@@ -2001,6 +2982,11 @@ class Engine:
                     "discovery": metrics["discovery"],
                     "protocol_version": metrics["protocol_version"],
                     "evaluation_runtime": metrics.get("runtime") or {},
+                    "training_signal_rank_signature": (
+                        (metrics.get("runtime") or {}).get(
+                            "signal_rank_signature"
+                        ) or {}
+                    ),
                     "training_return_path_signature": combined_training_signature(
                         metrics["public"],
                         metrics["gate"],
@@ -2097,6 +3083,7 @@ class Engine:
             self.status["candidate_evaluations"] = (
                 int(self.status.get("candidate_evaluations") or 0) + 1
             )
+            self._update_research_efficiency_status()
             self._touch_progress(
                 current_operation="register_factor" if node.status == "ok" else "candidate_failed",
             )
@@ -2339,7 +3326,7 @@ class Engine:
             s.add(Factor(
                 experiment_id=self.exp_id,
                 name=f"F{n + 1:05d}", expression=node.expression, hypothesis=node.hypothesis,
-                status="public-leading", node_id=node.id, task_name=node.task_name,
+                status="research-candidate", node_id=node.id, task_name=node.task_name,
                 public_metrics=node.public_metrics, gate_metrics=node.gate_metrics,
                 evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
                 lifecycle_stage="research_pass",
@@ -2395,6 +3382,7 @@ class Engine:
                 },
             ))
             await s.commit()
+            self.status["research_candidate_count"] = int(n) + 1
             return admission
 
     # ================================================================
@@ -2572,6 +3560,114 @@ class Engine:
             for node in rows
         ]
 
+    async def _targeted_seed_nodes_v2(self) -> dict[str, list[dict]]:
+        """Load declared seed nodes explicitly, independent of top/recent caps."""
+        branches = self._targeted_research_branches()
+        if not branches:
+            return {}
+        ids = [int(branch["seed_node_id"]) for branch in branches]
+        async with SessionLocal() as session:
+            nodes = list((await session.scalars(
+                select(Node).where(
+                    Node.id.in_(ids),
+                    Node.experiment_id == self.exp_id,
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                    Node.status == "ok",
+                )
+            )).all())
+        by_id = {node.id: node for node in nodes}
+        missing = sorted(set(ids) - set(by_id))
+        if missing:
+            raise ValueError(
+                f"专属研究分支节点不存在、非当前任务或不可用: {missing}"
+            )
+        result: dict[str, list[dict]] = {}
+        for branch in branches:
+            node = by_id[int(branch["seed_node_id"])]
+            if node.task_name != branch["task_name"]:
+                raise ValueError(
+                    f"专属研究分支 {branch['branch_id']} 的 task_name 与节点不一致"
+                )
+            result.setdefault(node.task_name, []).append({
+                "id": node.id,
+                "parent_id": node.parent_id,
+                "expression": node.expression,
+                "hypothesis": node.hypothesis,
+                "status": node.status,
+                "error": node.error,
+                "source": node.source,
+                "task_name": node.task_name,
+                "evaluation_protocol": node.evaluation_protocol,
+                "public_score": node.public_score or 0.0,
+                "public_metrics": node.public_metrics or {},
+                "proposal_meta": node.proposal_meta or {},
+                "feedback_summary": node.feedback_summary or {},
+            })
+        return result
+
+    async def _search_allocation_history_v2(
+        self,
+        task_names: list[str],
+        *,
+        max_node_id: int,
+    ) -> dict[str, list[dict]]:
+        """Load lightweight all-time arm outcomes for exact quota accounting.
+
+        This history is never sent to an LLM. It carries only PUBLIC/META_TRAIN
+        discovery evidence required for gate-oriented rewards, unique quota
+        accounting, and collapse detection. Holdout, vault, and rating fields
+        are never selected.
+        """
+        policy_config = dict(self.task_config.get("search_policy") or {})
+        try:
+            activation_node_id = max(
+                0, int(policy_config.get("activation_node_id") or 0)
+            )
+        except (TypeError, ValueError):
+            activation_node_id = 0
+        async with SessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        Node.id,
+                        Node.task_name,
+                        Node.status,
+                        Node.expression,
+                        Node.public_score,
+                        Node.public_metrics,
+                        Node.proposal_meta,
+                        Node.feedback_summary,
+                    ).where(
+                        Node.experiment_id == self.exp_id,
+                        Node.task_name.in_(task_names),
+                        Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                        Node.id > activation_node_id,
+                        Node.id <= max_node_id,
+                    )
+                )
+            ).all()
+        result = {name: [] for name in task_names}
+        for (
+            node_id,
+            task_name,
+            status,
+            expression,
+            score,
+            public_metrics,
+            proposal_meta,
+            feedback_summary,
+        ) in rows:
+            result.setdefault(task_name, []).append({
+                "id": node_id,
+                "status": status,
+                "expression": expression,
+                "public_score": score or 0.0,
+                "public_metrics": public_metrics or {},
+                "proposal_meta": proposal_meta or {},
+                "feedback_summary": feedback_summary or {},
+            })
+        return result
+
     async def _feedback_baseline_v2(
         self,
         task_names: list[str],
@@ -2610,21 +3706,175 @@ class Engine:
             )
         return int(value or 0)
 
-    async def _experiment_expressions(self) -> set[str]:
-        """Return exact same-protocol expressions for random-campaign dedupe."""
+    async def _experiment_expressions(
+        self,
+        task_name: str | None = None,
+    ) -> set[str]:
+        """Return same-protocol expressions, optionally scoped to one task."""
+        filters = [
+            Node.experiment_id == self.exp_id,
+            Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+        ]
+        if task_name is not None:
+            filters.append(Node.task_name == task_name)
         async with SessionLocal() as session:
             values = await session.scalars(
-                select(Node.expression).where(
-                    Node.experiment_id == self.exp_id,
-                    Node.evaluation_protocol
-                    == EVALUATION_PROTOCOL_VERSION,
-                )
+                select(Node.expression).where(*filters)
             )
             return {
                 str(value).strip()
                 for value in values
                 if str(value or "").strip()
             }
+
+    def _normalized_expression_hash(self, expression: str) -> str | None:
+        try:
+            return normalize_hash(
+                expression,
+                direction_invariant=(
+                    self._direction_policy() == "both_train_select"
+                ),
+            )
+        except (SyntaxError, TypeError, ValueError):
+            return None
+
+    async def _experiment_expression_hashes(self, task_name: str) -> set[str]:
+        """Return task-local, direction-invariant AST hashes for dedupe."""
+        expressions = await self._experiment_expressions(task_name)
+        return {
+            value
+            for expression in expressions
+            if (value := self._normalized_expression_hash(expression)) is not None
+        }
+
+    async def _persist_pre_eval_duplicate_v2(
+        self,
+        node: Node,
+        *,
+        expression_hash: str,
+        seed: int,
+    ) -> None:
+        await self._persist_pre_eval_rejection_v2(
+            node,
+            expression_hash=expression_hash,
+            seed=seed,
+            rejection_code="duplicate_normalized_ast",
+            error="duplicate_normalized_ast: 同一研究子任务已存在方向等价 AST，未执行回测",
+            failure_reason="回测前去重：同一研究子任务已评价方向等价 AST",
+            statistic={},
+        )
+
+    async def _persist_pre_eval_signal_rejection_v2(
+        self,
+        node: Node,
+        *,
+        expression_hash: str,
+        seed: int,
+        preflight: dict,
+    ) -> None:
+        reasons = list(preflight.get("failure_reasons") or [])
+        await self._persist_pre_eval_rejection_v2(
+            node,
+            expression_hash=expression_hash,
+            seed=seed,
+            rejection_code="signal_preflight_failed",
+            error="signal_preflight_failed: " + "；".join(reasons),
+            failure_reason="；".join(reasons) or "廉价信号预筛未通过",
+            statistic={"signal_preflight": preflight},
+        )
+
+    async def _persist_pre_eval_rejection_v2(
+        self,
+        node: Node,
+        *,
+        expression_hash: str,
+        seed: int,
+        rejection_code: str,
+        error: str,
+        failure_reason: str,
+        statistic: dict,
+    ) -> None:
+        """Append an auditable cheap rejection without charging a trial."""
+        node.status = "rejected"
+        node.error = error[:500]
+        node.public_score = 0.0
+        node.public_metrics = {
+            "discovery": {
+                "learning_score": 0.0,
+                "gate_score": 0.0,
+                "passed": False,
+                "failure_reasons": [failure_reason],
+                "score_semantics": "pre_evaluation_filter",
+            },
+            "evaluation_runtime": {
+                "evaluation_performed": False,
+                "budget_charged": False,
+            },
+            "protocol_version": EVALUATION_PROTOCOL_VERSION,
+        }
+        node.gate_metrics = {}
+        async with SessionLocal() as session:
+            session.add(node)
+            await session.flush()
+            envelope = build_feedback_envelope(
+                node_id=node.id,
+                parent_id=node.parent_id,
+                task_name=node.task_name,
+                expression=node.expression,
+                hypothesis=node.hypothesis,
+                source=node.source,
+                status=node.status,
+                error=node.error,
+                public_score=node.public_score,
+                public_metrics=node.public_metrics,
+                evaluation_protocol=node.evaluation_protocol,
+                market=self.task_config.get("market", "us"),
+                portfolio_mode=self._portfolio_mode(),
+                direction=self._signal_direction(),
+                proposal_meta=node.proposal_meta,
+            )
+            node.feedback_summary = envelope
+            session.add(Trial(
+                experiment_id=self.exp_id,
+                expression_hash=expression_hash,
+                layer="PRE_EVAL_FILTER",
+                task_name=node.task_name,
+                evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
+                node_id=node.id,
+                parent_node_id=node.parent_id,
+                expression=node.expression,
+                search_method=str(
+                    (node.proposal_meta or {}).get("search_algorithm")
+                    or node.source
+                ),
+                mechanism=str(
+                    (node.proposal_meta or {}).get("target_family") or ""
+                ),
+                selected=False,
+                failure_reason=node.error,
+                statistic={
+                    "evaluation_performed": False,
+                    "budget_charged": False,
+                    "pre_evaluation_rejection": rejection_code,
+                    "novelty_retries": int(
+                        (node.proposal_meta or {}).get(
+                            "campaign_novelty_retries", 0
+                        ) or 0
+                    ),
+                    "seed": seed,
+                    "protocol_version": EVALUATION_PROTOCOL_VERSION,
+                    **statistic,
+                },
+            ))
+            await session.commit()
+        counter_key = (
+            "pre_eval_duplicate_rejections"
+            if rejection_code == "duplicate_normalized_ast"
+            else "pre_eval_signal_rejections"
+        )
+        self.status[counter_key] = int(self.status.get(counter_key) or 0) + 1
+        self._update_research_efficiency_status()
+        self._touch_progress(current_operation=f"{rejection_code}_pre_eval")
 
     async def _config_v2(self) -> dict:
         async with SessionLocal() as s:
@@ -2895,6 +4145,11 @@ class Engine:
                     "discovery": metrics["discovery"],
                     "protocol_version": metrics["protocol_version"],
                     "evaluation_runtime": metrics.get("runtime") or {},
+                    "training_signal_rank_signature": (
+                        (metrics.get("runtime") or {}).get(
+                            "signal_rank_signature"
+                        ) or {}
+                    ),
                 }
                 node.gate_metrics = metrics["gate"]
                 node.public_score = metrics["discovery"].get("score") or 0.0
@@ -3013,7 +4268,7 @@ class Engine:
             s.add(Factor(
                 experiment_id=self.exp_id,
                 name=f"F{n + 1:05d}", expression=node.expression, hypothesis=node.hypothesis,
-                status="public-leading", node_id=node.id, task_name=node.task_name,
+                status="research-candidate", node_id=node.id, task_name=node.task_name,
                 public_metrics=node.public_metrics, gate_metrics=node.gate_metrics,
                 evaluation_protocol=EVALUATION_PROTOCOL_VERSION,
                 lifecycle_stage="research_pass",
@@ -3092,10 +4347,18 @@ class Engine:
 
     async def _next_step_no(self) -> int:
         async with SessionLocal() as s:
-            last = await s.scalar(
-                select(OuterStep.step_no).where(OuterStep.experiment_id == self.exp_id)
-                .order_by(OuterStep.step_no.desc()).limit(1))
-            return (last or 0) + 1
+            last_outer = await s.scalar(
+                select(func.max(OuterStep.step_no)).where(
+                    OuterStep.experiment_id == self.exp_id
+                )
+            )
+            last_node = await s.scalar(
+                select(func.max(Node.outer_step_no)).where(
+                    Node.experiment_id == self.exp_id,
+                    Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+                )
+            )
+            return max(int(last_outer or 0), int(last_node or 0)) + 1
 
     async def _next_version_no(self) -> int:
         async with SessionLocal() as s:

@@ -15,10 +15,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import polars as pl
 
@@ -37,8 +39,22 @@ from .risk import (
     evaluate_exit,
     risk_levels,
 )
+from .rust_kernel import (
+    align_shadow_results,
+    run_rust_kernel,
+    rust_eligibility,
+    rust_kernel_capabilities,
+)
+from .stability import (
+    analyze_return_stability,
+    analyze_signal_diagnostics,
+    combine_sleeve_signal_diagnostics,
+    factor_performance_correlation,
+    monte_carlo_analysis,
+)
 
 BACKTEST_PROTOCOL = "step_event_v2"
+MULTI_FACTOR_BACKTEST_PROTOCOL = "step_event_v2_weighted_sleeves_v1"
 _EVENT_PHASE_ORDER = {
     "SESSION_OPEN": 0,
     "OPEN_CORPORATE_ACTION": 1,
@@ -2563,6 +2579,11 @@ def _write_artifacts(result: dict, artifact_dir: Path) -> dict:
         "daily_steps": (result["daily_steps"], artifact_dir / "daily_ledger.parquet"),
         "round_trips": (result.get("round_trips", []), artifact_dir / "round_trip_ledger.parquet"),
     }
+    if result.get("factor_attribution"):
+        frame_specs["factor_attribution"] = (
+            result["factor_attribution"],
+            artifact_dir / "factor_attribution.parquet",
+        )
     files: dict[str, dict] = {}
     for name, (rows, path) in frame_specs.items():
         if rows:
@@ -2605,12 +2626,45 @@ def _write_artifacts(result: dict, artifact_dir: Path) -> dict:
         "sha256": _hash_file(round_trip_csv),
         "rows": len(result.get("round_trips", [])),
     }
+    if result.get("factor_attribution"):
+        attribution_csv = artifact_dir / "factor_attribution.csv"
+        pl.DataFrame(
+            result["factor_attribution"], infer_schema_length=None
+        ).write_csv(attribution_csv)
+        files["factor_attribution_csv"] = {
+            "filename": attribution_csv.name,
+            "sha256": _hash_file(attribution_csv),
+            "rows": len(result["factor_attribution"]),
+        }
+    for key, filename in (
+        ("stability_analysis", "stability_analysis.json"),
+        ("signal_diagnostics", "signal_diagnostics.json"),
+        ("monte_carlo", "monte_carlo.json"),
+        ("factor_performance_correlation", "factor_performance_correlation.json"),
+    ):
+        if result.get(key):
+            diagnostic_path = artifact_dir / filename
+            diagnostic_path.write_text(
+                json.dumps(result[key], ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            files[key] = {
+                "filename": diagnostic_path.name,
+                "sha256": _hash_file(diagnostic_path),
+                "rows": len(result[key].get("annual", [])),
+            }
     manifest = {
         "protocol": BACKTEST_PROTOCOL,
         "config": result["config"],
         "fee_schedule": result["fee_schedule"],
         "stats": result["stats"],
         "integrity": result["integrity"],
+        "attribution_method": result.get("attribution_method"),
+        "stability_analysis": result.get("stability_analysis"),
+        "signal_diagnostics": result.get("signal_diagnostics"),
+        "monte_carlo": result.get("monte_carlo"),
+        "factor_performance_correlation": result.get("factor_performance_correlation"),
+        "execution": result.get("execution"),
         "files": files,
     }
     manifest_path = artifact_dir / "manifest.json"
@@ -2665,7 +2719,14 @@ def run_backtest(
     exit_policy: ExitPolicyConfig | dict | None = None,
     artifact_dir: str | Path | None = None,
     response_trade_limit: int = 200,
+    response_daily_limit: int | None = 120,
     capture_detail: bool = True,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    execution_backend: str | None = None,
+    monte_carlo_enabled: bool = False,
+    monte_carlo_simulations: int = 2000,
+    monte_carlo_block_size_sessions: int = 20,
+    monte_carlo_seed: int = 20260824,
 ) -> dict:
     """Run the event engine.
 
@@ -2728,6 +2789,14 @@ def run_backtest(
     # Reject invalid account, leverage, sizing and exit semantics before the
     # potentially expensive panel scan.
     config.validate()
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "materialize",
+            "message": "加载面板并计算因子；该阶段无法可靠预估耗时",
+            "completed": None,
+            "total": None,
+        })
+    materialize_started = time.perf_counter()
     frame, _ = _prepare_backtest_frame(
         expression=expression,
         universe_n=universe_n,
@@ -2735,11 +2804,45 @@ def run_backtest(
         end=end,
         panel_glob=panel_glob,
         market=market,
+        forward_horizon=rebalance_every,
         atr_period=resolved_exit_policy.atr_period,
     )
+    materialize_seconds = time.perf_counter() - materialize_started
+    requested_backend = str(
+        execution_backend or os.getenv("FF_BACKTEST_BACKEND", "python")
+    ).strip().lower()
+    if requested_backend not in {"python", "rust_shadow", "rust"}:
+        raise ValueError("execution_backend 必须是 python、rust_shadow 或 rust")
+    # `rust` is intentionally still guarded by the shadow oracle. A mirror
+    # service may request Rust-first execution, but it cannot bypass exact
+    # ledger comparison until the kernel is formally promoted.
+    shadow_requested = requested_backend in {"rust_shadow", "rust"}
+    rust_result = None
+    rust_error = None
+    rust_total_seconds = None
+    rust_is_eligible, rust_reasons = rust_eligibility(config)
+    if shadow_requested and not capture_detail:
+        rust_is_eligible = False
+        rust_reasons = [*rust_reasons, "影子逐笔对齐要求capture_detail=true"]
+    if shadow_requested and rust_is_eligible:
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "rust_shadow",
+                "message": "运行Rust列式事件内核",
+                "completed": 0,
+                "total": 2,
+            })
+        rust_started = time.perf_counter()
+        try:
+            rust_result = run_rust_kernel(frame, config)
+        except Exception as exc:  # noqa: BLE001 - oracle fallback is deliberate
+            rust_error = str(exc)
+        rust_total_seconds = time.perf_counter() - rust_started
+    python_event_started = time.perf_counter()
     runner = StepEventBacktester(config, capture_detail=capture_detail)
     sessions = frame.partition_by("trade_date", maintain_order=True)
     session_dates = [session["trade_date"][0] for session in sessions]
+    progress_stride = max(1, len(sessions) // 200)
     for index, session in enumerate(sessions):
         runner.step(
             trade_date=session_dates[index],
@@ -2751,16 +2854,172 @@ def run_backtest(
             ),
             rebalance=index % rebalance_every == 0,
         )
+        completed_sessions = index + 1
+        if progress_callback is not None and (
+            completed_sessions == 1
+            or completed_sessions == len(sessions)
+            or completed_sessions % progress_stride == 0
+        ):
+            progress_callback({
+                "phase": "event_simulation",
+                "message": f"逐交易日事件仿真 {completed_sessions}/{len(sessions)}",
+                "completed": completed_sessions,
+                "total": len(sessions),
+            })
     result = runner.result()
+    python_event_seconds = time.perf_counter() - python_event_started
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "stability_analysis",
+            "message": "计算年度/滚动稳定性与因果IC诊断",
+            "completed": None,
+            "total": None,
+        })
+    result["signal_diagnostics"] = analyze_signal_diagnostics(
+        frame,
+        horizon=rebalance_every,
+        universe_n=universe_n,
+        direction=direction,
+    )
+    result["stability_analysis"] = analyze_return_stability(
+        result["daily_steps"],
+        total_initial_capital=initial_capital,
+        sleeves=[{
+            "factor_id": "F01",
+            "name": "单因子",
+            "normalized_weight": 1.0,
+            "initial_capital": initial_capital,
+            "nlv": [row["close_nlv"] for row in result["daily_steps"]],
+        }],
+    )
+    result["config"]["diagnostics"] = {
+        "time_slice_stability": True,
+        "causal_information_coefficient": True,
+        "monte_carlo_enabled": bool(monte_carlo_enabled),
+        "monte_carlo_simulations": int(monte_carlo_simulations),
+        "monte_carlo_block_size_sessions": int(monte_carlo_block_size_sessions),
+        "monte_carlo_seed": int(monte_carlo_seed),
+    }
+    result["monte_carlo"] = (
+        monte_carlo_analysis(
+            result["daily_steps"],
+            simulations=monte_carlo_simulations,
+            block_size_sessions=monte_carlo_block_size_sessions,
+            seed=monte_carlo_seed,
+            sleeves=[{
+                "factor_id": "F01",
+                "name": "单因子",
+                "normalized_weight": 1.0,
+                "initial_capital": initial_capital,
+                "nlv": [row["close_nlv"] for row in result["daily_steps"]],
+            }],
+        )
+        if monte_carlo_enabled else {
+            "protocol": "moving_block_bootstrap_v1",
+            "status": "DISABLED",
+        }
+    )
+    result["factor_performance_correlation"] = factor_performance_correlation(
+        dates=result["curve"]["dates"],
+        sleeves=[{
+            "factor_id": "F01",
+            "name": "单因子",
+            "normalized_weight": 1.0,
+            "initial_capital": initial_capital,
+            "nlv": [row["close_nlv"] for row in result["daily_steps"]],
+        }],
+        signal_diagnostics=result["signal_diagnostics"],
+        stability_analysis=result["stability_analysis"],
+    )
+    alignment = None
+    backend_used = "python"
+    if rust_result is not None:
+        alignment = align_shadow_results(result, rust_result)
+        backend_used = (
+            "rust_verified_shadow" if alignment["all_pass"] else "python_fallback"
+        )
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "rust_shadow",
+                "message": (
+                    "Rust逐笔与每日账本完全对齐"
+                    if alignment["all_pass"]
+                    else "Rust对齐未通过，已保留Python权威结果"
+                ),
+                "completed": 2,
+                "total": 2,
+            })
+    elif shadow_requested:
+        backend_used = "python_fallback"
+    execution = {
+        "requested_backend": requested_backend,
+        "backend_used": backend_used,
+        "python_authoritative": True,
+        "rust_eligible": rust_is_eligible,
+        "rust_fallback_reasons": rust_reasons,
+        "rust_error": rust_error,
+        "kernel": rust_kernel_capabilities(),
+        "alignment": alignment,
+        "timing_seconds": {
+            "materialization": round(materialize_seconds, 6),
+            "python_event_simulation": round(python_event_seconds, 6),
+            "rust_frame_conversion_and_kernel": (
+                round(rust_total_seconds, 6)
+                if rust_total_seconds is not None else None
+            ),
+            "rust_kernel_only": (
+                round(float(rust_result["kernel_seconds"]), 6)
+                if rust_result is not None else None
+            ),
+            "event_kernel_speedup": (
+                round(
+                    python_event_seconds
+                    / max(float(rust_result["kernel_seconds"]), 1e-12),
+                    4,
+                )
+                if rust_result is not None else None
+            ),
+            "end_to_end_projected_speedup": (
+                round(
+                    (materialize_seconds + python_event_seconds)
+                    / max(
+                        materialize_seconds
+                        + float(rust_total_seconds or rust_result["kernel_seconds"]),
+                        1e-12,
+                    ),
+                    4,
+                )
+                if rust_result is not None else None
+            ),
+        },
+        "rust_summary": rust_result.get("summary") if rust_result else None,
+        "promotion_policy": (
+            "Rust不能越过Python逐笔/每日账本门槛；当前镜像仅验证，不替换权威结果"
+        ),
+    }
+    result["execution"] = execution
     manifest = None
     if artifact_dir is not None:
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "artifact_write",
+                "message": "写入事件账本、交割单和审计产物",
+                "completed": None,
+                "total": None,
+            })
         manifest = _write_artifacts(result, Path(artifact_dir))
     compact = {
         **result,
         "trades": result["trades"][:max(0, response_trade_limit)],
         "events": result["events"][:max(0, response_trade_limit)],
         "round_trips": result.get("round_trips", [])[:max(0, response_trade_limit)],
-        "daily_steps": result["daily_steps"][-min(120, len(result["daily_steps"])):],
+        "daily_steps": (
+            result["daily_steps"]
+            if response_daily_limit is None
+            else result["daily_steps"][
+                -min(max(0, response_daily_limit), len(result["daily_steps"])):
+            ]
+        ),
         "trade_page": {
             "offset": 0,
             "limit": max(0, response_trade_limit),
@@ -2774,5 +3033,629 @@ def run_backtest(
             "total": len(result["events"]),
         },
         "artifacts": manifest,
+        "execution": execution,
     }
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "complete",
+            "message": "事件回测与完整性检查完成",
+            "completed": 1,
+            "total": 1,
+        })
+    return compact
+
+
+def _weighted_sleeve_specs(factors: list[dict]) -> list[dict]:
+    """Validate and normalize the capital allocation of factor sleeves."""
+    if not 1 <= len(factors) <= 12:
+        raise ValueError("多因子回测必须包含 1..12 个因子")
+    prepared: list[dict] = []
+    total_weight = 0.0
+    used_names: set[str] = set()
+    for index, raw in enumerate(factors, start=1):
+        expression = str(raw.get("expression") or "").strip()
+        if not expression:
+            raise ValueError(f"第 {index} 个因子表达式不能为空")
+        try:
+            weight = float(raw.get("weight", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"第 {index} 个因子权重不是有效数字") from exc
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError(f"第 {index} 个因子权重必须为正数")
+        direction = int(raw.get("direction", 1))
+        if direction not in {-1, 1}:
+            raise ValueError(f"第 {index} 个因子方向必须为 1 或 -1")
+        base_name = str(raw.get("name") or f"因子{index}").strip() or f"因子{index}"
+        name = base_name
+        suffix = 2
+        while name in used_names:
+            name = f"{base_name}-{suffix}"
+            suffix += 1
+        used_names.add(name)
+        factor_id = f"F{index:02d}"
+        prepared.append({
+            "factor_id": factor_id,
+            "name": name[:80],
+            "expression": expression,
+            "raw_weight": weight,
+            "direction": direction,
+        })
+        total_weight += weight
+    for item in prepared:
+        item["normalized_weight"] = item["raw_weight"] / total_weight
+    return prepared
+
+
+def _performance_from_nav(net_nav: list[float]) -> dict[str, float]:
+    if not net_nav:
+        raise ValueError("组合回测没有净值序列")
+    returns: list[float] = []
+    previous = 1.0
+    for value in net_nav:
+        returns.append(value / previous - 1.0 if previous > 0 else 0.0)
+        previous = value
+    n = len(returns)
+    final_nav = net_nav[-1]
+    ann_ret = final_nav ** (252.0 / max(1, n)) - 1.0 if final_nav > 0 else -1.0
+    mean_ret = sum(returns) / n
+    variance = sum((value - mean_ret) ** 2 for value in returns) / max(1, n - 1)
+    daily_vol = math.sqrt(variance)
+    downside_vol = math.sqrt(
+        sum(min(0.0, value) ** 2 for value in returns) / max(1, n)
+    )
+    peak = 1.0
+    max_dd = 0.0
+    for value in net_nav:
+        peak = max(peak, value)
+        max_dd = max(max_dd, 1.0 - value / peak if peak else 0.0)
+    return {
+        "final_nav": _round(final_nav, 6),
+        "ann_ret": _round(ann_ret, 6),
+        "ann_vol": _round(daily_vol * math.sqrt(252.0), 6),
+        "sharpe": _round(
+            mean_ret / daily_vol * math.sqrt(252.0) if daily_vol > 1e-12 else 0.0,
+            4,
+        ),
+        "sortino": _round(
+            mean_ret / downside_vol * math.sqrt(252.0) if downside_vol > 1e-12 else 0.0,
+            4,
+        ),
+        "calmar": _round(ann_ret / max_dd if max_dd > 1e-12 else 0.0, 4),
+        "max_dd": _round(max_dd, 6),
+    }
+
+
+def _tag_sleeve_rows(rows: list[dict], spec: dict, id_fields: tuple[str, ...]) -> list[dict]:
+    tagged: list[dict] = []
+    prefix = spec["factor_id"]
+    for source in rows:
+        row = dict(source)
+        row.update({
+            "factor_id": prefix,
+            "factor_name": spec["name"],
+            "factor_weight": _round(spec["normalized_weight"], 10),
+            "factor_direction": spec["direction"],
+        })
+        for field_name in id_fields:
+            if row.get(field_name):
+                row[field_name] = f"{prefix}-{row[field_name]}"
+        tagged.append(row)
+    return tagged
+
+
+def run_multi_factor_backtest(
+    factors: list[dict],
+    **kwargs: Any,
+) -> dict:
+    """Backtest an auditable capital-sleeve ensemble.
+
+    Each factor owns a fixed share of starting capital and an independent event
+    ledger.  The portfolio NLV is the pointwise sum of sleeve NLVs, so net P&L,
+    execution costs and return contribution reconcile exactly.  Cross-factor
+    order netting is deliberately disabled and disclosed; otherwise a fill can
+    no longer be assigned to one factor without an arbitrary attribution rule.
+    """
+    specs = _weighted_sleeve_specs(factors)
+    artifact_dir = kwargs.pop("artifact_dir", None)
+    response_trade_limit = int(kwargs.pop("response_trade_limit", 200))
+    response_daily_limit = kwargs.pop("response_daily_limit", 120)
+    progress_callback = kwargs.pop("progress_callback", None)
+    capture_detail = bool(kwargs.pop("capture_detail", True))
+    monte_carlo_enabled = bool(kwargs.pop("monte_carlo_enabled", False))
+    monte_carlo_simulations = int(kwargs.pop("monte_carlo_simulations", 2000))
+    monte_carlo_block_size_sessions = int(
+        kwargs.pop("monte_carlo_block_size_sessions", 20)
+    )
+    monte_carlo_seed = int(kwargs.pop("monte_carlo_seed", 20260824))
+    if not capture_detail:
+        raise ValueError("多因子贡献归因要求 capture_detail=true")
+    total_initial = float(kwargs.pop("initial_capital", 1_000_000.0))
+    if total_initial <= 0:
+        raise ValueError("initial_capital 必须为正数")
+
+    sleeves: list[tuple[dict, dict]] = []
+    for index, spec in enumerate(specs, start=1):
+        sleeve_capital = total_initial * float(spec["normalized_weight"])
+
+        def sleeve_progress(payload: dict, *, _index: int = index, _spec: dict = spec) -> None:
+            if progress_callback is None:
+                return
+            progress_callback({
+                "phase": "factor_sleeve",
+                "message": (
+                    f"因子袖套 {_index}/{len(specs)} · {_spec['name']} · "
+                    f"{payload.get('message') or payload.get('phase') or ''}"
+                ),
+                "completed": _index - 1,
+                "total": len(specs),
+            })
+
+        result = run_backtest(
+            expression=spec["expression"],
+            direction=spec["direction"],
+            initial_capital=sleeve_capital,
+            artifact_dir=None,
+            response_trade_limit=10**9,
+            response_daily_limit=None,
+            capture_detail=True,
+            monte_carlo_enabled=False,
+            progress_callback=sleeve_progress,
+            **kwargs,
+        )
+        sleeves.append((spec | {"initial_capital": sleeve_capital}, result))
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "factor_sleeve",
+                "message": f"因子袖套 {index}/{len(specs)} 完成 · {spec['name']}",
+                "completed": index,
+                "total": len(specs),
+            })
+
+    reference_dates = sleeves[0][1]["curve"]["dates"]
+    if any(result["curve"]["dates"] != reference_dates for _, result in sleeves[1:]):
+        raise ValueError("因子袖套交易日不一致，无法进行组合归因")
+
+    combined_nlv: list[float] = []
+    combined_gross_proxy: list[float] = []
+    combined_daily: list[dict] = []
+    factor_curve_series: list[dict] = []
+    previous_total_nlv = total_initial
+    peak_nlv = total_initial
+    for spec, result in sleeves:
+        capital = float(spec["initial_capital"])
+        factor_curve_series.append({
+            "factor_id": spec["factor_id"],
+            "name": spec["name"],
+            "values": [
+                _round((float(nav) * capital - capital) / total_initial, 10)
+                for nav in result["curve"]["equity"]
+            ],
+        })
+    for day_index, trade_date in enumerate(reference_dates):
+        rows = [result["daily_steps"][day_index] for _, result in sleeves]
+        close_nlv = sum(float(row["close_nlv"]) for row in rows)
+        cost_free_nlv = sum(
+            float(result["curve"]["cost_free_proxy"][day_index])
+            * float(spec["initial_capital"])
+            for spec, result in sleeves
+        )
+        long_value = sum(float(row["long_market_value"]) for row in rows)
+        short_value = sum(float(row["short_market_value"]) for row in rows)
+        cash = sum(float(row["cash"]) for row in rows)
+        turnover_notional = 0.0
+        for spec, result in sleeves:
+            sleeve_previous = (
+                float(spec["initial_capital"])
+                if day_index == 0
+                else float(result["daily_steps"][day_index - 1]["close_nlv"])
+            )
+            turnover_notional += (
+                float(result["daily_steps"][day_index]["turnover"])
+                * sleeve_previous
+            )
+        daily_return = (
+            close_nlv / previous_total_nlv - 1.0
+            if previous_total_nlv > 0 else 0.0
+        )
+        peak_nlv = max(peak_nlv, close_nlv)
+        combined_nlv.append(close_nlv)
+        combined_gross_proxy.append(cost_free_nlv)
+        combined_daily.append({
+            "trade_date": trade_date,
+            "open_nlv_before_fills": _round(sum(float(row["open_nlv_before_fills"]) for row in rows), 6),
+            "open_nlv_after_fills": _round(sum(float(row["open_nlv_after_fills"]) for row in rows), 6),
+            "open_gross_exposure_before_control": _round(
+                sum(
+                    float(row["open_gross_exposure_before_control"])
+                    * float(spec["initial_capital"])
+                    for (spec, _), row in zip(sleeves, rows)
+                ) / total_initial,
+                8,
+            ),
+            "open_gross_exposure": _round(
+                (long_value + abs(short_value)) / close_nlv if close_nlv > 0 else 0.0,
+                8,
+            ),
+            "leverage_control_orders": sum(int(row["leverage_control_orders"]) for row in rows),
+            "leverage_control_resolved": all(bool(row["leverage_control_resolved"]) for row in rows),
+            "close_nlv": _round(close_nlv, 6),
+            "net_nav": _round(close_nlv / total_initial, 8),
+            "same_orders_cost_free_nav_proxy": _round(cost_free_nlv / total_initial, 8),
+            "daily_return": _round(daily_return, 8),
+            "cash": _round(cash, 6),
+            "long_market_value": _round(long_value, 6),
+            "short_market_value": _round(short_value, 6),
+            "gross_exposure": _round((long_value + abs(short_value)) / close_nlv if close_nlv > 0 else 0.0, 6),
+            "net_exposure": _round((long_value + short_value) / close_nlv if close_nlv else 0.0, 6),
+            "turnover": _round(turnover_notional / previous_total_nlv if previous_total_nlv > 0 else 0.0, 6),
+            "fills": sum(int(row["fills"]) for row in rows),
+            "events": sum(int(row["events"]) for row in rows),
+            "orders_created": sum(int(row["orders_created"]) for row in rows),
+            "positions": sum(int(row["positions"]) for row in rows),
+            "borrow_fee": _round(sum(float(row["borrow_fee"]) for row in rows), 6),
+            "margin_interest": _round(sum(float(row["margin_interest"]) for row in rows), 6),
+            "portfolio_drawdown": _round(1.0 - close_nlv / peak_nlv if peak_nlv > 0 else 1.0, 8),
+            "portfolio_risk_orders": sum(int(row["portfolio_risk_orders"]) for row in rows),
+            "portfolio_risk_active": any(bool(row["portfolio_risk_active"]) for row in rows),
+            "portfolio_risk_rearmed": any(bool(row["portfolio_risk_rearmed"]) for row in rows),
+            "risk_cooldown_remaining": max(int(row["risk_cooldown_remaining"]) for row in rows),
+            "position_state_max_error": max(float(row["position_state_max_error"]) for row in rows),
+        })
+        previous_total_nlv = close_nlv
+
+    total_final_nlv = combined_nlv[-1]
+    total_net_profit = total_final_nlv - total_initial
+    factor_attribution: list[dict] = []
+    for spec, result in sleeves:
+        stats = result["stats"]
+        capital = float(spec["initial_capital"])
+        final_nlv = float(stats["final_nlv"])
+        net_profit = final_nlv - capital
+        factor_attribution.append({
+            "factor_id": spec["factor_id"],
+            "name": spec["name"],
+            "expression": spec["expression"],
+            "direction": spec["direction"],
+            "raw_weight": _round(spec["raw_weight"], 10),
+            "normalized_weight": _round(spec["normalized_weight"], 10),
+            "initial_capital": _round(capital, 6),
+            "final_nlv": _round(final_nlv, 6),
+            "net_profit": _round(net_profit, 6),
+            "return_contribution": _round(net_profit / total_initial, 10),
+            "pnl_share": (
+                _round(net_profit / total_net_profit, 10)
+                if abs(total_net_profit) > 1e-12 else None
+            ),
+            "standalone_return": _round(final_nlv / capital - 1.0, 10),
+            "ann_ret": stats["ann_ret"],
+            "sharpe": stats["sharpe"],
+            "max_dd": stats["max_dd"],
+            "avg_daily_turnover": stats["avg_daily_turnover"],
+            "win_rate": stats["win_rate"],
+            "profit_factor": stats["profit_factor"],
+            "fills": stats["fills"],
+            "total_execution_cost": stats["total_execution_cost"],
+            "integrity_pass": bool(result["integrity"]["all_pass"]),
+        })
+
+    trades: list[dict] = []
+    events: list[dict] = []
+    round_trips: list[dict] = []
+    positions: list[dict] = []
+    for spec, result in sleeves:
+        trades.extend(_tag_sleeve_rows(result["trades"], spec, ("fill_id", "order_id")))
+        events.extend(_tag_sleeve_rows(result["events"], spec, ("order_id",)))
+        round_trips.extend(_tag_sleeve_rows(result.get("round_trips", []), spec, ()))
+        positions.extend(_tag_sleeve_rows(result.get("positions", []), spec, ()))
+    trades.sort(key=lambda row: (row.get("trade_date", ""), row.get("factor_id", ""), row.get("fill_id", "")))
+    events.sort(key=lambda row: (row.get("trade_date", ""), row.get("factor_id", ""), int(row.get("seq", 0))))
+    for seq, row in enumerate(events, start=1):
+        row["seq"] = seq
+
+    perf = _performance_from_nav([value / total_initial for value in combined_nlv])
+    wins = [row for row in round_trips if float(row.get("net_pnl", 0.0)) > 0]
+    losses = [row for row in round_trips if float(row.get("net_pnl", 0.0)) < 0]
+    gross_profit = sum(float(row["net_pnl"]) for row in wins)
+    gross_loss = abs(sum(float(row["net_pnl"]) for row in losses))
+    total_cost = sum(float(result["stats"]["total_execution_cost"]) for _, result in sleeves)
+    orders = sum(int(result["stats"]["orders"]) for _, result in sleeves)
+    weighted_fill_rate = (
+        sum(float(result["stats"]["fill_rate"]) * max(1, int(result["stats"]["orders"])) for _, result in sleeves)
+        / sum(max(1, int(result["stats"]["orders"])) for _, result in sleeves)
+    )
+    stats = {
+        "protocol": MULTI_FACTOR_BACKTEST_PROTOCOL,
+        "days": len(reference_dates),
+        "initial_capital": total_initial,
+        "final_nlv": _round(total_final_nlv, 6),
+        **perf,
+        "avg_daily_turnover": _round(sum(float(row["turnover"]) for row in combined_daily) / len(combined_daily), 6),
+        "avg_gross_exposure": _round(sum(float(row["gross_exposure"]) for row in combined_daily) / len(combined_daily), 6),
+        "avg_net_exposure": _round(sum(float(row["net_exposure"]) for row in combined_daily) / len(combined_daily), 6),
+        "fills": len(trades),
+        "orders": orders,
+        "orders_executed": sum(int(result["stats"]["orders_executed"]) for _, result in sleeves),
+        "rejected_orders": sum(int(result["stats"]["rejected_orders"]) for _, result in sleeves),
+        "partial_orders": sum(int(result["stats"]["partial_orders"]) for _, result in sleeves),
+        "fill_rate": _round(weighted_fill_rate, 6),
+        "commission_and_tax": _round(sum(float(result["stats"]["commission_and_tax"]) for _, result in sleeves), 6),
+        "slippage_cost": _round(sum(float(result["stats"]["slippage_cost"]) for _, result in sleeves), 6),
+        "borrow_cost": _round(sum(float(result["stats"]["borrow_cost"]) for _, result in sleeves), 6),
+        "margin_interest": _round(sum(float(result["stats"]["margin_interest"]) for _, result in sleeves), 6),
+        "total_execution_cost": _round(total_cost, 6),
+        "fee_profile": sleeves[0][1]["stats"]["fee_profile"],
+        "currency": sleeves[0][1]["stats"]["currency"],
+        "open_positions": len(positions),
+        "same_orders_cost_free_final_nav_proxy": _round(combined_gross_proxy[-1] / total_initial, 6),
+        "closed_trades": len(round_trips),
+        "win_rate": _round(len(wins) / len(round_trips), 6) if round_trips else 0.0,
+        "profit_factor": _round(gross_profit / gross_loss, 6) if gross_loss > 1e-12 else None,
+        "payoff_ratio": None,
+        "avg_trade_return": _round(sum(float(row.get("return", 0.0)) for row in round_trips) / len(round_trips), 8) if round_trips else 0.0,
+        "avg_holding_sessions": _round(sum(int(row.get("holding_sessions", 0)) for row in round_trips) / len(round_trips), 4) if round_trips else 0.0,
+        "portfolio_liquidations": sum(int(result["stats"]["portfolio_liquidations"]) for _, result in sleeves),
+        "portfolio_risk_trigger_events": sum(int(result["stats"]["portfolio_risk_trigger_events"]) for _, result in sleeves),
+        "portfolio_risk_rearms": sum(int(result["stats"]["portfolio_risk_rearms"]) for _, result in sleeves),
+        "portfolio_risk_active_sessions": sum(int(result["stats"]["portfolio_risk_active_sessions"]) for _, result in sleeves),
+        "portfolio_risk_active_at_end": any(bool(result["stats"]["portfolio_risk_active_at_end"]) for _, result in sleeves),
+        "portfolio_risk_last_trigger": next((result["stats"]["portfolio_risk_last_trigger"] for _, result in reversed(sleeves) if result["stats"]["portfolio_risk_last_trigger"]), None),
+        "max_portfolio_risk_cycle_drawdown": max(float(result["stats"]["max_portfolio_risk_cycle_drawdown"]) for _, result in sleeves),
+        "terminal_flat_sessions": min(int(result["stats"]["terminal_flat_sessions"]) for _, result in sleeves),
+        "exit_reason_counts": {},
+        "gross_leverage_breach_events": sum(int(result["stats"]["gross_leverage_breach_events"]) for _, result in sleeves),
+        "automatic_deleveraging_events": sum(int(result["stats"]["automatic_deleveraging_events"]) for _, result in sleeves),
+        "leverage_limited_orders": sum(int(result["stats"]["leverage_limited_orders"]) for _, result in sleeves),
+        "max_open_gross_leverage_observed": max(float(row["open_gross_exposure_before_control"]) for row in combined_daily),
+        "max_open_gross_leverage_after_control": max(float(row["open_gross_exposure"]) for row in combined_daily),
+        "factor_count": len(specs),
+    }
+    for row in round_trips:
+        reason = str(row.get("exit_reason") or "unknown")
+        stats["exit_reason_counts"][reason] = stats["exit_reason_counts"].get(reason, 0) + 1
+    if wins and losses:
+        avg_win = gross_profit / len(wins)
+        avg_loss = gross_loss / len(losses)
+        stats["payoff_ratio"] = _round(avg_win / avg_loss, 6) if avg_loss > 1e-12 else None
+
+    integrity: dict[str, Any] = {}
+    all_integrities = [result["integrity"] for _, result in sleeves]
+    keys = set().union(*(item.keys() for item in all_integrities)) - {"all_pass", "gross_leverage_violation_details", "ledger_source_of_truth"}
+    for key in keys:
+        values = [item.get(key, 0) for item in all_integrities]
+        if key.endswith("_max_error") or key.startswith("max_open_"):
+            integrity[key] = max(float(value or 0.0) for value in values)
+        else:
+            integrity[key] = sum(int(value or 0) for value in values)
+    integrity["gross_leverage_violation_details"] = [
+        detail | {"factor_id": spec["factor_id"], "factor_name": spec["name"]}
+        for spec, result in sleeves
+        for detail in result["integrity"].get("gross_leverage_violation_details", [])
+    ]
+    integrity["statement_rows"] = len(trades)
+    integrity["factor_sleeve_integrity_failures"] = sum(
+        not bool(item.get("all_pass")) for item in all_integrities
+    )
+    integrity["attribution_final_nlv_max_error"] = abs(
+        sum(float(row["final_nlv"]) for row in factor_attribution) - total_final_nlv
+    )
+    integrity["attribution_return_contribution_max_error"] = abs(
+        sum(float(row["return_contribution"]) for row in factor_attribution)
+        - (total_final_nlv / total_initial - 1.0)
+    )
+    integrity["ledger_source_of_truth"] = True
+    integrity["all_pass"] = (
+        integrity["factor_sleeve_integrity_failures"] == 0
+        and integrity["attribution_final_nlv_max_error"] <= 1e-5
+        and integrity["attribution_return_contribution_max_error"] <= 1e-8
+    )
+
+    sleeve_executions = [result.get("execution", {}) for _, result in sleeves]
+    timing_keys = (
+        "materialization",
+        "python_event_simulation",
+        "rust_frame_conversion_and_kernel",
+        "rust_kernel_only",
+    )
+    combined_timing = {
+        key: _round(
+            sum(
+                float(item.get("timing_seconds", {}).get(key) or 0.0)
+                for item in sleeve_executions
+            ),
+            6,
+        )
+        for key in timing_keys
+    }
+    rust_alignments = [
+        item.get("alignment") for item in sleeve_executions
+        if item.get("alignment") is not None
+    ]
+    all_rust_verified = bool(sleeve_executions) and all(
+        item.get("backend_used") == "rust_verified_shadow"
+        for item in sleeve_executions
+    )
+    any_rust_requested = any(
+        item.get("requested_backend") in {"rust", "rust_shadow"}
+        for item in sleeve_executions
+    )
+    execution = {
+        "requested_backend": sleeve_executions[0].get("requested_backend", "python"),
+        "backend_used": (
+            "rust_verified_shadow"
+            if all_rust_verified
+            else ("python_fallback" if any_rust_requested else "python")
+        ),
+        "python_authoritative": True,
+        "rust_eligible": all(bool(item.get("rust_eligible")) for item in sleeve_executions),
+        "rust_fallback_reasons": sorted({
+            str(reason)
+            for item in sleeve_executions
+            for reason in item.get("rust_fallback_reasons", [])
+        }),
+        "alignment": {
+            "all_pass": bool(rust_alignments)
+            and len(rust_alignments) == len(sleeve_executions)
+            and all(bool(item.get("all_pass")) for item in rust_alignments),
+            "factor_sleeves_checked": len(rust_alignments),
+            "factor_sleeves_total": len(sleeve_executions),
+            "max_trade_numeric_error": max(
+                (float(item.get("max_trade_numeric_error") or 0.0) for item in rust_alignments),
+                default=None,
+            ),
+            "max_daily_numeric_error": max(
+                (float(item.get("max_daily_numeric_error") or 0.0) for item in rust_alignments),
+                default=None,
+            ),
+        },
+        "timing_seconds": {
+            **combined_timing,
+            "event_kernel_speedup": (
+                _round(
+                    combined_timing["python_event_simulation"]
+                    / max(combined_timing["rust_kernel_only"], 1e-12),
+                    4,
+                )
+                if combined_timing["rust_kernel_only"] > 0 else None
+            ),
+            "end_to_end_projected_speedup": (
+                _round(
+                    (
+                        combined_timing["materialization"]
+                        + combined_timing["python_event_simulation"]
+                    )
+                    / max(
+                        combined_timing["materialization"]
+                        + combined_timing["rust_frame_conversion_and_kernel"],
+                        1e-12,
+                    ),
+                    4,
+                )
+                if combined_timing["rust_frame_conversion_and_kernel"] > 0 else None
+            ),
+        },
+        "sleeves": [
+            {
+                "factor_id": spec["factor_id"],
+                "factor_name": spec["name"],
+                "backend_used": result.get("execution", {}).get("backend_used"),
+                "alignment": result.get("execution", {}).get("alignment"),
+            }
+            for spec, result in sleeves
+        ],
+        "promotion_policy": "每个因子袖套都必须通过Python逐笔及每日账本对齐",
+    }
+
+    stability_sleeves = [{
+        "factor_id": spec["factor_id"],
+        "name": spec["name"],
+        "normalized_weight": spec["normalized_weight"],
+        "initial_capital": spec["initial_capital"],
+        "nlv": [row["close_nlv"] for row in sleeve_result["daily_steps"]],
+    } for spec, sleeve_result in sleeves]
+    combined_stability = analyze_return_stability(
+        combined_daily,
+        total_initial_capital=total_initial,
+        sleeves=stability_sleeves,
+    )
+    combined_signal_diagnostics = combine_sleeve_signal_diagnostics(sleeves)
+    performance_correlation = factor_performance_correlation(
+        dates=reference_dates,
+        sleeves=stability_sleeves,
+        signal_diagnostics=combined_signal_diagnostics,
+        stability_analysis=combined_stability,
+    )
+    result = {
+        "protocol": MULTI_FACTOR_BACKTEST_PROTOCOL,
+        "config": sleeves[0][1]["config"] | {
+            "initial_capital": total_initial,
+            "combination_method": "independent_capital_sleeves",
+            "cross_factor_order_netting": False,
+            "factors": specs,
+            "diagnostics": {
+                "time_slice_stability": True,
+                "causal_information_coefficient": True,
+                "monte_carlo_enabled": monte_carlo_enabled,
+                "monte_carlo_simulations": monte_carlo_simulations,
+                "monte_carlo_block_size_sessions": monte_carlo_block_size_sessions,
+                "monte_carlo_seed": monte_carlo_seed,
+            },
+        },
+        "fee_schedule": sleeves[0][1]["fee_schedule"],
+        "stats": stats,
+        "curve": {
+            "dates": reference_dates,
+            "equity": [_round(value / total_initial, 8) for value in combined_nlv],
+            "cost_free_proxy": [_round(value / total_initial, 8) for value in combined_gross_proxy],
+            "daily_ret": [row["daily_return"] for row in combined_daily],
+        },
+        "attribution_method": "exact_independent_capital_sleeves_v1",
+        "attribution_disclosure": "各因子独立资金、独立成交与独立费用；组合净值逐日相加；不跨因子净额抵销订单。",
+        "factor_attribution": factor_attribution,
+        "factor_attribution_curve": {"dates": reference_dates, "series": factor_curve_series},
+        "stability_analysis": combined_stability,
+        "signal_diagnostics": combined_signal_diagnostics,
+        "factor_performance_correlation": performance_correlation,
+        "monte_carlo": (
+            monte_carlo_analysis(
+                combined_daily,
+                simulations=monte_carlo_simulations,
+                block_size_sessions=monte_carlo_block_size_sessions,
+                seed=monte_carlo_seed,
+                sleeves=stability_sleeves,
+            )
+            if monte_carlo_enabled else {
+                "protocol": "moving_block_bootstrap_v1",
+                "status": "DISABLED",
+            }
+        ),
+        "daily_steps": combined_daily,
+        "trades": trades,
+        "events": events,
+        "round_trips": round_trips,
+        "positions": positions,
+        "integrity": integrity,
+        "execution": execution,
+        "detail_capture": "full_statement_per_factor_sleeve",
+    }
+    manifest = None
+    if artifact_dir is not None:
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "artifact_write",
+                "message": "写入组合账本与逐因子贡献归因产物",
+                "completed": None,
+                "total": None,
+            })
+        manifest = _write_artifacts(result, Path(artifact_dir))
+    compact = {
+        **result,
+        "trades": trades[:max(0, response_trade_limit)],
+        "events": events[:max(0, response_trade_limit)],
+        "round_trips": round_trips[:max(0, response_trade_limit)],
+        "daily_steps": (
+            combined_daily
+            if response_daily_limit is None
+            else combined_daily[-min(max(0, int(response_daily_limit)), len(combined_daily)):]
+        ),
+        "trade_page": {
+            "offset": 0,
+            "limit": max(0, response_trade_limit),
+            "returned": min(len(trades), max(0, response_trade_limit)),
+            "total": len(trades),
+        },
+        "event_page": {
+            "offset": 0,
+            "limit": max(0, response_trade_limit),
+            "returned": min(len(events), max(0, response_trade_limit)),
+            "total": len(events),
+        },
+        "artifacts": manifest,
+    }
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "complete",
+            "message": "多因子组合、事件账本与贡献归因完成",
+            "completed": len(specs),
+            "total": len(specs),
+        })
     return compact

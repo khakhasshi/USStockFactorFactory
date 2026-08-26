@@ -5,7 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .search_pool import DEFAULT_SEARCH_ALGORITHMS
+from .search_pool import DEFAULT_SEARCH_ALGORITHMS, SUPPORTED_SEARCH_ALGORITHMS
+from .qlib_native import resolve_qlib_task_integration
 
 
 RESEARCH_ARCHITECTURE_SCHEMA = "factorfactory.research-architecture/v1"
@@ -22,11 +23,12 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
     },
     "algorithm_pool_only": {
         "label": "第一层算法池（无 LLM）",
-        "description": "随机、进化、代理模型与 Q-learning；不调用 LLM。",
+        "description": "结构、残差、ML 蒸馏、局部优化与高风险探索按科学配额运行；不调用 LLM。",
         "layer1_enabled": True,
         "layer2_enabled": False,
         "layer3_enabled": False,
-        "search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+        "search_algorithms": [*DEFAULT_SEARCH_ALGORITHMS, "qlib_alpha158_prior"],
+        "qlib_integration": {"enabled": True},
         "default_memory_mode": "cold",
     },
     "random_researcher": {
@@ -45,7 +47,8 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
         "layer1_enabled": True,
         "layer2_enabled": True,
         "layer3_enabled": False,
-        "search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+        "search_algorithms": [*DEFAULT_SEARCH_ALGORITHMS, "qlib_alpha158_prior"],
+        "qlib_integration": {"enabled": True},
         "default_memory_mode": "adaptive",
     },
     "full_three_layer": {
@@ -54,7 +57,8 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
         "layer1_enabled": True,
         "layer2_enabled": True,
         "layer3_enabled": True,
-        "search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+        "search_algorithms": [*DEFAULT_SEARCH_ALGORITHMS, "qlib_alpha158_prior"],
+        "qlib_integration": {"enabled": True},
         "default_memory_mode": "adaptive",
     },
     "full_llm_three_layer": {
@@ -68,7 +72,8 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
         "layer3_enabled": True,
         "full_llm_architecture": True,
         "scientific_governor_enabled": True,
-        "search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+        "search_algorithms": [*DEFAULT_SEARCH_ALGORITHMS, "qlib_alpha158_prior"],
+        "qlib_integration": {"enabled": True},
         "default_memory_mode": "adaptive",
     },
     "direct_researcher": {
@@ -173,7 +178,7 @@ def resolve_research_architecture(config: dict[str, Any] | None) -> dict[str, An
     if not any((layer1, layer2, layer3)) and not legacy_direct_random:
         raise ValueError("研究架构至少需要启用第一层搜索或第二层 LLM")
 
-    allowed = set(DEFAULT_SEARCH_ALGORITHMS)
+    allowed = set(SUPPORTED_SEARCH_ALGORITHMS)
     unknown = sorted(set(algorithms) - allowed)
     if unknown:
         raise ValueError(f"未知第一层搜索算法: {unknown}")
@@ -183,6 +188,28 @@ def resolve_research_architecture(config: dict[str, Any] | None) -> dict[str, An
         algorithms = []
     if not layer2:
         memory_mode = "cold"
+
+    qlib_integration = resolve_qlib_task_integration(
+        raw.get("qlib_integration") or (
+            template.get("qlib_integration")
+            if requested in _TEMPLATES
+            else None
+        ),
+        layer1_enabled=layer1,
+        alpha158_algorithm_selected="qlib_alpha158_prior" in algorithms,
+        joint_algorithm_selected="qlib_joint_residual_distill" in algorithms,
+    )
+    if qlib_integration["alpha158_prior_enabled"] and "qlib_alpha158_prior" not in algorithms:
+        algorithms.append("qlib_alpha158_prior")
+    if not qlib_integration["alpha158_prior_enabled"]:
+        algorithms = [name for name in algorithms if name != "qlib_alpha158_prior"]
+    if qlib_integration["joint_model_enabled"] and "qlib_joint_residual_distill" not in algorithms:
+        algorithms.append("qlib_joint_residual_distill")
+    if not qlib_integration["joint_model_enabled"]:
+        algorithms = [
+            name for name in algorithms
+            if name != "qlib_joint_residual_distill"
+        ]
 
     proposal_mode = "llm" if layer2 else "search_pool" if layer1 else "random"
     resolved = {
@@ -194,6 +221,7 @@ def resolve_research_architecture(config: dict[str, Any] | None) -> dict[str, An
         "search_algorithms": algorithms,
         "proposal_mode": proposal_mode,
         "memory_mode": memory_mode,
+        "qlib_integration": qlib_integration,
     }
     if requested in _TEMPLATES and _TEMPLATES[requested].get(
         "full_llm_architecture", False

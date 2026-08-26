@@ -1,8 +1,10 @@
 import asyncio
 import json
+import math
 import os
 import statistics as st
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,17 +17,20 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
-from ..backtest.engine import run_backtest
+from ..backtest.engine import run_backtest, run_multi_factor_backtest
+from ..backtest.rust_kernel import rust_kernel_capabilities
 from ..blind_review import (
     build_review_packets,
     deterministic_code_review,
     seal_reviews,
 )
+from ..factor_lifecycle import factor_evidence_state
 from ..combination_lab import (
     COMBINATION_LAB_PROTOCOL,
     CombinationLabManager,
     validate_lab_spec,
 )
+from ..compute_progress import ACTIVE_STATES, COMPUTE_PROGRESS
 from ..config import (
     BACKTEST_ARTIFACT_ROOT,
     DATABASE_URL,
@@ -58,6 +63,7 @@ from ..db import (
 from ..dsl.engine import (
     OPERATORS_DOC,
     expression_profile,
+    normalize_hash,
     parse,
     validate,
 )
@@ -75,6 +81,7 @@ from ..leaderboards import (
 from ..factors.diversity import infer_mechanism, mechanisms_for_market
 from ..factors.return_source_governance import (
     RETURN_SOURCE_GOVERNANCE_PROTOCOL,
+    cluster_training_return_sources,
     resolve_return_source_governance,
 )
 from ..factors.semantics import audit_expression_semantics, field_contract
@@ -120,6 +127,13 @@ from ..portfolio_allocation import (
     ALLOCATION_METHODS,
     build_purchase_allocation,
 )
+from ..qlib_native import (
+    alpha158_catalog,
+    alpha158_progress,
+    latest_alpha158_reports,
+    qlib_native_capabilities,
+)
+from ..qlib_joint import JointModelSpec, latest_joint_result, run_joint_alpha158
 from ..research_records import (
     RESEARCH_RECORD_SCHEMA_VERSION,
     research_record_payload,
@@ -145,7 +159,13 @@ from ..research_architecture import (
     architecture_catalog,
     resolve_research_architecture,
 )
-from ..search_pool import DEFAULT_SEARCH_ALGORITHMS
+from ..search_pool import (
+    ALGORITHM_GROUPS,
+    DEFAULT_SEARCH_ALGORITHMS,
+    SEARCH_GROUP_WEIGHTS,
+    SEARCH_POLICY_SCHEMA,
+    SUPPORTED_SEARCH_ALGORITHMS,
+)
 from ..screener import SCREEN_CACHE, screen_cross_section
 
 router = APIRouter(prefix="/api")
@@ -341,12 +361,21 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
         full_ranking.get("rating_protocol_version")
         == FROZEN_RATING_PROTOCOL_VERSION
     )
+    market = str((f.research_meta or {}).get("market") or "us")
+    current_review = deterministic_code_review(f.expression, market)
+    evidence_state = factor_evidence_state(
+        f,
+        current_code_review=current_review,
+        current_rating_protocol=FROZEN_RATING_PROTOCOL_VERSION,
+    )
     payload = {
         "id": f.id,
         "experiment_id": f.experiment_id,
         "name": f.name,
         "expression": f.expression,
-        "status": f.status,
+        "status": evidence_state["effective_status"],
+        "raw_status": f.status,
+        "evidence_state": evidence_state,
         "lifecycle_stage": f.lifecycle_stage or "legacy_unreviewed",
         "provenance_status": f.provenance_status or "unverified",
         "task": f.task_name,
@@ -375,6 +404,7 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
     if include_validation:
         payload["validation"] = validation
         payload["fingerprint"] = f.fingerprint or {}
+        payload["current_code_review"] = current_review
     return payload
 
 
@@ -414,6 +444,313 @@ async def engine_start(req: EngineStartReq | None = None):
 async def engine_stop(req: dict | None = None):
     experiment_id = req.get("experiment_id") if req else None
     return await EngineManager.get().stop(experiment_id)
+
+
+def _progress_numbers(completed, total) -> tuple[float | None, float | None, float | None]:
+    try:
+        done = float(completed) if completed is not None else None
+    except (TypeError, ValueError):
+        done = None
+    try:
+        size = float(total) if total is not None else None
+    except (TypeError, ValueError):
+        size = None
+    ratio = (
+        max(0.0, min(1.0, done / size))
+        if done is not None and size is not None and size > 0
+        else None
+    )
+    return done, size, ratio
+
+
+def _elapsed_seconds(started_at) -> float | None:
+    if not started_at:
+        return None
+    try:
+        started = (
+            started_at
+            if isinstance(started_at, datetime)
+            else datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        )
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return round(max(0.0, (datetime.now(timezone.utc) - started).total_seconds()), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_job(
+    *,
+    job_id: str,
+    kind: str,
+    title: str,
+    state: str,
+    phase: str,
+    message: str = "",
+    completed=None,
+    total=None,
+    cancellable: bool = False,
+    experiment_id: int | None = None,
+    error: str = "",
+    started_at=None,
+    updated_at=None,
+    completed_at=None,
+    heartbeat_age_seconds=None,
+    elapsed_seconds=None,
+    metadata: dict | None = None,
+    source: str = "durable",
+) -> dict:
+    done, size, ratio = _progress_numbers(completed, total)
+    resolved_elapsed = elapsed_seconds
+    if resolved_elapsed is None and started_at and completed_at:
+        try:
+            started_value = started_at if isinstance(started_at, datetime) else datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            completed_value = completed_at if isinstance(completed_at, datetime) else datetime.fromisoformat(str(completed_at).replace("Z", "+00:00"))
+            if started_value.tzinfo is None:
+                started_value = started_value.replace(tzinfo=timezone.utc)
+            if completed_value.tzinfo is None:
+                completed_value = completed_value.replace(tzinfo=timezone.utc)
+            resolved_elapsed = round(max(0.0, (completed_value - started_value).total_seconds()), 3)
+        except (TypeError, ValueError):
+            resolved_elapsed = None
+    elif resolved_elapsed is None and state in ACTIVE_STATES:
+        resolved_elapsed = _elapsed_seconds(started_at)
+    return {
+        "job_id": job_id,
+        "kind": kind,
+        "title": title,
+        "state": state,
+        "phase": phase,
+        "message": message,
+        "completed": done,
+        "total": size,
+        "progress": ratio,
+        "indeterminate": ratio is None,
+        "cancellable": bool(cancellable and state in ACTIVE_STATES),
+        "experiment_id": experiment_id,
+        "error": str(error or "")[:4000],
+        "started_at": started_at.isoformat() if isinstance(started_at, datetime) else started_at,
+        "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else updated_at,
+        "completed_at": completed_at.isoformat() if isinstance(completed_at, datetime) else completed_at,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "elapsed_seconds": resolved_elapsed,
+        "metadata": dict(metadata or {}),
+        "source": source,
+    }
+
+
+@router.get("/compute-tasks")
+async def compute_tasks(include_recent: bool = True, limit: int = 60):
+    """One progress protocol for every material calculation in this process.
+
+    Exact totals are exposed only when the worker knows them.  Continuous
+    research, panel collection and other open-ended phases remain explicitly
+    indeterminate and rely on phase/heartbeat/elapsed-time observability.
+    """
+    limit = max(10, min(200, int(limit)))
+    jobs: dict[str, dict] = {
+        row["job_id"]: {**row, "source": "runtime_registry"}
+        for row in COMPUTE_PROGRESS.snapshot(include_recent=include_recent, limit=limit)
+    }
+    manager = EngineManager.get()
+    worker_rows = manager.all_status(include_logs=False)
+    experiment_ids = {int(row["experiment_id"]) for row in worker_rows if row.get("experiment_id")}
+    async with SessionLocal() as session:
+        names = {
+            row.id: row.name
+            for row in (await session.scalars(
+                select(Experiment).where(Experiment.id.in_(experiment_ids))
+            )).all()
+        } if experiment_ids else {}
+        combinations = list((await session.scalars(
+            select(CombinationExperiment)
+            .order_by(CombinationExperiment.id.desc())
+            .limit(30)
+        )).all())
+        backtests = list((await session.scalars(
+            select(Backtest).order_by(Backtest.id.desc()).limit(30)
+        )).all())
+
+    for runtime in worker_rows:
+        experiment_id = int(runtime.get("experiment_id") or 0)
+        state = "running" if runtime.get("running") else str(runtime.get("state") or "stopped")
+        if state == "error":
+            state = "failed"
+        completed = runtime.get("candidate_evaluations", runtime.get("inner_evals"))
+        total = runtime.get("candidate_evaluation_budget")
+        if not total:
+            total = (runtime.get("task_config") or {}).get("candidate_evaluation_budget")
+        if not total or float(total) <= 0:
+            total = None
+        job = _compute_job(
+            job_id=f"research:{experiment_id}",
+            kind="research",
+            title=f"因子研究 · {names.get(experiment_id, f'任务#{experiment_id}')}",
+            state=state,
+            phase=str(runtime.get("phase") or "not_started"),
+            message=str(runtime.get("current_operation") or runtime.get("current_task") or ""),
+            completed=completed,
+            total=total,
+            cancellable=True,
+            experiment_id=experiment_id,
+            error=str(runtime.get("last_error") or runtime.get("task_exception") or ""),
+            started_at=runtime.get("started_at"),
+            updated_at=runtime.get("last_progress_at") or runtime.get("last_heartbeat_at"),
+            heartbeat_age_seconds=runtime.get("heartbeat_age_seconds"),
+            elapsed_seconds=runtime.get("uptime_seconds"),
+            metadata={
+                "market": (runtime.get("task_config") or {}).get("market"),
+                "continuous": total is None,
+                "heartbeat_stale": bool(runtime.get("heartbeat_stale")),
+                "outer_step": runtime.get("outer_step"),
+                "llm_calls": runtime.get("llm_calls"),
+                "factor_count": runtime.get("factor_count"),
+                "formal_factor_count": runtime.get("formal_factor_count"),
+                "research_candidate_count": runtime.get(
+                    "research_candidate_count"
+                ),
+                "hidden_novelty_resamples": runtime.get(
+                    "session_hidden_novelty_resamples"
+                ),
+                "hidden_resample_waste_rate": runtime.get(
+                    "hidden_resample_waste_rate"
+                ),
+                "effective_evaluations_per_hour": runtime.get(
+                    "effective_evaluations_per_hour"
+                ),
+                "duplicate_waste_rate": runtime.get("duplicate_waste_rate"),
+                "recent_unique_yield_rate": runtime.get(
+                    "recent_unique_yield_rate"
+                ),
+                "search_space_exhausted": bool(
+                    runtime.get("search_space_exhausted")
+                ),
+            },
+        )
+        jobs[job["job_id"]] = job
+
+    for row in combinations:
+        state_map = {"error": "failed", "draft": "stopped"}
+        state = state_map.get(row.status, row.status)
+        if not include_recent and state not in ACTIVE_STATES:
+            continue
+        runtime = CombinationLabManager.get().snapshot(row.id) or dict(row.progress or {})
+        job = _compute_job(
+            job_id=f"combination:{row.id}",
+            kind="combination",
+            title=f"组合优化 · {row.name}",
+            state=state,
+            phase=str(runtime.get("stage") or state),
+            message=str(runtime.get("message") or ""),
+            completed=runtime.get("completed"),
+            total=runtime.get("total"),
+            cancellable=True,
+            experiment_id=row.experiment_id,
+            error=row.error,
+            started_at=row.started_at or row.created_at,
+            updated_at=runtime.get("updated_at") or row.completed_at or row.created_at,
+            completed_at=row.completed_at,
+            elapsed_seconds=(row.result or {}).get("elapsed_seconds"),
+            metadata={"market": row.market, "search_mode": row.search_mode},
+        )
+        jobs[job["job_id"]] = job
+
+    for row in backtests:
+        job_id = f"backtest:{row.id}"
+        if job_id in jobs:
+            continue
+        state = "failed" if row.status == "failed" else row.status
+        if not include_recent and state not in ACTIVE_STATES:
+            continue
+        job = _compute_job(
+            job_id=job_id,
+            kind="backtest",
+            title=f"事件回测 #{row.id}",
+            state=state,
+            phase="event_backtest" if state in ACTIVE_STATES else state,
+            message=f"{(row.params or {}).get('market', '—')} · {(row.params or {}).get('start', '—')} 至 {(row.params or {}).get('end', '—')}",
+            experiment_id=row.experiment_id,
+            error=row.error,
+            started_at=row.created_at,
+            updated_at=row.created_at,
+            metadata={"market": (row.params or {}).get("market")},
+        )
+        jobs[job_id] = job
+
+    try:
+        alpha = await asyncio.to_thread(alpha158_progress)
+    except (OSError, ValueError, json.JSONDecodeError):
+        alpha = {"state": "not_started"}
+    if alpha.get("state") != "not_started":
+        state = "done" if alpha.get("state") == "complete" else str(alpha.get("state") or "running")
+        if include_recent or state in ACTIVE_STATES:
+            job = _compute_job(
+                job_id="qlib-alpha158:benchmark",
+                kind="qlib_alpha158",
+                title="Qlib Alpha158 双市场基准",
+                state=state,
+                phase=str(alpha.get("current") or alpha.get("phase") or state),
+                message=f"{alpha.get('market', '—')} · {alpha.get('portfolio_mode', '—')}",
+                completed=alpha.get("completed"),
+                total=alpha.get("total"),
+                started_at=alpha.get("started_at"),
+                updated_at=alpha.get("updated_at"),
+                error=alpha.get("error", ""),
+                metadata={"artifact_path": alpha.get("artifact_path")},
+            )
+            jobs[job["job_id"]] = job
+
+    panel_registry = await asyncio.to_thread(PanelStore.registry_snapshot)
+    for panel in panel_registry.get("panels", []):
+        state = str(panel.get("state") or "cold")
+        if state not in {"loading", "reloading", "error"}:
+            continue
+        job = _compute_job(
+            job_id=f"panel:{panel.get('id')}",
+            kind="panel",
+            title=f"数据面板 · {panel.get('market', '—')}",
+            state="failed" if state == "error" else "running",
+            phase=state,
+            message="面板热重载" if state == "reloading" else "加载研究面板",
+            error=panel.get("load_error") or panel.get("reload_error") or "",
+            started_at=panel.get("reload_started_at") or panel.get("load_started_at"),
+            updated_at=panel.get("reloaded_at") or panel.get("loaded_at"),
+            metadata={"generation": panel.get("generation")},
+        )
+        jobs[job["job_id"]] = job
+
+    ordered = sorted(
+        jobs.values(),
+        key=lambda row: (
+            0 if row.get("state") in ACTIVE_STATES else 1,
+            -(datetime.fromisoformat(str(row.get("updated_at") or row.get("started_at") or "1970-01-01").replace("Z", "+00:00")).timestamp()),
+        ),
+    )[:limit]
+    active_count = sum(row.get("state") in ACTIVE_STATES for row in ordered)
+    failed_count = sum(row.get("state") == "failed" for row in ordered)
+    return {
+        "schema": "factorfactory.compute-progress/v1",
+        "observed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "active_count": active_count,
+        "failed_count": failed_count,
+        "total": len(ordered),
+        "tasks": ordered,
+        "semantics": {
+            "determinate": "completed/total 仅在总量真实可知时提供",
+            "indeterminate": "持续任务或不可预估阶段只展示阶段、心跳和耗时",
+        },
+    }
+
+
+@router.post("/compute-tasks/{job_id:path}/cancel")
+async def cancel_compute_task(job_id: str):
+    if job_id.startswith("research:"):
+        experiment_id = int(job_id.split(":", 1)[1])
+        return await EngineManager.get().stop(experiment_id)
+    if job_id.startswith("combination:"):
+        combination_id = int(job_id.split(":", 1)[1])
+        return await CombinationLabManager.get().stop(combination_id)
+    raise HTTPException(409, "该计算阶段不支持安全取消")
 
 
 @router.post("/service/llm-probe")
@@ -1084,7 +1421,23 @@ async def _ranked_research_records(experiment_id: int) -> list[dict]:
                 )
             )
         ).all()
-    factor_by_node = {int(row.node_id): row.id for row in factors if row.node_id is not None}
+    factor_by_node = {
+        int(row.node_id): row.id for row in factors if row.node_id is not None
+    }
+    formal_by_node = {}
+    for row in factors:
+        if row.node_id is None:
+            continue
+        market = str((row.research_meta or {}).get("market") or "us")
+        evidence = factor_evidence_state(
+            row,
+            current_code_review=deterministic_code_review(
+                row.expression, market
+            ),
+            current_rating_protocol=FROZEN_RATING_PROTOCOL_VERSION,
+        )
+        if evidence["formal_factor"]:
+            formal_by_node[int(row.node_id)] = row.id
     grouped: dict[str, list[Node]] = {}
     for node in nodes:
         grouped.setdefault(node.task_name or "unknown", []).append(node)
@@ -1103,7 +1456,8 @@ async def _ranked_research_records(experiment_id: int) -> list[dict]:
                 research_record_payload(
                     node,
                     task_rank=rank,
-                    formal_factor_id=factor_by_node.get(int(node.id)),
+                    formal_factor_id=formal_by_node.get(int(node.id)),
+                    research_factor_id=factor_by_node.get(int(node.id)),
                 )
             )
     records.sort(
@@ -1653,6 +2007,7 @@ async def set_factor_status(fid: int, req: FactorStatusReq):
         "research-pass",
         "oos-pass",
         "live-candidate",
+        "research-candidate",
     }
     if req.status not in allowed:
         raise HTTPException(400, f"status 必须是 {allowed}")
@@ -1660,6 +2015,21 @@ async def set_factor_status(fid: int, req: FactorStatusReq):
         f = await s.get(Factor, fid)
         if not f:
             raise HTTPException(404)
+        if req.status in {"library-admitted", "live-candidate"}:
+            market = str((f.research_meta or {}).get("market") or "us")
+            evidence = factor_evidence_state(
+                f,
+                current_code_review=deterministic_code_review(
+                    f.expression, market
+                ),
+                current_rating_protocol=FROZEN_RATING_PROTOCOL_VERSION,
+            )
+            if not evidence["formal_factor"]:
+                raise HTTPException(
+                    409,
+                    "该记录仍是研究候选，未通过 HOLDOUT/Vault/冻结评级/"
+                    "双盲审查全部门槛，不能标记为正式或实盘候选",
+                )
         f.status = req.status
         await s.commit()
     _invalidate_observability_components()
@@ -1895,8 +2265,18 @@ class ExitPolicyReq(BaseModel):
     intrabar_conflict_policy: str = "conservative"
 
 
-class BacktestReq(BaseModel):
+class BacktestFactorReq(BaseModel):
+    name: str = ""
     expression: str
+    weight: float = Field(default=1.0, gt=0)
+    direction: int = 1
+
+
+class BacktestReq(BaseModel):
+    expression: str = ""
+    factors: list[BacktestFactorReq] = Field(default_factory=list)
+    combination_method: str = "independent_capital_sleeves"
+    execution_backend: str | None = None
     experiment_id: int | None = None
     universe_n: int = 500
     start: str = "2015-01-01"
@@ -1934,6 +2314,10 @@ class BacktestReq(BaseModel):
     portfolio_stop_drawdown_pct: float | None = None
     portfolio_daily_loss_pct: float | None = None
     risk_cooldown_sessions: int = 0
+    monte_carlo_enabled: bool = True
+    monte_carlo_simulations: int = Field(default=2000, ge=100, le=20000)
+    monte_carlo_block_size_sessions: int = Field(default=20, ge=1, le=252)
+    monte_carlo_seed: int = 20260824
     exit_policy: ExitPolicyReq = Field(default_factory=ExitPolicyReq)
 
 
@@ -1958,6 +2342,41 @@ async def backtest_capabilities():
             "portfolio_daily_loss_exit",
         ],
         "position_sizing": ["equal_weight", "inverse_volatility", "atr_risk"],
+        "multi_factor": {
+            "max_factors": 12,
+            "combination_methods": ["independent_capital_sleeves"],
+            "weight_semantics": "positive_starting_capital_allocation_normalized_to_one",
+            "per_factor_direction": [-1, 1],
+            "attribution": "exact_daily_nlv_pnl_and_cost_by_factor_sleeve",
+            "cross_factor_order_netting": False,
+        },
+        "diagnostics": {
+            "time_slice_stability": {
+                "annual": True,
+                "rolling_months": [12, 24],
+                "metrics": ["total_return", "cagr", "sharpe", "max_drawdown", "turnover"],
+                "sleeve_regime_reversal": True,
+            },
+            "information_coefficient": {
+                "label": "t_close_to_t_plus_1_open_through_t_plus_1_plus_h_open",
+                "metrics": ["ic_mean", "icir", "rank_ic_mean", "rank_icir"],
+                "non_overlapping_rebalance_dates": True,
+            },
+            "monte_carlo": {
+                "method": "circular_moving_block_bootstrap",
+                "simulation_range": [100, 20000],
+                "joint_sleeve_sampling": True,
+            },
+            "factor_performance_correlation": {
+                "metrics": [
+                    "daily_net_return_correlation",
+                    "monthly_net_return_correlation",
+                    "rolling_12m_return_correlation",
+                    "rank_ic_path_correlation",
+                ],
+                "source": "independent_fee_after_sleeve_ledgers",
+            },
+        },
         "impact_models": ["fixed", "linear", "square_root"],
         "account_types": ["auto", "cash", "margin"],
         "order_policies": ["cancel", "carry"],
@@ -1977,6 +2396,7 @@ async def backtest_capabilities():
             "ashare": ["board_lot_buy", "t_plus_1_sell", "open_limit_proxy"],
             "us": ["cash_or_margin", "short_borrow_cost"],
         },
+        "rust_kernel": rust_kernel_capabilities(),
     }
 
 
@@ -1986,9 +2406,24 @@ async def backtest(req: BacktestReq):
     market = cfg.get("market", "us")
     if req.direction not in {-1, 1}:
         raise HTTPException(400, "direction 必须为 1 或 -1")
-    err = validate(req.expression, get_dsl_fields(market))
-    if err:
-        raise HTTPException(400, f"表达式非法: {err}")
+    if req.combination_method != "independent_capital_sleeves":
+        raise HTTPException(400, "combination_method 仅支持 independent_capital_sleeves")
+    if len(req.factors) > 12:
+        raise HTTPException(400, "多因子回测最多支持 12 个因子")
+    factor_payload = [item.model_dump() for item in req.factors]
+    if factor_payload:
+        for index, factor in enumerate(factor_payload, start=1):
+            if factor["direction"] not in {-1, 1}:
+                raise HTTPException(400, f"第 {index} 个因子方向必须为 1 或 -1")
+            err = validate(factor["expression"], get_dsl_fields(market))
+            if err:
+                raise HTTPException(400, f"第 {index} 个因子表达式非法: {err}")
+    else:
+        if not req.expression.strip():
+            raise HTTPException(400, "至少需要一个因子表达式")
+        err = validate(req.expression, get_dsl_fields(market))
+        if err:
+            raise HTTPException(400, f"表达式非法: {err}")
     panel_glob = req.panel_glob or cfg.get("panel_glob")
     resolved_eval = evaluation_config(market, cfg.get("evaluation_config"))
     try:
@@ -2003,12 +2438,16 @@ async def backtest(req: BacktestReq):
         raise HTTPException(400, str(exc)) from exc
     params = {
         **req.model_dump(),
+        "expression": req.expression or (factor_payload[0]["expression"] if factor_payload else ""),
         "requested_mode": req.mode,
         "mode": mode,
         "market": market,
         "panel_glob": panel_glob,
         "borrow_cost_bps_annual": borrow_cost,
-        "protocol": "step_event_v2",
+        "protocol": (
+            "step_event_v2_weighted_sleeves_v1"
+            if factor_payload else "step_event_v2"
+        ),
     }
     async with SessionLocal() as s:
         record = Backtest(
@@ -2022,20 +2461,42 @@ async def backtest(req: BacktestReq):
         await s.refresh(record)
         run_id = record.id
     artifact_dir = BACKTEST_ARTIFACT_ROOT / f"{run_id:08d}"
+    progress_job_id = f"backtest:{run_id}"
+    COMPUTE_PROGRESS.start(
+        progress_job_id,
+        kind="backtest",
+        title=f"事件回测 #{run_id}",
+        phase="queued",
+        message=f"{market} · {req.start} 至 {req.end}",
+        experiment_id=eid,
+        metadata={
+            "backtest_id": run_id,
+            "market": market,
+            "mode": mode,
+            "factor_count": len(factor_payload) or 1,
+        },
+    )
+
+    def backtest_progress(payload: dict) -> None:
+        COMPUTE_PROGRESS.update(
+            progress_job_id,
+            phase=payload.get("phase"),
+            message=payload.get("message"),
+            completed=payload.get("completed"),
+            total=payload.get("total"),
+        )
+
     try:
-        result = await asyncio.to_thread(
-            run_backtest,
-            req.expression,
-            req.universe_n,
-            req.start,
-            req.end,
-            req.cost_bps,
-            req.direction,
-            mode,
-            panel_glob,
-            market,
-            borrow_cost,
-            req.top_fraction,
+        common_backtest_kwargs = dict(
+            universe_n=req.universe_n,
+            start=req.start,
+            end=req.end,
+            cost_bps=req.cost_bps,
+            mode=mode,
+            panel_glob=panel_glob,
+            market=market,
+            borrow_cost_bps_annual=borrow_cost,
+            top_fraction=req.top_fraction,
             initial_capital=req.initial_capital,
             rebalance_every=req.rebalance_every,
             slippage_bps=req.slippage_bps,
@@ -2063,10 +2524,35 @@ async def backtest(req: BacktestReq):
             portfolio_stop_drawdown_pct=req.portfolio_stop_drawdown_pct,
             portfolio_daily_loss_pct=req.portfolio_daily_loss_pct,
             risk_cooldown_sessions=req.risk_cooldown_sessions,
+            monte_carlo_enabled=req.monte_carlo_enabled,
+            monte_carlo_simulations=req.monte_carlo_simulations,
+            monte_carlo_block_size_sessions=req.monte_carlo_block_size_sessions,
+            monte_carlo_seed=req.monte_carlo_seed,
             exit_policy=req.exit_policy.model_dump(),
+            execution_backend=req.execution_backend,
             artifact_dir=artifact_dir,
+            progress_callback=backtest_progress,
         )
+        if factor_payload:
+            result = await asyncio.to_thread(
+                run_multi_factor_backtest,
+                factor_payload,
+                **common_backtest_kwargs,
+            )
+        else:
+            result = await asyncio.to_thread(
+                run_backtest,
+                req.expression,
+                direction=req.direction,
+                **common_backtest_kwargs,
+            )
     except Exception as exc:  # noqa: BLE001 - persist failed runs as audit evidence
+        COMPUTE_PROGRESS.finish(
+            progress_job_id,
+            state="failed",
+            message="事件回测失败",
+            error=str(exc),
+        )
         async with SessionLocal() as s:
             failed = await s.get(Backtest, run_id)
             failed.status = "failed"
@@ -2087,8 +2573,18 @@ async def backtest(req: BacktestReq):
             "integrity",
             "positions",
             "round_trips",
+            "attribution_method",
+            "attribution_disclosure",
+            "factor_attribution",
+            "factor_attribution_curve",
+            "stability_analysis",
+            "signal_diagnostics",
+            "monte_carlo",
+            "factor_performance_correlation",
+            "execution",
             "artifacts",
         )
+        if key in result
     }
     async with SessionLocal() as s:
         completed = await s.get(Backtest, run_id)
@@ -2102,10 +2598,20 @@ async def backtest(req: BacktestReq):
         )
         await s.commit()
     if not integrity_passed:
+        COMPUTE_PROGRESS.finish(
+            progress_job_id,
+            state="failed",
+            message="交割单完整性检查失败",
+            error=completed.error,
+        )
         raise HTTPException(
             500,
             "交割单完整性检查失败；失败账本已保留，请检查历史回测详情",
         )
+    COMPUTE_PROGRESS.finish(
+        progress_job_id,
+        message="事件回测、交割单与完整性检查完成",
+    )
     return {"id": run_id, **result}
 
 
@@ -2278,6 +2784,18 @@ async def download_backtest_round_trips(backtest_id: int):
     )
 
 
+@router.get("/backtests/{backtest_id}/factor-attribution.csv")
+async def download_backtest_factor_attribution(backtest_id: int):
+    path = _artifact_path(backtest_id, "factor_attribution.csv")
+    if not path.exists():
+        raise HTTPException(404, "该历史回测没有多因子贡献归因产物")
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=f"backtest-{backtest_id:08d}-factor-attribution.csv",
+    )
+
+
 # ---------- 榜单版本目录 ----------
 
 @router.get("/leaderboards")
@@ -2385,6 +2903,12 @@ class BlindReviewSealRequest(BaseModel):
     code_review: dict
 
 
+class QlibJointRunRequest(BaseModel):
+    experiment_id: int = Field(ge=1)
+    task_name: str = Field(min_length=1, max_length=64)
+    max_rows: int | None = Field(default=None, ge=5_000, le=5_000_000)
+
+
 @router.get("/research-intelligence/mechanisms")
 async def research_mechanisms(market: str | None = None):
     try:
@@ -2430,8 +2954,18 @@ async def research_document_to_dsl(req: DocumentToDslRequest):
 
 @router.post("/research-intelligence/residual-beam")
 async def research_residual_beam(req: ResidualBeamRequest):
+    job_id = f"residual-beam:{uuid.uuid4().hex[:12]}"
+    COMPUTE_PROGRESS.start(
+        job_id,
+        kind="residual_beam",
+        title="Residual OOF Beam 搜索",
+        phase="walk_forward_oof",
+        message=f"{len(req.candidates)} 个候选 · beam {req.beam_width}",
+        completed=0,
+        total=len(req.candidates),
+    )
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             residual_oof_beam_search,
             target=req.target,
             incumbent_predictions=req.incumbent_predictions,
@@ -2442,7 +2976,13 @@ async def research_residual_beam(req: ResidualBeamRequest):
             complexity=req.complexity,
         )
     except (ValueError, ArithmeticError) as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="残差搜索失败", error=str(exc))
         raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="残差搜索失败", error=str(exc))
+        raise
+    COMPUTE_PROGRESS.finish(job_id, message="残差搜索完成")
+    return result
 
 
 @router.post("/research-intelligence/overfit-diagnostics")
@@ -2450,10 +2990,22 @@ async def research_overfit_diagnostics(req: OverfitDiagnosticsRequest):
     matrix = req.period_return_matrix
     if not matrix or any(len(row) != len(matrix[0]) for row in matrix):
         raise HTTPException(400, "period_return_matrix 必须为非空矩形")
-    effective = await asyncio.to_thread(effective_trial_count, matrix)
+    job_id = f"overfit-diagnostics:{uuid.uuid4().hex[:12]}"
+    COMPUTE_PROGRESS.start(
+        job_id,
+        kind="diagnostics",
+        title="过拟合诊断 · DSR/PBO",
+        phase="effective_trials",
+        message=f"{len(matrix[0])} 次试验 · {len(matrix)} 个时期",
+    )
+    try:
+        effective = await asyncio.to_thread(effective_trial_count, matrix)
+    except Exception as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="过拟合诊断失败", error=str(exc))
+        raise
     values = [value for row in matrix for value in row]
     score_std = st.pstdev(values) if len(values) > 1 else 0.0
-    return {
+    result = {
         "scope": "caller_supplied_non_frozen_period_returns",
         "actual_trials": len(matrix[0]),
         "effective_trials": effective,
@@ -2477,6 +3029,8 @@ async def research_overfit_diagnostics(req: OverfitDiagnosticsRequest):
             score_std=score_std,
         ),
     }
+    COMPUTE_PROGRESS.finish(job_id, message="DSR/PBO 诊断完成")
+    return result
 
 
 @router.get("/research-intelligence/trial-ledger")
@@ -2505,17 +3059,46 @@ async def research_trial_ledger(experiment_id: int):
         )
     method_counts: dict[str, int] = {}
     mechanism_counts: dict[str, int] = {}
+    evaluated_trials = []
     for trial in trials:
         method = trial.search_method or "legacy_unrecorded"
         mechanism = trial.mechanism or "legacy_unrecorded"
         method_counts[method] = method_counts.get(method, 0) + 1
         mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+        statistic = dict(trial.statistic or {})
+        if statistic.get("evaluation_performed", True) is not False:
+            evaluated_trials.append(trial)
+    research_config = dict(experiment.research_config or {})
+    predeclared_trials = int(
+        (research_config.get("evaluation_config") or {}).get(
+            "multiple_testing_trials", 1000
+        )
+        or 1000
+    )
     by_task: dict[str, dict] = {}
     for task_name in sorted({node.task_name for node in nodes}):
         task_nodes = [node for node in nodes if node.task_name == task_name]
+        # Correlation/PBO/source clustering are quadratic in candidate count.
+        # Preserve full trial counts but use a deterministic quality+recency
+        # diagnostic sample so the API remains bounded for 7x24 campaigns.
+        diagnostic_limit = 300
+        quality_nodes = sorted(
+            task_nodes,
+            key=lambda node: (float(node.public_score or 0.0), node.id),
+            reverse=True,
+        )[: diagnostic_limit // 2]
+        recent_nodes = sorted(task_nodes, key=lambda node: node.id, reverse=True)[
+            : diagnostic_limit // 2
+        ]
+        diagnostic_nodes = []
+        diagnostic_ids = set()
+        for node in [*quality_nodes, *recent_nodes]:
+            if node.id not in diagnostic_ids:
+                diagnostic_ids.add(node.id)
+                diagnostic_nodes.append(node)
         vectors = []
         valid_nodes = []
-        for node in task_nodes:
+        for node in diagnostic_nodes:
             signature = (node.public_metrics or {}).get("training_return_path_signature") or {}
             vector = list(signature.get("vector") or [])
             if vector:
@@ -2523,17 +3106,152 @@ async def research_trial_ledger(experiment_id: int):
                 valid_nodes.append(node)
         same_length = len({len(row) for row in vectors}) == 1 if vectors else False
         matrix = list(map(list, zip(*vectors))) if same_length else []
-        effective = effective_trial_count(matrix) if matrix else float(len(task_nodes) or 1)
+        effective_sample = effective_trial_count(matrix) if matrix else float(len(diagnostic_nodes) or 1)
+        effective = min(
+            float(len(task_nodes) or 1),
+            effective_sample * len(task_nodes) / max(1, len(diagnostic_nodes)),
+        )
         pbo = cscv_pbo(matrix) if matrix else {"available": False, "reason": "no_comparable_training_signatures"}
         best = max(valid_nodes or task_nodes, key=lambda node: float(node.public_score or 0.0), default=None)
         branch = dict((best.public_metrics or {}).get("active") or (best.public_metrics or {}).get("net") or {}) if best else {}
         sharpe = float(branch.get("sharpe") or 0.0)
         observations = int((best.public_metrics or {}).get("n_days") or 2) if best else 2
+        task_trials = [trial for trial in trials if trial.task_name == task_name]
+        task_evaluated = [
+            trial for trial in task_trials
+            if (trial.statistic or {}).get("evaluation_performed", True) is not False
+        ]
+        direction_invariant_hashes = set()
+        for trial in task_evaluated:
+            try:
+                direction_invariant_hashes.add(
+                    normalize_hash(trial.expression, direction_invariant=True)
+                )
+            except (SyntaxError, TypeError, ValueError):
+                direction_invariant_hashes.add(
+                    f"invalid:{trial.expression_hash or trial.id}"
+                )
+        source_snapshot = cluster_training_return_sources(
+            [
+                {
+                    "id": node.id,
+                    "task_name": node.task_name,
+                    "market": research_config.get("market"),
+                    "portfolio_mode": research_config.get("portfolio_mode"),
+                    "public_score": node.public_score,
+                    "public_metrics": node.public_metrics or {},
+                    "mechanism_family": (
+                        (node.proposal_meta or {}).get("target_family") or "other"
+                    ),
+                }
+                for node in diagnostic_nodes
+            ],
+            correlation_threshold=float(
+                (research_config.get("return_source_governance") or {}).get(
+                    "correlation_threshold", 0.85
+                )
+            ),
+        )
+        signal_rows = []
+        for node in sorted(
+            diagnostic_nodes,
+            key=lambda value: float(value.public_score or 0.0),
+            reverse=True,
+        ):
+            signature = (node.public_metrics or {}).get(
+                "training_signal_rank_signature"
+            ) or {}
+            vector = list(signature.get("vector") or [])
+            if signature.get("available") and len(vector) >= 8:
+                signal_rows.append((node.id, vector))
+        signal_clusters = []
+        if signal_rows and len({len(vector) for _, vector in signal_rows}) == 1:
+            import numpy as np
+
+            for node_id, vector in signal_rows:
+                values = np.asarray(vector, dtype=float)
+                assigned = False
+                for cluster in signal_clusters:
+                    corr = float(np.corrcoef(values, cluster["vector"])[0, 1])
+                    if math.isfinite(corr) and abs(corr) >= 0.95:
+                        cluster["members"].append(node_id)
+                        assigned = True
+                        break
+                if not assigned:
+                    signal_clusters.append({
+                        "representative_node_id": node_id,
+                        "members": [node_id],
+                        "vector": values,
+                    })
+        algorithm_efficiency = {}
+        for trial in task_evaluated:
+            method = trial.search_method or "legacy_unrecorded"
+            row = algorithm_efficiency.setdefault(method, {
+                "evaluations": 0,
+                "selected": 0,
+                "runtime_seconds": 0.0,
+            })
+            row["evaluations"] += 1
+            row["selected"] += int(bool(trial.selected))
+            runtime = ((trial.statistic or {}).get("evaluation_runtime") or {})
+            row["runtime_seconds"] += float(runtime.get("total_ms") or 0.0) / 1000.0
+        for row in algorithm_efficiency.values():
+            row["selected_per_100"] = round(
+                100.0 * row["selected"] / max(1, row["evaluations"]), 6
+            )
+            row["selected_per_cpu_hour"] = round(
+                3600.0 * row["selected"] / max(1.0, row["runtime_seconds"]), 6
+            )
+            row["runtime_seconds"] = round(row["runtime_seconds"], 3)
+        dynamic_trials = max(
+            predeclared_trials,
+            len(task_evaluated),
+            int(math.ceil(effective)),
+        )
         by_task[task_name] = {
-            "actual_trials": len(task_nodes),
+            "actual_trials": len(task_trials),
+            "evaluated_trials": len(task_evaluated),
+            "pre_evaluation_rejections": len(task_trials) - len(task_evaluated),
+            "unique_direction_invariant_ast": len(direction_invariant_hashes),
+            "ast_redundancy_rate": round(
+                1.0 - len(direction_invariant_hashes) / max(1, len(task_evaluated)),
+                6,
+            ),
             "comparable_return_paths": len(vectors) if same_length else 0,
             "return_path_scope": "compressed_public_plus_meta_train_not_frozen_rating",
             "effective_trials": effective,
+            "diagnostic_sampling": {
+                "method": "top_quality_plus_recent_deterministic",
+                "total_nodes": len(task_nodes),
+                "sampled_nodes": len(diagnostic_nodes),
+                "sample_effective_trials": effective_sample,
+                "effective_trial_extrapolation": "sample_effective * total/sample, capped_at_total",
+            },
+            "multiple_testing_trials": {
+                "predeclared": predeclared_trials,
+                "actual_evaluated": len(task_evaluated),
+                "effective_correlated": effective,
+                "dynamic_gate_trials": dynamic_trials,
+                "policy": "max(predeclared, actual_evaluated, ceil(effective))",
+            },
+            "return_source_governance": source_snapshot,
+            "signal_rank_deduplication": {
+                "protocol": "factorfactory.signal-rank-sketch/v1",
+                "available_signatures": len(signal_rows),
+                "clusters": len(signal_clusters),
+                "absolute_correlation_threshold": 0.95,
+                "redundancy_rate": round(
+                    1.0 - len(signal_clusters) / max(1, len(signal_rows)), 6
+                ),
+                "representatives": [
+                    {
+                        "node_id": row["representative_node_id"],
+                        "members": row["members"],
+                    }
+                    for row in signal_clusters
+                ],
+            },
+            "algorithm_efficiency": algorithm_efficiency,
             "best_node_id": best.id if best else None,
             "best_training_sharpe": sharpe,
             "dsr": deflated_sharpe_ratio(
@@ -2547,6 +3265,8 @@ async def research_trial_ledger(experiment_id: int):
         "schema": "factorfactory.actual-trial-ledger/v1",
         "experiment_id": experiment_id,
         "append_only_trials": len(trials),
+        "evaluated_trials": len(evaluated_trials),
+        "predeclared_trials": predeclared_trials,
         "selected_trials": sum(bool(trial.selected) for trial in trials),
         "search_method_counts": method_counts,
         "mechanism_family_counts": mechanism_counts,
@@ -2672,7 +3392,14 @@ async def research_architectures():
         "schema": RESEARCH_ARCHITECTURE_SCHEMA,
         "templates": architecture_catalog(),
         "customization": {
-            "search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+            "search_algorithms": list(SUPPORTED_SEARCH_ALGORITHMS),
+            "recommended_search_algorithms": list(DEFAULT_SEARCH_ALGORITHMS),
+            "search_policy": {
+                "schema": SEARCH_POLICY_SCHEMA,
+                "scheduler": "quota_deficit_plus_ucb1",
+                "group_weights": SEARCH_GROUP_WEIGHTS,
+                "algorithm_groups": ALGORITHM_GROUPS,
+            },
             "memory_modes": ["adaptive", "cold"],
             "rules": [
                 "layer3_requires_layer2",
@@ -2909,6 +3636,7 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
                 "layer2_enabled",
                 "layer3_enabled",
                 "search_algorithms",
+                "qlib_integration",
             }
             if any(previous_config.get(key) != merged.get(key) for key in material_keys):
                 factors = (
@@ -2973,6 +3701,210 @@ async def activate_experiment(eid: int):
             "research_config": e.research_config or {},
         },
     }
+
+
+# ---------- Qlib 原生研究适配 ----------
+
+
+@router.get("/qlib/capabilities")
+async def qlib_capabilities():
+    return await asyncio.to_thread(qlib_native_capabilities)
+
+
+@router.get("/qlib/alpha158/catalog")
+async def qlib_alpha158_catalog(market: str | None = None):
+    try:
+        return alpha158_catalog(market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/qlib/alpha158/progress")
+async def qlib_alpha158_progress():
+    return await asyncio.to_thread(alpha158_progress)
+
+
+@router.get("/qlib/alpha158/results")
+async def qlib_alpha158_results(market: str):
+    try:
+        reports = await asyncio.to_thread(latest_alpha158_reports, market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "schema": "factorfactory.qlib-alpha158-results/v1",
+        "market": market,
+        "available": bool(reports),
+        "reports": reports,
+    }
+
+
+@router.get("/qlib/alpha158/report")
+async def qlib_alpha158_report(market: str, portfolio_mode: str):
+    if portfolio_mode not in {"long_only", "long_short"}:
+        raise HTTPException(400, "portfolio_mode 必须是 long_only 或 long_short")
+    try:
+        reports = await asyncio.to_thread(latest_alpha158_reports, market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    selected = next(
+        (row for row in reports if row.get("portfolio_mode") == portfolio_mode),
+        None,
+    )
+    if selected is None:
+        raise HTTPException(404, "尚无该市场与模式的 Alpha158 报告")
+    summary_path = Path(selected["artifact_path"])
+    report_path = summary_path.with_name(
+        summary_path.name.replace("-summary.json", "-report.html")
+    )
+    if not report_path.exists():
+        raise HTTPException(404, "报告文件不存在")
+    return FileResponse(report_path, media_type="text/html")
+
+
+@router.get("/qlib/joint/status")
+async def qlib_joint_status(experiment_id: int, task_name: str):
+    async with SessionLocal() as session:
+        experiment = await session.get(Experiment, experiment_id)
+        if experiment is None:
+            raise HTTPException(404, "研究任务不存在")
+    config = dict(experiment.research_config or {})
+    tasks = list((config.get("engine_config") or {}).get("tasks") or DEFAULT_ENGINE_CONFIG_V2["tasks"])
+    task = next((row for row in tasks if str(row.get("name")) == task_name), None)
+    if task is None:
+        raise HTTPException(404, "研究子任务不存在")
+    key = (
+        f"exp-{experiment_id}-{task_name}-{config.get('market', 'us')}-"
+        f"u{int(task.get('universe_n') or 500)}-h{int(task.get('horizon') or 5)}"
+    )
+    return latest_joint_result(key) or {
+        "schema": "factorfactory.qlib-joint-residual-distill/v1",
+        "state": "not_started",
+        "task_key": key,
+    }
+
+
+@router.post("/qlib/joint/run")
+async def qlib_joint_run(req: QlibJointRunRequest):
+    async with SessionLocal() as session:
+        experiment = await session.get(Experiment, req.experiment_id)
+        if experiment is None:
+            raise HTTPException(404, "研究任务不存在")
+        nodes = list((await session.scalars(
+            select(Node)
+            .where(
+                Node.experiment_id == req.experiment_id,
+                Node.task_name == req.task_name,
+                Node.status == "ok",
+            )
+            .order_by(Node.public_score.desc(), Node.id.desc())
+            .limit(100)
+        )).all())
+    config = dict(experiment.research_config or {})
+    integration = dict(config.get("qlib_integration") or {})
+    if not integration.get("joint_model_enabled"):
+        raise HTTPException(400, "该研究任务未启用Qlib联合模型")
+    tasks = list((config.get("engine_config") or {}).get("tasks") or DEFAULT_ENGINE_CONFIG_V2["tasks"])
+    task = next((row for row in tasks if str(row.get("name")) == req.task_name), None)
+    if task is None:
+        raise HTTPException(404, "研究子任务不存在")
+    expressions = []
+    seen = set()
+    for node in nodes:
+        try:
+            key = normalize_hash(node.expression, direction_invariant=True)
+        except (SyntaxError, TypeError, ValueError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            expressions.append(node.expression)
+    task_key = (
+        f"exp-{req.experiment_id}-{req.task_name}-{config.get('market', 'us')}-"
+        f"u{int(task.get('universe_n') or 500)}-h{int(task.get('horizon') or 5)}"
+    )
+    progress_job_id = f"qlib-joint:{task_key}"
+    COMPUTE_PROGRESS.start(
+        progress_job_id,
+        kind="qlib_joint",
+        title=f"Qlib联合模型 · {req.task_name}",
+        phase="queued",
+        message="等待特征矩阵与严格时序 OOF 计算",
+        experiment_id=req.experiment_id,
+        metadata={"task_key": task_key, "task_name": req.task_name},
+    )
+
+    def joint_progress(payload: dict) -> None:
+        COMPUTE_PROGRESS.update(
+            progress_job_id,
+            phase=payload.get("phase"),
+            message=payload.get("message"),
+            completed=payload.get("completed"),
+            total=payload.get("total"),
+        )
+
+    try:
+        joint_task = asyncio.create_task(
+            asyncio.to_thread(
+                run_joint_alpha158,
+                JointModelSpec(
+                    market=str(config.get("market") or "us"),
+                    panel_glob=config.get("panel_glob"),
+                    universe_n=int(task.get("universe_n") or 500),
+                    horizon=int(task.get("horizon") or 5),
+                    max_rows=int(
+                        req.max_rows
+                        or integration.get("max_training_rows")
+                        or 250_000
+                    ),
+                    min_meta_dates=int(
+                        integration.get("min_meta_dates") or 60
+                    ),
+                    include_low_fidelity_vwap=bool(
+                        integration.get("include_low_fidelity_vwap", False)
+                    ),
+                ),
+                task_key=task_key,
+                incumbent_expressions=expressions[:5],
+                progress_callback=joint_progress,
+            ),
+            name=f"qlib-joint.manual.{req.experiment_id}.{req.task_name}",
+        )
+        while not joint_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(joint_task), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                COMPUTE_PROGRESS.update(
+                    progress_job_id,
+                    metadata={
+                        "worker_heartbeat": datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                    },
+                )
+        result = await joint_task
+    except (ValueError, RuntimeError) as exc:
+        COMPUTE_PROGRESS.finish(
+            progress_job_id,
+            state="failed",
+            message="Qlib联合模型失败",
+            error=str(exc),
+        )
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        COMPUTE_PROGRESS.finish(
+            progress_job_id,
+            state="failed",
+            message="Qlib联合模型失败",
+            error=str(exc),
+        )
+        raise
+    COMPUTE_PROGRESS.finish(
+        progress_job_id,
+        message="联合模型与DSL蒸馏完成",
+        metadata={"search_eligible": bool(result.get("search_eligible"))},
+    )
+    return result
 
 
 # ---------- 因子组合优化实验台 ----------
@@ -3041,12 +3973,25 @@ async def factor_tools_correlation(req: FactorCorrelationReq):
         if str(cfg.get("market") or "us") == payload["market"]
         else None
     )
+    job_id = f"factor-correlation:{uuid.uuid4().hex[:12]}"
+    COMPUTE_PROGRESS.start(
+        job_id,
+        kind="factor_correlation",
+        title="因子相关性检测",
+        phase="materialize",
+        message=f"{len(payload.get('components') or [])} 个因子 · {payload['market']}",
+        experiment_id=req.experiment_id,
+    )
     try:
-        return await asyncio.to_thread(run_factor_correlation, payload)
+        result = await asyncio.to_thread(run_factor_correlation, payload)
     except ValueError as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="相关性检测失败", error=str(exc))
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="相关性检测失败", error=str(exc))
         raise HTTPException(500, f"相关性检测失败: {exc}") from exc
+    COMPUTE_PROGRESS.finish(job_id, message="相关性矩阵与聚类完成")
+    return result
 
 
 @router.post("/factor-tools/build-expression")
@@ -3455,6 +4400,8 @@ async def screener(req: ScreenerReq):
         }]
     if not factors:
         raise HTTPException(400, "至少需要一个因子")
+    if len(factors) > 12:
+        raise HTTPException(400, "多因子选股最多支持 12 个因子")
     for factor in factors:
         if not factor.get("expression"):
             raise HTTPException(400, "因子表达式不能为空")
@@ -3468,6 +4415,10 @@ async def screener(req: ScreenerReq):
             raise HTTPException(400, "因子 direction 必须为 1 或 -1")
     factors = [
         {
+            **(
+                {"name": str(factor.get("name"))[:80]}
+                if factor.get("name") else {}
+            ),
             "expression": str(factor["expression"]),
             "weight": float(factor.get("weight", 1.0)),
             "direction": int(factor.get("direction", 1)),
@@ -3502,6 +4453,17 @@ async def screener(req: ScreenerReq):
         f"{market}:{panel_glob or 'default'}:g{panel_generation}:"
         f"{loaded_identity or 'legacy'}:{df.height}:{trading_dates[-1]}"
     )
+    job_id = f"screener:{uuid.uuid4().hex[:12]}"
+    COMPUTE_PROGRESS.start(
+        job_id,
+        kind="screener",
+        title="多因子选股",
+        phase="cross_section",
+        message=f"{market} · {target_date} · {len(factors)} 个因子",
+        completed=0,
+        total=len(factors),
+        experiment_id=experiment_id,
+    )
     try:
         screened = await asyncio.to_thread(
             screen_cross_section,
@@ -3516,7 +4478,11 @@ async def screener(req: ScreenerReq):
             direction=req.direction,
         )
     except ValueError as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="选股计算失败", error=str(exc))
         raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="选股计算失败", error=str(exc))
+        raise
 
     response = {
         "experiment_id": experiment_id,
@@ -3574,6 +4540,10 @@ async def screener(req: ScreenerReq):
         session.add(run)
         await session.commit()
         await session.refresh(run)
+    COMPUTE_PROGRESS.finish(
+        job_id,
+        message=f"选股完成：{len(screened.get('stocks') or [])} 条结果",
+    )
     return {
         **response,
         "run_id": run.id,
@@ -3640,6 +4610,15 @@ async def allocate_screener_selection(req: ScreenerAllocationReq):
         f"{row.market}:{panel_glob or 'default'}:g{panel_generation}:"
         f"{loaded_identity or 'legacy'}:{df.height}:{trading_dates[-1]}"
     )
+    job_id = f"allocation:{uuid.uuid4().hex[:12]}"
+    COMPUTE_PROGRESS.start(
+        job_id,
+        kind="allocation",
+        title=f"选股配权 · 记录#{row.id}",
+        phase="covariance",
+        message=f"{len(selected)} 只证券 · {req.method}",
+        experiment_id=experiment_id,
+    )
     try:
         allocation = await asyncio.to_thread(
             build_purchase_allocation,
@@ -3652,7 +4631,11 @@ async def allocate_screener_selection(req: ScreenerAllocationReq):
             score_tilt=req.score_tilt,
         )
     except ValueError as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="配权计算失败", error=str(exc))
         raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="配权计算失败", error=str(exc))
+        raise
 
     panel_changed = bool(
         row.panel_identity
@@ -3663,6 +4646,7 @@ async def allocate_screener_selection(req: ScreenerAllocationReq):
             "当前面板标识与选股快照生成时不同；候选清单保持冻结，"
             "风险统计按当前面板中截至原截面日的数据重新计算。"
         )
+    COMPUTE_PROGRESS.finish(job_id, message="稳健协方差与风险预算配权完成")
     return {
         "experiment_id": experiment_id,
         "run_id": row.id,

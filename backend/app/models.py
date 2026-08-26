@@ -100,7 +100,7 @@ class Factor(Base):
     name: Mapped[str] = mapped_column(String(128))
     expression: Mapped[str] = mapped_column(Text)  # 唯一性改为实验内注册时检查
     hypothesis: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(32), default="public-leading", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="research-candidate", index=True)
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"), nullable=True)
     task_name: Mapped[str] = mapped_column(String(64), default="")
     public_metrics: Mapped[dict] = mapped_column(JSON, default=dict)

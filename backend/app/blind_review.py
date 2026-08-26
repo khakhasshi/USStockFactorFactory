@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+from .config import get_dsl_fields
 from .dsl.engine import expression_profile, validate
 from .factors.semantics import audit_expression_semantics
 
@@ -53,7 +54,11 @@ def build_review_packets(*, expression: str, hypothesis: str, market: str) -> di
 
 def deterministic_code_review(expression: str, market: str) -> dict:
     semantic = audit_expression_semantics(expression, market)
-    dsl_error = validate(expression)
+    # The default DSL whitelist is intentionally the US market vocabulary.
+    # Blind review must use the task market or valid A-share-only fields such
+    # as buy_elg_amount/turnover_rate are falsely rejected after training.
+    fields = get_dsl_fields(market)
+    dsl_error = validate(expression, fields)
     try:
         profile = expression_profile(expression)
     except (SyntaxError, ValueError):
@@ -69,6 +74,8 @@ def deterministic_code_review(expression: str, market: str) -> dict:
         "semantic_errors": semantic.get("errors") or [],
         "warnings": warnings,
         "profile": profile,
+        "market": market,
+        "field_whitelist_size": len(fields),
     }
 
 

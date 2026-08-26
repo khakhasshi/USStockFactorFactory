@@ -1,0 +1,15 @@
+[package]
+name = "factorfactory-rust-backtest"
+version = "0.2.0"
+edition = "2024"
+description = "Columnar step-event backtest kernel for FactorFactory"
+
+[lib]
+name = "factorfactory_rust_backtest"
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
