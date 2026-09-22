@@ -300,25 +300,25 @@ const FactorLibrary = {
         <div><button class="btn primary" @click="runEval" :disabled="evaling">{{ evaling ? '评估中…' : '评估' }}</button></div>
       </div>
       <div v-if="evalResult" style="margin-top:10px">
-        <table><tr><th></th><th>IC均值</th><th>ICIR</th><th>期一致性</th><th>换手</th><th>综合分</th></tr>
+        <table><tr><th></th><th>RankIC均值</th><th>RankICIR</th><th>期一致性</th><th>换手</th><th>综合分</th></tr>
           <tr v-for="(m,k) in {public: evalResult.public, gate: evalResult.gate}" :key="k">
             <td>{{ k==='public' ? 'PUBLIC(训练可见)' : 'GATE(门禁)' }}</td>
-            <td>{{ f(m.ic_mean) }}</td><td>{{ f(m.icir) }}</td><td>{{ f(m.era_consistency) }}</td><td>{{ f(m.turnover) }}</td><td><b>{{ f(m.score) }}</b></td>
+            <td>{{ f(m.rank_ic_mean ?? m.ic_mean) }}</td><td>{{ f(m.rank_icir ?? m.icir) }}</td><td>{{ f(m.era_consistency) }}</td><td>{{ f(m.turnover) }}</td><td><b>{{ f(m.score) }}</b></td>
           </tr></table>
       </div>
       <div v-if="evalErr" style="color:var(--red); margin-top:8px">{{ evalErr }}</div>
     </div>
     <div class="card">
       <h3>研究因子记录 ({{ factors.length }})</h3>
-      <div class="sub" style="margin-bottom:10px">训练通过只代表进入任务专属研究记录；只有完成 HOLDOUT、Vault、当前冻结评级和双盲审查后才是正式研究因子。</div>
+      <div class="sub" style="margin-bottom:10px">训练通过只代表进入任务专属研究记录；正式晋级还需隔离层、事件回测、输入冻结、DSR/PBO、当前评级与双盲审查全部通过。这里的相关性指标为 Spearman RankIC，旧 IC 字段只作兼容读取。</div>
       <table>
-        <tr><th>名称</th><th>表达式</th><th>状态</th><th>任务</th><th>PUB ICIR</th><th>GATE ICIR</th><th>GATE 分</th><th>时间</th></tr>
+        <tr><th>名称</th><th>表达式</th><th>状态</th><th>任务</th><th>PUB RankICIR</th><th>GATE RankICIR</th><th>GATE 分</th><th>时间</th></tr>
         <tr v-for="fa in factors" :key="fa.id" class="clickable" @click="open(fa)">
           <td>{{ fa.name }}</td>
           <td class="mono-expr" style="max-width:380px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ fa.expression }}</td>
           <td><span class="tag" :class="{green: fa.evidence_state?.formal_factor, amber: !fa.evidence_state?.formal_factor, red: fa.raw_status==='retired'}">{{ fa.evidence_state?.label || fa.status }}</span></td>
           <td>{{ fa.task }}</td>
-          <td>{{ f(fa.public?.icir) }}</td><td>{{ f(fa.gate?.icir) }}</td><td>{{ f(fa.gate?.score) }}</td>
+          <td>{{ f(fa.public?.rank_icir ?? fa.public?.icir) }}</td><td>{{ f(fa.gate?.rank_icir ?? fa.gate?.icir) }}</td><td>{{ f(fa.gate?.score) }}</td>
           <td class="sub">{{ fa.created_at?.slice(5,16) }}</td>
         </tr>
       </table>
@@ -334,14 +334,14 @@ const FactorLibrary = {
         <button class="btn" v-for="s in ['library-admitted','paper','retired']" :key="s" @click="setStatus(s)">标记 {{ s }}</button>
       </div>
       <div class="card" style="margin-bottom:12px">
-        <h3>分层 · 分期 IC 步进 (含隔离层)</h3>
+        <h3>分层 · 分期 RankIC 步进 (含隔离层)</h3>
         <div class="chart" ref="eraEl"></div>
       </div>
       <div class="card">
         <h3>各层指标</h3>
-        <table><tr><th>层</th><th>IC均值</th><th>ICIR</th><th>一致性</th><th>综合分</th></tr>
+        <table><tr><th>层</th><th>RankIC均值</th><th>RankICIR</th><th>一致性</th><th>综合分</th></tr>
           <tr v-for="(m,layer) in detail.layers" :key="layer">
-            <td>{{ layer }}</td><td>{{ f(m.ic_mean) }}</td><td>{{ f(m.icir) }}</td><td>{{ f(m.era_consistency) }}</td><td>{{ f(m.score) }}</td>
+            <td>{{ layer }}</td><td>{{ f(m.rank_ic_mean ?? m.ic_mean) }}</td><td>{{ f(m.rank_icir ?? m.icir) }}</td><td>{{ f(m.era_consistency) }}</td><td>{{ f(m.score) }}</td>
           </tr></table>
       </div>
     </div>
@@ -366,10 +366,10 @@ const FactorLibrary = {
         grid: { left: 55, right: 20, top: 30, bottom: 40 },
         tooltip: { trigger: "axis" },
         xAxis: { type: "category", data: eras.map((e) => e.era), axisLabel: { rotate: 45, color: "#8b949e" } },
-        yAxis: { type: "value", name: "era IC", splitLine: { lineStyle: { color: "#21262d" } } },
+        yAxis: { type: "value", name: "era RankIC", splitLine: { lineStyle: { color: "#21262d" } } },
         series: [{
           type: "bar",
-          data: eras.map((e) => ({ value: e.ic_mean, itemStyle: { color: colors[e.layer] || "#8b949e" } })),
+          data: eras.map((e) => ({ value: e.rank_ic_mean ?? e.ic_mean, itemStyle: { color: colors[e.layer] || "#8b949e" } })),
         }],
         legend: { show: false },
         graphic: Object.entries(colors).map(([k, c], i) => ({
@@ -404,7 +404,7 @@ const FactorLibraryWorkbench = {
         <input style="flex:3" v-model="query" @keyup.enter="refresh" placeholder="搜索名称、表达式、经济学假设…" />
         <select v-model="status"><option value="">全部生命周期</option><option value="discovery_only">F1 · discovery_only</option><option value="research_pass">F2 · research_pass</option><option value="oos_pass">F3 · oos_pass</option><option value="paper_candidate">F4 · paper_candidate</option><option value="live_candidate_non_pit">F5 · live_candidate_non_pit</option><option value="legacy_unreviewed">旧协议未审计</option><option value="invalid_provenance">来源无效</option><option value="configuration_changed_requires_reaudit">配置变更待复审</option></select>
         <select v-model="groupFilter"><option value="">全部相似组</option><option v-for="g in groups" :key="g.id" :value="g.id">{{ g.id }} · {{ familyLabel(g.family) }} · {{ g.size }}个</option></select>
-        <select v-model="sort"><option value="live_rank">按实盘排序</option><option value="score">按连续学习分</option><option value="grade">按实战等级</option><option value="icir">按 ICIR</option><option value="created">按最新</option></select>
+        <select v-model="sort"><option value="live_rank">按实盘排序</option><option value="score">按连续学习分</option><option value="grade">按实战等级</option><option value="icir">按 RankICIR</option><option value="created">按最新</option></select>
         <button class="btn" @click="refresh">刷新</button><button class="btn primary" @click="compare" :disabled="selected.length<2">比较 {{ selected.length }} 个</button>
       </div>
       <div class="similarity-summary">
@@ -427,8 +427,8 @@ const FactorLibraryWorkbench = {
     <div class="grid cols-2" v-if="comparison">
       <div class="card">
         <div class="panel-title-row"><h2>V4.2 冻结方向训练层复评</h2><span class="tag amber">{{ comparison.portfolio_mode }}</span></div>
-        <table><tr><th>表达式</th><th>方向</th><th>PUB ICIR</th><th>GATE ICIR</th><th>GATE 费后 Sharpe</th><th>学习分</th></tr>
-          <tr v-for="r in comparison.results" :key="r.expression"><td class="mono-expr">{{ r.expression }}</td><td>{{ Number(r.direction || 1)>0?'+1':'-1' }}</td><td>{{ f(r.public?.icir) }}</td><td>{{ f(r.gate?.icir) }}</td><td>{{ f(layerSharpe(r.gate)) }}</td><td><b>{{ f(r.discovery?.score) }}</b></td></tr></table>
+        <table><tr><th>表达式</th><th>方向</th><th>PUB RankICIR</th><th>GATE RankICIR</th><th>GATE 费后 Sharpe</th><th>学习分</th></tr>
+          <tr v-for="r in comparison.results" :key="r.expression"><td class="mono-expr">{{ r.expression }}</td><td>{{ Number(r.direction || 1)>0?'+1':'-1' }}</td><td>{{ f(r.public?.rank_icir ?? r.public?.icir) }}</td><td>{{ f(r.gate?.rank_icir ?? r.gate?.icir) }}</td><td>{{ f(layerSharpe(r.gate)) }}</td><td><b>{{ f(r.discovery?.score) }}</b></td></tr></table>
       </div>
       <div class="card"><h2>横截面冗余检查</h2><div class="sub">{{ comparison.correlation?.date }} · {{ comparison.correlation?.n }} 只股票</div>
         <table><tr><th></th><th v-for="(_,i) in comparison.correlation.matrix" :key="i">F{{ i+1 }}</th></tr>
@@ -489,8 +489,21 @@ const FactorLibraryWorkbench = {
         </div>
       </div>
       <div v-if="detail.factor.validation?.source_provenance_warning" class="warn-banner">{{ detail.factor.validation.source_provenance_warning }}</div>
+      <div class="card" v-if="detail.factor.validation">
+        <div class="panel-title-row"><div><h3>正式晋级证据链</h3><span class="sub">向量分数不等于可交易证据；缺少原始试验路径时 DSR/PBO 不会以代理数据补成通过。</span></div><span class="tag" :class="detail.factor.evidence_state?.formal_factor?'green':'amber'">{{ detail.factor.evidence_state?.formal_factor ? '全部通过' : '非正式候选' }}</span></div>
+        <div class="metric-strip">
+          <div class="metric-card"><span>事件回测硬门槛</span><b :class="evidenceClass(auditEvidence.event)">{{ evidenceStatus(auditEvidence.event) }}</b><small>{{ auditEvidence.event.protocol || '尚无事件审计' }}</small></div>
+          <div class="metric-card"><span>不可变输入</span><b :class="auditEvidence.provenance.immutable_inputs_available?'ok-text':'bad-text'">{{ auditEvidence.provenance.immutable_inputs_available?'已冻结':'缺少完整冻结' }}</b><small>{{ auditEvidence.provenance.actual_start || '—' }} 至 {{ auditEvidence.provenance.actual_end || '—' }}</small></div>
+          <div class="metric-card"><span>DSR / PBO</span><b :class="evidenceClass(auditEvidence.overfit)">{{ evidenceStatus(auditEvidence.overfit) }}</b><small>DSR {{ pct(auditEvidence.overfit.dsr?.dsr_probability) }} · PBO {{ pct(auditEvidence.overfit.pbo?.pbo) }}</small></div>
+        </div>
+        <div class="sub">实际 {{ auditEvidence.provenance.actual_sessions ?? '—' }} 个交易日 · Git {{ auditEvidence.provenance.panel?.code?.git_commit || '—' }}<br/>代码 SHA256：<code>{{ auditEvidence.provenance.panel?.code?.code_sha256 || '—' }}</code><br/>面板 SHA256：<code>{{ auditEvidence.provenance.panel?.data_sha256 || '—' }}</code><br/>表达式 SHA256：<code>{{ auditEvidence.provenance.expression_sha256 || '—' }}</code></div>
+        <table v-if="auditEvidence.event.windows"><tr><th>事件窗口</th><th>实际日期</th><th>Sharpe</th><th>MDD</th><th>日均换手</th><th>状态 / 阻断</th></tr><tr v-for="(row,key) in auditEvidence.event.windows" :key="key"><td>{{ key }}</td><td>{{ row.actual_start || '—' }} 至 {{ row.actual_end || '—' }}</td><td>{{ f(row.stats?.sharpe) }}</td><td>{{ pct(row.stats?.max_dd) }}</td><td>{{ pct(row.stats?.avg_daily_turnover) }}</td><td><span :class="evidenceClass(row)">{{ evidenceStatus(row) }}</span><small>{{ row.failure_reasons?.join('；') }}</small></td></tr></table>
+        <div class="sub" v-if="auditEvidence.overfit.registered_trials != null">登记 {{ auditEvidence.overfit.registered_trials }} 次 · 已评价 {{ auditEvidence.overfit.evaluated_trials ?? '—' }} 次 · 有原始路径 {{ auditEvidence.overfit.raw_evidence_trials ?? '—' }} 次 · 缺失 {{ auditEvidence.overfit.missing_evidence_trials ?? '—' }} 次 · 双向检验 {{ auditEvidence.overfit.attempted_direction_trials ?? '—' }} 次 · 有效试验上界 {{ auditEvidence.overfit.effective_trials ?? '—' }}<br/>门槛：DSR ≥ {{ pct(auditEvidence.overfit.thresholds?.dsr_min) }}，PBO ≤ {{ pct(auditEvidence.overfit.thresholds?.pbo_max) }}</div>
+        <div class="failure-list" v-if="auditEvidence.overfit.reasons?.length"><b>过拟合治理阻断</b><ul><li v-for="reason in auditEvidence.overfit.reasons" :key="reason">{{ reason }}</li></ul></div>
+        <div class="failure-list" v-if="auditEvidence.event.failure_reasons?.length"><b>事件审计阻断</b><ul><li v-for="reason in auditEvidence.event.failure_reasons" :key="reason">{{ reason }}</li></ul></div>
+      </div>
       <div class="card audit-controls">
-        <div class="panel-title-row"><div><h3>完整 V4.2 审计 + Rating V4.3</h3><span class="sub">沿训练阶段选中的冻结方向，计算 2020 至最新交易日评级；手动翻向会作为新假设重新审计。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
+        <div class="panel-title-row"><div><h3>完整审计 + Rating V4.3</h3><span class="sub">冻结面板、代码、实际日期与方向；隔离标签采用 purge/embargo，向量通过后必须通过事件回测与 DSR/PBO 门槛。手动翻向作为新假设重审。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
         <div class="form-row"><div><label>股票池</label><input type="number" v-model.number="auditForm.universe_n" /></div><div><label>持有期</label><select v-model.number="auditForm.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="10">10日</option><option :value="20">20日</option></select></div><div><label>冻结方向</label><select v-model.number="auditForm.direction"><option :value="1">+1 高值偏多</option><option :value="-1">-1 低值偏多</option></select></div><div><label>基础成本 bps</label><input type="number" v-model.number="auditForm.cost_bps" /></div><div><label>目标资金规模</label><input type="number" v-model.number="auditForm.target_capital" /></div></div>
         <div v-if="auditErr" style="color:var(--red)">{{ auditErr }}</div>
       </div>
@@ -502,7 +515,7 @@ const FactorLibraryWorkbench = {
         <div v-if="detail.factor.eligibility?.failure_reasons?.length" class="failure-list"><b>未通过原因</b><ul><li v-for="reason in detail.factor.eligibility.failure_reasons" :key="reason">{{ reason }}</li></ul></div>
       </div>
       <div v-else class="card selector-empty"><h3>尚未完成 Rating V4.3 全层审计</h3><p>旧评分仅作为历史记录。运行审计后才会生成 F1–F5 等级与 2020 至最新冻结评级分。</p></div>
-      <div class="card"><h3>训练反馈层</h3><table><tr><th>层</th><th>ICIR</th><th>一致性</th><th>费后 Sharpe</th><th>日均等效换手</th><th>学习分</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
+      <div class="card"><h3>训练反馈层</h3><div class="sub">RankIC 是因子截面排名与前向收益排名的 Spearman 相关性；不是原值 Pearson IC。历史 ic_mean/icir 仅保留兼容读取。</div><table><tr><th>层</th><th>RankICIR</th><th>一致性</th><th>费后 Sharpe</th><th>日均等效换手</th><th>学习分</th></tr><tr v-for="(m,k) in {PUBLIC:detail.factor.public,GATE:detail.factor.gate}" :key="k"><td>{{ k }}</td><td>{{ f(m?.rank_icir ?? m?.icir) }}</td><td>{{ f(m?.era_consistency) }}</td><td>{{ f(layerSharpe(m)) }}</td><td>{{ pct(m?.daily_turnover ?? m?.turnover) }}</td><td>{{ f(m?.score) }}</td></tr></table></div>
       <label>标签（逗号分隔）</label><input v-model="review.tags" placeholder="momentum, quality, low-turnover" /><label>研究备注</label><textarea v-model="review.note" rows="5" placeholder="记录经济机制、已知暴露、失败原因和后续动作"></textarea>
       <div style="margin-top:10px"><button class="btn primary" @click="saveReview">保存研究备注</button><span class="sub" style="margin-left:8px">experiment={{ detail.factor.experiment_id }}</span></div>
     </div>
@@ -517,6 +530,12 @@ const FactorLibraryWorkbench = {
     const review = reactive({ tags: "", note: "" });
     const auditForm = reactive({ universe_n: 500, horizon: 5, direction: 1, cost_bps: 20, target_capital: 10000000 });
     const auditing = ref(false), auditErr = ref("");
+    const auditEvidence = computed(() => {
+      const validation = detail.value?.factor?.validation || {};
+      return {event:validation.event_audit || {}, provenance:validation.audit_provenance || {}, overfit:validation.overfit_governance || {}};
+    });
+    const evidenceStatus = evidence => evidence?.status || (evidence?.passed === true ? "PASS" : evidence?.passed === false ? "FAIL" : "NOT_RUN");
+    const evidenceClass = evidence => evidence?.passed === true ? "ok-text" : "bad-text";
     let loadedExperimentVersion = -1;
     const f = v => v == null ? "—" : Number(v).toFixed(3);
     const pct = v => v == null ? "—" : (Number(v) * 100).toFixed(1) + "%";
@@ -632,7 +651,7 @@ const FactorLibraryWorkbench = {
     return {
       factors, visibleFactors, selected, detail, comparison, query, status, sort,
       groups, groupFilter, groupStats, rankingDiagnostics, groupFor, familyLabel, showLatex, latexEl,
-      review, auditForm, auditing, auditErr, f, pct, layerSharpe, layerReturn,
+      review, auditForm, auditing, auditErr, auditEvidence, evidenceStatus, evidenceClass, f, pct, layerSharpe, layerReturn,
       worstStress, gradeClass, calibrationLabel, rankStatusLabel, rankStatusClass,
       componentLabel, refresh, toggleAll, open, openSimilar, compare,
       runAudit, saveReview,
@@ -765,8 +784,9 @@ const BacktestView = {
         <div class="metric-card"><span>佣金税费</span><b>{{ money(result.stats.commission_and_tax) }}</b><small>滑点 {{ money(result.stats.slippage_cost) }}</small></div>
         <div class="metric-card"><span>账本完整性</span><b :class="result.integrity?.all_pass ? 'ok-text' : 'bad-text'">{{ result.integrity?.all_pass ? 'PASS' : 'FAIL' }}</b><small>{{ result.stats.protocol }}</small></div>
         <div class="metric-card"><span>Sortino / Calmar</span><b>{{ num(result.stats.sortino, 2) }}</b><small>Calmar {{ num(result.stats.calmar, 2) }}</small></div>
-        <div class="metric-card"><span>完整交易 / 胜率</span><b>{{ result.stats.closed_trades }} / {{ pct(result.stats.win_rate) }}</b><small>PF {{ num(result.stats.profit_factor, 2) }} · 持有 {{ num(result.stats.avg_holding_sessions,1) }}日</small></div>
+        <div class="metric-card" :title="result.stats.trade_statistics_disclosure"><span>已平仓批次 / 胜率</span><b>{{ result.stats.closed_lots ?? result.stats.closed_trades }} / {{ pct((result.stats.closed_lots ?? result.stats.closed_trades) === 0 ? null : (result.stats.closed_lot_win_rate ?? result.stats.win_rate)) }}</b><small>已平仓 PF {{ num((result.stats.closed_lots ?? result.stats.closed_trades) === 0 ? null : (result.stats.closed_lot_profit_factor ?? result.stats.profit_factor), 2) }} · 持有 {{ num(result.stats.avg_holding_sessions,1) }}日</small></div>
       </div>
+      <div class="protocol-card"><b>交易统计与组合收益分开解释</b><span>胜率和 PF 仅统计已平仓批次，包含部分减仓；未平仓浮盈亏与未分摊借券/融资成本不计入该比率。零平仓样本显示“—”，不是 0% 胜率。组合净值、Sharpe 与回撤仍包含全部持仓及已入账费用。</span><small>期末未平仓 {{ result.stats.open_positions ?? '—' }} 个 · 未实现盈亏（扣未分摊入场费）{{ money(result.stats.open_unrealized_pnl_after_entry_fees) }} · 未分摊借券/融资成本 {{ money(result.stats.unallocated_financing_cost) }}</small></div>
       <div class="card" v-if="result.execution">
         <div class="panel-title-row">
           <div><h3>Rust 镜像内核诊断</h3><span class="sub">Python事件账本永久作为影子权威；只有逐笔成交与每日NLV全部对齐才标记Rust通过。</span></div>
@@ -827,7 +847,7 @@ const BacktestView = {
       </div>
 
       <div class="card ledger-card" v-if="result.round_trips?.length">
-        <div class="panel-title-row"><div><h3>完整交易与退出归因</h3><span class="sub">成本、持有期、MAE/MFE及止损止盈原因</span></div><div><span class="tag">{{ result.stats.closed_trades }} 笔</span> <a v-if="currentId" class="btn-link" :href="'/api/backtests/'+currentId+'/round-trips.csv'">下载完整归因CSV</a></div></div>
+        <div class="panel-title-row"><div><h3>已平仓批次与退出归因</h3><span class="sub">包含部分减仓；成本、持有期、MAE/MFE及止损止盈原因。不是完整持仓生命周期计数。</span></div><div><span class="tag">{{ result.stats.closed_lots ?? result.stats.closed_trades }} 批次</span> <a v-if="currentId" class="btn-link" :href="'/api/backtests/'+currentId+'/round-trips.csv'">下载平仓归因CSV</a></div></div>
         <div class="ledger-scroll"><table><thead><tr><th>证券</th><th>入场/退出</th><th>方向</th><th>数量</th><th>成本/退出价</th><th>净盈亏</th><th>收益</th><th>持有</th><th>MFE/MAE</th><th>退出原因</th></tr></thead><tbody><tr v-for="row in result.round_trips" :key="row.symbol+row.entry_date+row.exit_date"><td><code>{{ row.symbol }}</code></td><td>{{ row.entry_date }} / {{ row.exit_date }}</td><td>{{ row.direction>0?'LONG':'SHORT' }}</td><td>{{ num(row.quantity,2) }}</td><td>{{ num(row.entry_price,4) }} / {{ num(row.exit_price,4) }}</td><td :class="row.net_pnl>=0?'ok-text':'bad-text'">{{ money(row.net_pnl) }}</td><td>{{ pct(row.return) }}</td><td>{{ row.holding_sessions }}</td><td>{{ pct(row.mfe_pct) }} / {{ pct(row.mae_pct) }}</td><td><span class="tag">{{ row.exit_reason }}</span></td></tr></tbody></table></div>
       </div>
 
@@ -873,9 +893,10 @@ const BacktestView = {
 
     <div class="card history-card">
       <div class="panel-title-row"><div><h3>历史回测档案</h3><span class="sub">旧向量回测保留但标记 legacy；新记录可重放交割单</span></div><button class="btn" @click="loadHistory">刷新</button></div>
-      <table><tr><th>#</th><th>协议</th><th>组合</th><th>因子数</th><th>状态</th><th>因子 / 表达式</th><th>区间</th><th>Sharpe</th><th>年化</th><th>回撤</th><th>交割检查</th><th>时间</th></tr>
+      <table><tr><th>#</th><th>协议</th><th>组合</th><th>因子数</th><th>状态</th><th>因子 / 表达式</th><th>区间</th><th>Sharpe</th><th>年化</th><th>回撤</th><th>交割检查</th><th>时间</th><th>交易计划</th></tr>
         <tr v-for="b in history" :key="b.id" class="clickable" @click="openHistory(b)">
           <td>{{ b.id }}</td><td><span class="tag" :class="b.protocol?.startsWith('step_event_')?'green':'amber'">{{ b.protocol }}</span></td><td><span class="tag amber">{{ b.params?.mode==='long_short' ? '多空' : '纯多' }}</span></td><td>{{ b.params?.factors?.length || 1 }}</td><td>{{ b.status }}</td><td class="mono-expr factor-expression">{{ b.params?.factors?.length ? b.params.factors.map(f=>(f.name||'因子')+'×'+f.weight).join(' · ') : b.params.expression }}</td><td class="sub">{{ b.params.start }}~{{ b.params.end }}</td><td>{{ num(b.stats?.sharpe,2) }}</td><td>{{ pct(b.stats?.ann_ret) }}</td><td>{{ pct(b.stats?.max_dd) }}</td><td :class="b.integrity?.all_pass?'ok-text':'bad-text'">{{ b.integrity?.all_pass ? 'PASS' : '—' }}</td><td class="sub">{{ b.created_at?.slice(0,16) }}</td>
+          <td><button v-if="b.status==='done' && b.integrity?.all_pass && b.protocol==='step_event_v2_weighted_sleeves_v1'" class="btn" @click.stop="openTradePlan(b)">创建计划</button></td>
         </tr>
       </table>
     </div>
@@ -1127,6 +1148,7 @@ const BacktestView = {
       taskMode, market, feeLabel, result, history, err, running, run,
       curveEl, currentId, currentStep, stepCursor, ledgerTab, ledgerRows,
       ledgerPage, integrityLabels, integrityRows, leveragePlan, num, pct, money, loadHistory, openHistory,
+      openTradePlan(b) { appState.planBacktestId=b.id; appState.requestedTab='trade-plans'; },
       integrityOk, formatIntegrityValue, switchLedger, pageLedger, applyRiskPreset, clearExitPolicy,
     };
   },
@@ -1143,7 +1165,7 @@ const SettingsView = {
         <div style="flex:3"><label>研究问题 / 假设</label><input v-model="taskForm.description" placeholder="要验证的经济机制、变更点与成功标准" /></div>
       </div>
       <div class="form-row">
-        <div><label>市场</label><select v-model="taskForm.market" @change="syncMarketDefaults"><option value="ashare">A股</option><option value="us">美股</option></select></div>
+        <div><label>市场</label><select v-model="taskForm.market" :disabled="Boolean(serviceMarket)" @change="syncMarketDefaults"><option value="ashare">A股</option><option value="us">美股</option></select><small v-if="serviceMarket">独立市场服务 · 数据库与研究任务隔离</small></div>
         <div><label>持仓约束</label><select v-model="taskForm.portfolio_mode"><option value="long_only">纯多头</option><option value="long_short" :disabled="taskForm.market==='ashare'">多空</option></select></div>
         <div><label>双向同分优先方向</label><select v-model.number="taskForm.direction"><option :value="1">+1 高值偏多</option><option :value="-1">-1 低值偏多</option></select><small>每个候选仍会同时评价正反两向</small></div>
         <div><label>引擎版本</label><select v-model="taskForm.engine_mode"><option value="v2">V2 MinerTemplate（当前）</option></select></div>
@@ -1316,10 +1338,17 @@ const SettingsView = {
       qlib_structural_prior_share: 0.10,
     });
     const taskMsg = ref(""), taskOk = ref(false);
+    const serviceMarket = ref("");
     async function load() {
-      const [s, architectures] = await Promise.all([
+      const [s, architectures, identity] = await Promise.all([
         api("/settings"), api("/research-architectures", { cacheTtl: 10000 }),
+        api("/service/identity"),
       ]);
+      serviceMarket.value = identity.service_market || "";
+      if (serviceMarket.value && taskForm.market !== serviceMarket.value) {
+        taskForm.market = serviceMarket.value;
+        syncMarketDefaults();
+      }
       Object.assign(llm, s.llm_providers);
       Object.assign(eng, s.engine_config);
       Object.assign(evalProtocol, s.evaluation_protocol || {});
@@ -1456,7 +1485,7 @@ const SettingsView = {
       if (!taskForm.qlib_joint_model_enabled) taskForm.qlib_residual_distillation_enabled = false;
     }
     onMounted(load);
-    return { llm, eng, evalProtocol, save, msg, saved, taskForm, taskMsg, taskOk, createTask, syncMarketDefaults,
+    return { llm, eng, evalProtocol, save, msg, saved, taskForm, taskMsg, taskOk, serviceMarket, createTask, syncMarketDefaults,
       architectureTemplates, architectureAlgorithms, architectureSchema, selectedArchitecture, layer1Label,
       algorithmLabel, algorithmDescription,
       applyArchitectureTemplate, syncCustomArchitecture, syncQlibIntegration };
@@ -3199,7 +3228,7 @@ const App = {
     const tabs = [
       { id: "dash", label: "总览" }, { id: "tree", label: "研发树" },
       { id: "records", label: "研究记录" }, { id: "factors", label: "因子库" }, { id: "leaderboards", label: "榜单" }, { id: "qlib", label: "Qlib" }, { id: "tools", label: "因子工具" }, { id: "combinations", label: "组合优化" }, { id: "documents", label: "文档" }, { id: "screener", label: "选股器" }, { id: "backtest", label: "回测" },
-      { id: "exps", label: "实验" }, { id: "diagnostics", label: "诊断" }, { id: "settings", label: "设置" },
+      { id: "trade-plans", label: "交易计划" }, { id: "exps", label: "实验" }, { id: "diagnostics", label: "诊断" }, { id: "settings", label: "设置" },
     ];
     const engState = ref("…");
     const exps = ref([]), selExp = ref(null);
@@ -3208,7 +3237,7 @@ const App = {
     const activeComponent = computed(() => ({
       dash: Dashboard, tree: ResearchTree, records: ResearchRecordsView, factors: FactorLibraryWorkbench,
       leaderboards: LeaderboardsView, qlib: QlibResearchView, tools: FactorToolsView, combinations: CombinationLabView, documents: ResearchDocumentsView, screener: ScreenerView, backtest: BacktestView, exps: ExperimentsView,
-      diagnostics: ObservabilityView, settings: SettingsView,
+      diagnostics: ObservabilityView, settings: SettingsView, "trade-plans": TradePlansView,
     })[tab.value] || Dashboard);
     async function poll() {
       if (polling) return;

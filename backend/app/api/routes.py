@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -6,7 +7,7 @@ import statistics as st
 import time
 import uuid
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
+from ..artifact_exports import csv_download
 from ..backtest.engine import run_backtest, run_multi_factor_backtest
 from ..backtest.rust_kernel import rust_kernel_capabilities
 from ..blind_review import (
@@ -48,6 +50,8 @@ from ..config import (
     PANEL_GLOB,
     SERVICE_ARCHITECTURE,
     SERVICE_INSTANCE,
+    SERVICE_MARKET,
+    require_service_market,
     default_panel_glob,
     evaluation_config,
     get_dsl_fields,
@@ -246,7 +250,15 @@ async def _experiment_context(experiment_id: int | None = None) -> tuple[int, di
         exp = await s.get(Experiment, eid)
     if not exp:
         raise HTTPException(404, "研究任务不存在")
+    _require_service_market((exp.research_config or {}).get("market", "us"))
     return eid, (exp.research_config or {})
+
+
+def _require_service_market(market: str) -> None:
+    try:
+        require_service_market(market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _resolved_task_pool(cfg: dict, global_engine: Setting | None) -> list[dict]:
@@ -990,6 +1002,7 @@ def _three_layer_arm_configs() -> list[dict]:
 @router.post("/campaigns/three-layer")
 async def create_three_layer_campaign(req: ThreeLayerCampaignReq):
     """Pre-register and optionally start the five-arm three-layer ablation."""
+    _require_service_market("us")
     campaign_id = req.campaign_id.strip()
     if not campaign_id or len(campaign_id) > 96:
         raise HTTPException(400, "campaign_id 必须为 1-96 字符")
@@ -1863,6 +1876,10 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             )
             or 0
         )
+        audit_trials = list((await s.scalars(select(Trial).where(
+            Trial.experiment_id == f.experiment_id,
+            Trial.task_name == f.task_name,
+        ).order_by(Trial.id))).all())
     cfg = exp.research_config or {}
     market = cfg.get("market", "us")
     mode = cfg.get(
@@ -1911,6 +1928,7 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             market,
             overrides,
             DIRECTION_POLICY_FIXED,
+            trial_history=audit_trials,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1969,8 +1987,9 @@ async def audit_factor(fid: int, req: FactorAuditReq | None = None):
             search_method="manual_full_audit",
             mechanism=infer_mechanism(factor.expression),
             selected=bool(audit["eligibility"].get("eligible")),
-            failure_reason="; ".join(audit["eligibility"].get("reasons") or []),
+            failure_reason="; ".join(audit["eligibility"].get("failure_reasons") or []),
             statistic={
+                "raw_return_evidence": audit.get("raw_return_evidence"),
                 "grade": audit["eligibility"]["grade"],
                 "stage": audit["eligibility"]["stage"],
                 "live_rank_score": audit["ranking"].get("score"),
@@ -2200,7 +2219,7 @@ class EvalReq(BaseModel):
 
 @router.post("/factors/evaluate")
 async def manual_evaluate(req: EvalReq):
-    _, cfg = await _experiment_context(req.experiment_id)
+    eid, cfg = await _experiment_context(req.experiment_id)
     market = cfg.get("market", "us")
     err = validate(req.expression, get_dsl_fields(market))
     if err:
@@ -2224,6 +2243,16 @@ async def manual_evaluate(req: EvalReq):
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+    async with SessionLocal() as session:
+        session.add(Trial(experiment_id=eid,
+            expression_hash=normalize_hash(req.expression), expression=req.expression,
+            layer="FULL_AUDIT_V4" if req.full_audit else "INNER_PUBLIC+META_TRAIN",
+            task_name=f"manual_top{req.universe_n}_{req.horizon}d", search_method="manual_evaluation",
+            selected=bool(metrics.get("eligibility", {}).get("eligible", metrics.get("discovery", {}).get("passed", False))),
+            statistic={"raw_return_evidence": metrics.get("raw_return_evidence"),
+                "evaluation_performed": True, "audit_revision": metrics.get("audit_revision"),
+                "directions_evaluated": 2 if req.direction_policy == DIRECTION_POLICY_BOTH else 1}))
+        await session.commit()
     return metrics
 
 
@@ -2648,7 +2677,10 @@ async def list_backtests(experiment_id: int | None = None):
 
 def _artifact_path(backtest_id: int, filename: str) -> Path:
     root = BACKTEST_ARTIFACT_ROOT.resolve()
-    path = (root / f"{backtest_id:08d}" / filename).resolve()
+    if Path(filename).name != filename or filename in ('.', '..'):
+        raise HTTPException(400, "非法回测产物路径")
+    # Constrain the artifact directory; individual immutable files may be FDC links.
+    path = (root / f"{backtest_id:08d}").resolve() / filename
     if root not in path.parents:
         raise HTTPException(400, "非法回测产物路径")
     return path
@@ -2675,6 +2707,29 @@ def _read_artifact_page(
         "total": total,
         "returned": len(rows),
     }
+
+
+def _read_artifact_session(
+    backtest_id: int,
+    filename: str,
+    session_date: str,
+) -> list[dict]:
+    path = _artifact_path(backtest_id, filename)
+    if not path.exists():
+        raise HTTPException(404, "该历史回测没有事件账本产物")
+    frame = pl.read_parquet(path)
+    if frame.columns == ["empty"]:
+        return []
+    date_column = next(
+        (name for name in ("trade_date", "date", "execute_date") if name in frame.columns),
+        None,
+    )
+    if date_column is None:
+        raise HTTPException(500, f"{filename} 缺少交易日期字段")
+    return (
+        frame.filter(pl.col(date_column).cast(pl.String) == session_date)
+        .to_dicts()
+    )
 
 
 @router.get("/backtests/{backtest_id}")
@@ -2714,6 +2769,7 @@ async def backtest_detail(backtest_id: int):
         "status": record.status,
         "error": record.error,
         "params": record.params,
+        "experiment_id": record.experiment_id,
         "result": record.result,
         "trades": trades,
         "events": events,
@@ -2732,6 +2788,43 @@ async def backtest_trades(backtest_id: int, offset: int = 0, limit: int = 200):
         offset,
         limit,
     )
+
+
+@router.get("/backtests/{backtest_id}/session-ledger")
+async def backtest_session_ledger(backtest_id: int, session_date: str):
+    """Return the complete, untruncated event truth for one trading session."""
+    try:
+        date.fromisoformat(session_date)
+    except ValueError as exc:
+        raise HTTPException(400, "session_date 必须是 YYYY-MM-DD") from exc
+    trades, events = await asyncio.gather(
+        asyncio.to_thread(
+            _read_artifact_session,
+            backtest_id,
+            "settlement_statement.parquet",
+            session_date,
+        ),
+        asyncio.to_thread(
+            _read_artifact_session,
+            backtest_id,
+            "event_ledger.parquet",
+            session_date,
+        ),
+    )
+    return {
+        "backtest_id": backtest_id,
+        "session_date": session_date,
+        "trades": trades,
+        "events": events,
+        "trade_count": len(trades),
+        "event_count": len(events),
+        "trade_hash": hashlib.sha256(
+            json.dumps(trades, sort_keys=True, default=str).encode()
+        ).hexdigest(),
+        "event_hash": hashlib.sha256(
+            json.dumps(events, sort_keys=True, default=str).encode()
+        ).hexdigest(),
+    }
 
 
 @router.get("/backtests/{backtest_id}/events")
@@ -2762,37 +2855,28 @@ async def backtest_round_trips(backtest_id: int, offset: int = 0, limit: int = 2
 
 @router.get("/backtests/{backtest_id}/statement.csv")
 async def download_backtest_statement(backtest_id: int):
-    path = _artifact_path(backtest_id, "settlement_statement.csv")
-    if not path.exists():
-        raise HTTPException(404, "该历史回测没有可下载交割单")
-    return FileResponse(
-        path,
-        media_type="text/csv",
-        filename=f"backtest-{backtest_id:08d}-settlement-statement.csv",
+    return csv_download(
+        _artifact_path(backtest_id, "settlement_statement.csv"),
+        f"backtest-{backtest_id:08d}-settlement-statement.csv",
+        "该历史回测没有可下载交割单",
     )
 
 
 @router.get("/backtests/{backtest_id}/round-trips.csv")
 async def download_backtest_round_trips(backtest_id: int):
-    path = _artifact_path(backtest_id, "round_trip_statement.csv")
-    if not path.exists():
-        raise HTTPException(404, "该历史回测没有完整交易归因产物")
-    return FileResponse(
-        path,
-        media_type="text/csv",
-        filename=f"backtest-{backtest_id:08d}-round-trips.csv",
+    return csv_download(
+        _artifact_path(backtest_id, "round_trip_statement.csv"),
+        f"backtest-{backtest_id:08d}-round-trips.csv",
+        "该历史回测没有完整交易归因产物",
     )
 
 
 @router.get("/backtests/{backtest_id}/factor-attribution.csv")
 async def download_backtest_factor_attribution(backtest_id: int):
-    path = _artifact_path(backtest_id, "factor_attribution.csv")
-    if not path.exists():
-        raise HTTPException(404, "该历史回测没有多因子贡献归因产物")
-    return FileResponse(
-        path,
-        media_type="text/csv",
-        filename=f"backtest-{backtest_id:08d}-factor-attribution.csv",
+    return csv_download(
+        _artifact_path(backtest_id, "factor_attribution.csv"),
+        f"backtest-{backtest_id:08d}-factor-attribution.csv",
+        "该历史回测没有多因子贡献归因产物",
     )
 
 
@@ -2885,8 +2969,11 @@ class ResidualBeamRequest(BaseModel):
 
 class OverfitDiagnosticsRequest(BaseModel):
     period_return_matrix: list[list[float]]
-    observed_sharpe: float
-    observations: int = Field(ge=2)
+    candidate_index: int = Field(default=0, ge=0)
+    # Legacy clients may still send these; all moments/sample counts now come
+    # from the selected actual-return column and never trust these overrides.
+    observed_sharpe: float | None = None
+    observations: int | None = Field(default=None, ge=2)
     skewness: float = 0.0
     kurtosis: float = Field(default=3.0, ge=1.0)
 
@@ -2987,8 +3074,10 @@ async def research_residual_beam(req: ResidualBeamRequest):
 
 @router.post("/research-intelligence/overfit-diagnostics")
 async def research_overfit_diagnostics(req: OverfitDiagnosticsRequest):
+    from ..research_overfit import return_matrix_diagnostics
+
     matrix = req.period_return_matrix
-    if not matrix or any(len(row) != len(matrix[0]) for row in matrix):
+    if not matrix or not matrix[0] or any(len(row) != len(matrix[0]) for row in matrix):
         raise HTTPException(400, "period_return_matrix 必须为非空矩形")
     job_id = f"overfit-diagnostics:{uuid.uuid4().hex[:12]}"
     COMPUTE_PROGRESS.start(
@@ -2999,42 +3088,22 @@ async def research_overfit_diagnostics(req: OverfitDiagnosticsRequest):
         message=f"{len(matrix[0])} 次试验 · {len(matrix)} 个时期",
     )
     try:
-        effective = await asyncio.to_thread(effective_trial_count, matrix)
+        result = await asyncio.to_thread(return_matrix_diagnostics, matrix, candidate_index=req.candidate_index)
+    except (ValueError, ArithmeticError) as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="过拟合诊断失败", error=str(exc))
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         COMPUTE_PROGRESS.finish(job_id, state="failed", message="过拟合诊断失败", error=str(exc))
         raise
-    values = [value for row in matrix for value in row]
-    score_std = st.pstdev(values) if len(values) > 1 else 0.0
-    result = {
-        "scope": "caller_supplied_non_frozen_period_returns",
-        "actual_trials": len(matrix[0]),
-        "effective_trials": effective,
-        "dsr": deflated_sharpe_ratio(
-            req.observed_sharpe,
-            observations=req.observations,
-            effective_trials=effective,
-            skewness=req.skewness,
-            kurtosis=req.kurtosis,
-            sharpe_std=score_std,
-        ),
-        "pbo": cscv_pbo(matrix),
-        "harvey_liu": harvey_liu_haircut(
-            req.observed_sharpe,
-            observations=req.observations,
-            trials=effective,
-        ),
-        "winner_curse": winner_curse(
-            req.observed_sharpe,
-            effective_trials=effective,
-            score_std=score_std,
-        ),
-    }
+    result["legacy_input_policy"] = "observed_sharpe/observations/skewness/kurtosis ignored; derived from raw matrix"
     COMPUTE_PROGRESS.finish(job_id, message="DSR/PBO 诊断完成")
     return result
 
 
 @router.get("/research-intelligence/trial-ledger")
 async def research_trial_ledger(experiment_id: int):
+    from ..research_overfit import formal_overfit_governance
+
     async with SessionLocal() as session:
         experiment = await session.get(Experiment, experiment_id)
         if experiment is None:
@@ -3076,7 +3145,7 @@ async def research_trial_ledger(experiment_id: int):
         or 1000
     )
     by_task: dict[str, dict] = {}
-    for task_name in sorted({node.task_name for node in nodes}):
+    for task_name in sorted({node.task_name for node in nodes} | {trial.task_name for trial in trials}):
         task_nodes = [node for node in nodes if node.task_name == task_name]
         # Correlation/PBO/source clustering are quadratic in candidate count.
         # Preserve full trial counts but use a deterministic quality+recency
@@ -3107,20 +3176,29 @@ async def research_trial_ledger(experiment_id: int):
         same_length = len({len(row) for row in vectors}) == 1 if vectors else False
         matrix = list(map(list, zip(*vectors))) if same_length else []
         effective_sample = effective_trial_count(matrix) if matrix else float(len(diagnostic_nodes) or 1)
-        effective = min(
-            float(len(task_nodes) or 1),
-            effective_sample * len(task_nodes) / max(1, len(diagnostic_nodes)),
-        )
-        pbo = cscv_pbo(matrix) if matrix else {"available": False, "reason": "no_comparable_training_signatures"}
         best = max(valid_nodes or task_nodes, key=lambda node: float(node.public_score or 0.0), default=None)
         branch = dict((best.public_metrics or {}).get("active") or (best.public_metrics or {}).get("net") or {}) if best else {}
         sharpe = float(branch.get("sharpe") or 0.0)
-        observations = int((best.public_metrics or {}).get("n_days") or 2) if best else 2
         task_trials = [trial for trial in trials if trial.task_name == task_name]
         task_evaluated = [
             trial for trial in task_trials
             if (trial.statistic or {}).get("evaluation_performed", True) is not False
         ]
+        best_trial = next((
+            trial for trial in reversed(task_evaluated)
+            if best is not None and trial.node_id == best.id
+            and (trial.statistic or {}).get("raw_return_evidence")
+        ), None)
+        best_statistic = dict(best_trial.statistic or {}) if best_trial else {}
+        governance = formal_overfit_governance(
+            task_trials,
+            best_statistic.get("raw_return_evidence"),
+            direction=int(best_statistic.get("selected_direction") or 1),
+            predeclared_trials=predeclared_trials,
+        )
+        # Compressed sketches are useful for clustering only.  Never report
+        # their quality-selected sample as actual-return DSR or PBO evidence.
+        effective = governance["effective_trials"]
         direction_invariant_hashes = set()
         for trial in task_evaluated:
             try:
@@ -3219,20 +3297,21 @@ async def research_trial_ledger(experiment_id: int):
             ),
             "comparable_return_paths": len(vectors) if same_length else 0,
             "return_path_scope": "compressed_public_plus_meta_train_not_frozen_rating",
+            "return_path_permitted_use": "clustering_only_not_dsr_or_pbo",
             "effective_trials": effective,
             "diagnostic_sampling": {
                 "method": "top_quality_plus_recent_deterministic",
                 "total_nodes": len(task_nodes),
                 "sampled_nodes": len(diagnostic_nodes),
                 "sample_effective_trials": effective_sample,
-                "effective_trial_extrapolation": "sample_effective * total/sample, capped_at_total",
+                "permitted_use": "source_clustering_only_not_formal_multiple_testing",
             },
             "multiple_testing_trials": {
                 "predeclared": predeclared_trials,
                 "actual_evaluated": len(task_evaluated),
-                "effective_correlated": effective,
+                "conservative_direction_trial_upper_bound": effective,
                 "dynamic_gate_trials": dynamic_trials,
-                "policy": "max(predeclared, actual_evaluated, ceil(effective))",
+                "policy": "max(predeclared, all_attempted_directions); no sketch discount",
             },
             "return_source_governance": source_snapshot,
             "signal_rank_deduplication": {
@@ -3254,12 +3333,9 @@ async def research_trial_ledger(experiment_id: int):
             "algorithm_efficiency": algorithm_efficiency,
             "best_node_id": best.id if best else None,
             "best_training_sharpe": sharpe,
-            "dsr": deflated_sharpe_ratio(
-                sharpe,
-                observations=observations,
-                effective_trials=effective,
-            ),
-            "pbo": pbo,
+            "dsr": governance["dsr"],
+            "pbo": governance["pbo"],
+            "overfit_governance": governance,
         }
     return {
         "schema": "factorfactory.actual-trial-ledger/v1",
@@ -3454,7 +3530,8 @@ async def list_experiments():
 async def create_experiment(req: ExperimentReq):
     if not req.name.strip():
         raise HTTPException(400, "名称不能为空")
-    market = req.research_config.get("market", "us")
+    market = req.research_config.get("market", SERVICE_MARKET or "us")
+    _require_service_market(market)
     if market not in {"us", "ashare"}:
         raise HTTPException(400, "market 必须是 us 或 ashare")
     portfolio_mode = req.research_config.get(
@@ -3555,6 +3632,7 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             previous_config = dict(e.research_config or {})
             merged = {**previous_config, **req.research_config}
             market = merged.get("market", "us")
+            _require_service_market(market)
             mode = merged.get("portfolio_mode", "long_only" if market == "ashare" else "long_short")
             if market not in {"us", "ashare"}:
                 raise HTTPException(400, "market 必须是 us 或 ashare")
@@ -4364,6 +4442,7 @@ class ScreenerReq(BaseModel):
     universe_n: int = 500
     top_n: int = 50
     direction: str = "top"  # "top" | "bottom" | "both"
+    atr_period: int = 14
 
 
 class ScreenerAllocationReq(BaseModel):
@@ -4391,6 +4470,8 @@ async def screener(req: ScreenerReq):
         raise HTTPException(400, "universe_n 必须在 1 到 10000 之间")
     if not 1 <= req.top_n <= 500:
         raise HTTPException(400, "top_n 必须在 1 到 500 之间")
+    if not 2 <= req.atr_period <= 252:
+        raise HTTPException(400, "atr_period 必须在 2 到 252 之间")
     factors = list(req.factors)
     if req.expression:
         factors = [{
@@ -4476,6 +4557,7 @@ async def screener(req: ScreenerReq):
             universe_n=req.universe_n,
             top_n=req.top_n,
             direction=req.direction,
+            atr_period=req.atr_period,
         )
     except ValueError as exc:
         COMPUTE_PROGRESS.finish(job_id, state="failed", message="选股计算失败", error=str(exc))
@@ -4496,6 +4578,7 @@ async def screener(req: ScreenerReq):
         "market": market,
         "portfolio_mode": portfolio_mode,
         "direction": req.direction,
+        "atr_period": req.atr_period,
         **screened,
     }
     request_spec = {
@@ -4515,6 +4598,7 @@ async def screener(req: ScreenerReq):
         "universe_n": req.universe_n,
         "top_n": req.top_n,
         "direction": req.direction,
+        "atr_period": req.atr_period,
         "expression_mode": bool(req.expression),
         "factors": factors,
     }

@@ -36,7 +36,88 @@ PANEL_META = {
     "pit_quality": "non_pit_current_constituents",
     "production_eligible": False,
     "universe_policy": "rolling_60d_amount_rank_v1",
+    "forward_label_policy": "exact_market_session_forward_open_v2",
+    "calendar_policy": "quality_valid_market_observed_session_union",
 }
+
+
+def with_market_calendar_labels(
+    frame: pl.DataFrame,
+    horizons: list[int] | tuple[int, ...] = tuple(HORIZONS),
+) -> pl.DataFrame:
+    """Attach exact-session forward-open labels without skipping suspensions.
+
+    A signal at market session t enters at t+1 and exits at t+1+h. The
+    calendar is shared by every security in this market panel. Missing symbol
+    quotes at either exact endpoint make the label null; a later observation
+    must never silently replace the missing endpoint. Endpoint dates remain
+    available even when a quote is missing, for purge/embargo and coverage
+    audits. The caller must supply the complete panel, before date slicing.
+    """
+    horizons = tuple(dict.fromkeys(int(h) for h in horizons))
+    if any(h < 1 for h in horizons):
+        raise ValueError("Forward-label horizons must be positive market sessions")
+    calendar = (
+        frame.select(pl.col("trade_date").cast(pl.Date))
+        .unique()
+        .sort("trade_date")
+        .with_row_index("market_session_index")
+        .with_columns(
+            pl.col("trade_date").shift(-1).alias("label_entry_date"),
+            *[
+                pl.col("trade_date").shift(-(h + 1)).alias(f"label_exit_date_{h}")
+                for h in horizons
+            ],
+        )
+    )
+    frame = frame.with_columns(pl.col("trade_date").cast(pl.Date))
+    result = frame.join(
+        calendar, on="trade_date", how="left", validate="m:1", maintain_order="left"
+    )
+    # Project to three columns for each endpoint join instead of repeatedly
+    # joining the entire multi-million-row feature panel. Validation rejects
+    # duplicate quotes rather than expanding rows or selecting one silently.
+    quotes = frame.select("ts_code", "trade_date", pl.col("open").cast(pl.Float64))
+    entry = (
+        result.select("ts_code", "label_entry_date")
+        .join(
+            quotes.rename({"trade_date": "label_entry_date"}),
+            on=["ts_code", "label_entry_date"],
+            how="left",
+            validate="m:1",
+            maintain_order="left",
+        )
+        .get_column("open")
+        .rename("entry")
+    )
+    labels = []
+    for horizon in horizons:
+        exit_column = f"label_exit_date_{horizon}"
+        exit_open = (
+            result.select("ts_code", exit_column)
+            .join(
+                quotes.rename({"trade_date": exit_column}),
+                on=["ts_code", exit_column],
+                how="left",
+                validate="m:1",
+                maintain_order="left",
+            )
+            .get_column("open")
+            .rename("exit")
+        )
+        label = pl.DataFrame([entry, exit_open]).select(
+            pl.when(
+                pl.col("entry").is_finite()
+                & (pl.col("entry") > 0)
+                & pl.col("exit").is_finite()
+                & (pl.col("exit") > 0)
+            )
+            .then(pl.col("exit") / pl.col("entry") - 1.0)
+            .otherwise(None)
+            .alias(f"fwd_{horizon}")
+        )
+        labels.append(label.to_series())
+    return result.with_columns(labels)
 
 
 class PanelStore:
@@ -317,14 +398,7 @@ class PanelStore:
         lf = lf.with_columns(pl.col("trade_date").cast(pl.Date)).sort("ts_code", "trade_date")
 
         by_code = {"partition_by": "ts_code", "order_by": "trade_date"}
-        # 前向收益: t 日信号 -> t+1 开盘成交 -> t+1+h 开盘平仓 (前复权 open 口径)
-        fwd_cols = [
-            (pl.col("open").shift(-(1 + h)).over(**by_code) / pl.col("open").shift(-1).over(**by_code) - 1)
-            .alias(f"fwd_{h}")
-            for h in HORIZONS
-        ]
         lf = lf.with_columns(
-            *fwd_cols,
             pl.col("amount").rolling_mean(60, min_samples=20).over(**by_code).alias("amt60"),
         )
         # universe 排名 (按 60 日均成交额, 每日截面)
@@ -344,7 +418,7 @@ class PanelStore:
                 .otherwise(layer_expr)
             )
         lf = lf.with_columns(layer_expr.alias("layer"))
-        frame = lf.collect()
+        frame = with_market_calendar_labels(lf.collect())
         trading_dates = frame["trade_date"].unique().sort().to_list()
         if not trading_dates:
             raise ValueError(f"{self.market} 面板没有有效交易日")

@@ -9,6 +9,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 _MARKET = os.environ.get("FF_MARKET", "us")  # "us" 或 "ashare"
+SERVICE_MARKET = os.environ.get("FF_SERVICE_MARKET", "").strip().lower()
+if SERVICE_MARKET not in {"", "us", "ashare"}:
+    raise ValueError("FF_SERVICE_MARKET 必须为空、us 或 ashare")
+
+
+def require_service_market(market: str) -> None:
+    """Independent market deployments must not accept cross-market writes."""
+    if SERVICE_MARKET and market != SERVICE_MARKET:
+        raise ValueError(f"当前独立服务仅支持 {SERVICE_MARKET}，请使用 {market} 对应服务")
+
+
 MARKET_LABEL = "A股" if _MARKET == "ashare" else "美股"
 
 HOST = os.environ.get("FF_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -43,6 +54,8 @@ def service_accepts_task(
         else service_architecture
     )
     task_service = str((task_config or {}).get("service_instance") or "").strip()
+    if SERVICE_MARKET and (task_config or {}).get("market", "us") != SERVICE_MARKET:
+        return False
     return not task_service or task_service == instance or not architecture.strip()
 
 
@@ -108,8 +121,14 @@ _ASHARE_PANEL_ROOT = (
     _fdc_path("logical__single__Portfolios__MultiFactorAshare__data")
     or _LEGACY_ASHARE_PANEL_ROOT
 )
-US_PANEL_GLOB = str(_US_PANEL_ROOT / "processed" / "daily_panel" / "trade_year=*" / "data_0.parquet")
-ASHARE_PANEL_GLOB = str(_ASHARE_PANEL_ROOT / "trade_year=*" / "data_0.parquet")
+US_PANEL_GLOB = os.environ.get(
+    "FF_US_PANEL_GLOB",
+    str(_US_PANEL_ROOT / "processed" / "daily_panel" / "trade_year=*" / "data_0.parquet"),
+)
+ASHARE_PANEL_GLOB = os.environ.get(
+    "FF_ASHARE_PANEL_GLOB",
+    str(_ASHARE_PANEL_ROOT / "trade_year=*" / "data_0.parquet"),
+)
 PANEL_GLOB = os.environ.get(
     "FF_PANEL_GLOB",
     ASHARE_PANEL_GLOB if _MARKET == "ashare" else US_PANEL_GLOB,

@@ -333,6 +333,19 @@ def analyze_signal_diagnostics(
         return base | {"reason": f"回测帧缺少 {forward} 或为空"}
     dates = frame["trade_date"].unique().sort().to_list()
     signal_dates = dates[:: max(1, int(horizon))]
+    label_exit = f"label_exit_date_{int(horizon)}"
+    if label_exit in frame.columns:
+        label_boundary = pl.col(label_exit).is_not_null() & (pl.col(label_exit) <= dates[-1])
+        boundary_rule = "explicit_market_calendar_label_exit_lte_actual_end"
+    else:
+        # Legacy/synthetic frames have no auditable label dates. At minimum
+        # purge the final h+1 market sessions, never consume labels beyond the
+        # requested event interval. This path cannot assert exact alignment.
+        safe_signal_dates = set(dates[: max(0, len(dates) - int(horizon) - 1)])
+        label_boundary = pl.col("trade_date").is_in(safe_signal_dates)
+        boundary_rule = "legacy_conservative_terminal_purge_label_dates_unavailable"
+    base["label_boundary_rule"] = boundary_rule
+    base["label_end_date"] = str(dates[-1])
     minimum_cross_section = min(50, max(10, int(universe_n * 0.20)))
     daily = (
         frame.lazy()
@@ -341,6 +354,7 @@ def analyze_signal_diagnostics(
             & (pl.col("univ_rank") <= int(universe_n))
             & pl.col("factor").is_finite()
             & pl.col(forward).is_finite()
+            & label_boundary
         )
         .with_columns((pl.col("factor") * int(direction)).alias("_signal"))
         .with_columns(

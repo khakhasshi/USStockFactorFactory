@@ -4,6 +4,11 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+if [[ -f .service.env ]]; then
+  set -a
+  source .service.env
+  set +a
+fi
 runtime_python="${FF_PYTHON:-$PWD/.venv/bin/python}"
 if [[ -z "${FF_PYTHON:-}" ]]; then
   [ -d .venv ] || python3 -m venv .venv

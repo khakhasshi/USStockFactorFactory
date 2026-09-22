@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -93,6 +94,7 @@ def _cache_key(
     universe_n: int,
     top_n: int,
     direction: str,
+    atr_period: int,
 ) -> str:
     payload = {
         "panel": panel_identity,
@@ -109,7 +111,8 @@ def _cache_key(
         "universe_n": universe_n,
         "top_n": top_n,
         "direction": direction,
-        "version": "single_pass_v3_tail_rank",
+        "atr_period": atr_period,
+        "version": "single_pass_v4_live_protocol_metrics",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -125,6 +128,7 @@ def screen_cross_section(
     universe_n: int,
     top_n: int,
     direction: str,
+    atr_period: int = 14,
 ) -> dict:
     started = time.perf_counter()
     key = _cache_key(
@@ -134,6 +138,7 @@ def screen_cross_section(
         universe_n=universe_n,
         top_n=top_n,
         direction=direction,
+        atr_period=atr_period,
     )
     cached = SCREEN_CACHE.get(key)
     if cached is not None:
@@ -147,7 +152,14 @@ def screen_cross_section(
     if target_date not in trading_dates:
         raise ValueError("目标日期不在交易日历中")
     target_index = trading_dates.index(target_date)
-    lookback = max(required_history(row["expression"]) for row in factors)
+    # Live sizing consumes previous-ADV, previous realised volatility and ATR
+    # from the same immutable t-close snapshot.  Reserve enough history even
+    # when the factor expression itself has a very short lookback.
+    expression_lookback = max(required_history(row["expression"]) for row in factors)
+    lookback = max(
+        expression_lookback,
+        int(atr_period) + 22,
+    )
     start_index = max(0, target_index - lookback - 2)
     history_start = trading_dates[start_index]
 
@@ -159,6 +171,38 @@ def screen_cross_section(
         alias = f"_screen_factor_{index}"
         lf = parse(factor["expression"], fields).apply(lf, alias=alias)
         value_columns.append(alias)
+    lf = (
+        lf.with_columns(
+            pl.col("close").shift(1).over("ts_code").alias("_screen_prev_close"),
+            pl.col("vol").shift(1).rolling_mean(window_size=20, min_samples=1)
+            .over("ts_code").alias("_adv20_prev"),
+            (pl.col("close") / pl.col("close").shift(1).over("ts_code") - 1.0)
+            .alias("_screen_ret1"),
+        )
+        .with_columns(
+            pl.max_horizontal(
+                (pl.col("high") - pl.col("low")).abs(),
+                (pl.col("high") - pl.col("_screen_prev_close")).abs(),
+                (pl.col("low") - pl.col("_screen_prev_close")).abs(),
+            ).alias("_screen_true_range")
+        )
+        .with_columns(
+            (
+                pl.col("_screen_true_range")
+                .rolling_mean(
+                    window_size=int(atr_period),
+                    min_samples=max(2, int(atr_period) // 2),
+                )
+                .over("ts_code")
+                / pl.col("close").abs()
+            ).alias("_atr_pct"),
+            (
+                pl.col("_screen_ret1").shift(1)
+                .rolling_std(window_size=20, min_samples=5)
+                .over("ts_code") * math.sqrt(252.0)
+            ).alias("_vol20_prev"),
+        )
+    )
     lf = lf.filter(
         (pl.col("trade_date") == target_date)
         & (pl.col("univ_rank") <= universe_n)
@@ -184,6 +228,7 @@ def screen_cross_section(
         "ts_code", "name", "univ_rank", "raw_close", "amount",
         *value_columns,
         *[f"_screen_rank_{index}" for index in range(len(factors))],
+        "_adv20_prev", "_atr_pct", "_vol20_prev",
     ]
     ranked = (
         lf.with_columns(score.alias("score"))
@@ -269,6 +314,20 @@ def screen_cross_section(
             "universe_rank": int(row["univ_rank"]),
             "raw_close": round(float(row["raw_close"]), 4) if row.get("raw_close") is not None else None,
             "amount": round(float(row["amount"]), 2) if row.get("amount") is not None else None,
+            "adv20_prev": round(float(row["_adv20_prev"]), 6) if row.get("_adv20_prev") is not None else None,
+            "atr_pct": round(float(row["_atr_pct"]), 10) if row.get("_atr_pct") is not None else None,
+            "vol20_prev": round(float(row["_vol20_prev"]), 10) if row.get("_vol20_prev") is not None else None,
+            # Display values above remain rounded for backward compatibility.
+            # Execution must use the exact Float64 values used by the Python
+            # event engine, otherwise integer sizing can differ by one share.
+            "execution_inputs": {
+                "protocol": "step_event_execution_inputs_float64_v1",
+                "raw_close": float(row["raw_close"]) if row.get("raw_close") is not None else None,
+                "amount": float(row["amount"]) if row.get("amount") is not None else None,
+                "adv20_prev": float(row["_adv20_prev"]) if row.get("_adv20_prev") is not None else None,
+                "atr_pct": float(row["_atr_pct"]) if row.get("_atr_pct") is not None else None,
+                "vol20_prev": float(row["_vol20_prev"]) if row.get("_vol20_prev") is not None else None,
+            },
             "components": components,
         })
     elapsed = (time.perf_counter() - started) * 1000
@@ -276,7 +335,8 @@ def screen_cross_section(
         "stocks": stocks,
         "eligible_count": eligible_count,
         "history_start": str(history_start),
-        "required_history": lookback,
+        "required_history": expression_lookback,
+        "loaded_history": lookback,
         "ranking_semantics": {
             "head_rank": "1 表示方向调整后综合分最高",
             "tail_rank": "1 表示方向调整后综合分最低",

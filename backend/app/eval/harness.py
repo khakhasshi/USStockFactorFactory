@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import math
 import time
+import functools
+import inspect
 from datetime import date
 from statistics import NormalDist
 
@@ -36,6 +38,7 @@ from ..config import (
     FROZEN_RATING_WINDOW_START,
     evaluation_config,
     get_dsl_fields,
+    get_layer_bounds,
 )
 from ..data.panel import PanelStore
 from ..dsl.engine import parse
@@ -52,6 +55,46 @@ LAYER_ALIASES = {
     "FACTOR_VAULT": "vault",
 }
 SIGNAL_PREFLIGHT_PROTOCOL = "factorfactory.signal-preflight/v1"
+AUDIT_REVISION = "v4.3-causal-event-20260913"
+
+
+def _panel_frame(panel_glob, market):
+    from ..audit_snapshot import read_frozen_panel
+    store = PanelStore.get(panel_glob, market)
+    # Small synthetic unit fixtures have no on-disk snapshot. They can test
+    # arithmetic but can never supply formal provenance.
+    return read_frozen_panel(store)[0] if hasattr(store, "read_snapshot") else store.ensure_loaded()
+
+
+def _frozen_evaluation(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        from ..audit_snapshot import frozen_panel, digest_json
+        from ..research_overfit import build_trial_return_evidence
+        bound = inspect.signature(func).bind(*args, **kwargs)
+        bound.apply_defaults()
+        params = bound.arguments
+        with frozen_panel(params.get("panel_glob"), params.get("market", "us")) as snap:
+            result = func(*args, **kwargs)
+            raw = result.get("runtime", {}).pop("_raw_paths", None)
+            if raw:
+                evidence_cfg = evaluation_config(params["market"], params.get("evaluation_overrides"))
+                evidence_cfg.pop("multiple_testing_trials", None)
+                evidence_cfg["base_cost_bps"] = result["parameters"]["base_cost_bps"]
+                context = {"market": params["market"], "portfolio_mode": params["portfolio_mode"],
+                    "horizon": params["horizon"], "task_name": f"top{params['universe_n']}_{params['horizon']}d",
+                    "panel_snapshot_id": snap.manifest["snapshot_id"],
+                    "code_version": snap.manifest["code"]["code_sha256"],
+                    "config_hash": digest_json({"universe_n": params["universe_n"], "horizon": params["horizon"],
+                        "portfolio_mode": params["portfolio_mode"], "effective_config": evidence_cfg,
+                        "isolation": get_layer_bounds(params["market"]),
+                        "revision": AUDIT_REVISION})}
+                result["raw_return_evidence"] = build_trial_return_evidence(paths=raw, context=context,
+                    expected_directions=[p["direction"] for p in raw])
+            result["audit_revision"] = AUDIT_REVISION
+            result["input_snapshot_id"] = snap.manifest["snapshot_id"]
+            return result
+    return wrapped
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -312,13 +355,17 @@ def _prepare_factor_base(
     cross-sectional factor rank, and forward-return rank are materialised only
     once even when both +1 and -1 are evaluated.
     """
-    panel = PanelStore.get(panel_glob, market)
-    df = panel.ensure_loaded()
+    df = _panel_frame(panel_glob, market)
     fwd = f"fwd_{horizon}"
     if fwd not in df.columns:
         raise ValueError(f"不支持的 horizon: {horizon}")
     pipe = parse(expression, get_dsl_fields(market))
-    source = df.lazy()
+    # Compute rolling/cross-sectional features BEFORE evaluation slicing.
+    # A cache is an optimizer barrier: later predicates must not truncate DSL
+    # warm-up or change the cross-sectional rank universe.
+    source = pipe.apply(df.lazy()).cache()
+    label_exit = f"label_exit_date_{horizon}"
+    calendar = df.select("trade_date", "layer").unique().sort("trade_date")
     if date_window is not None:
         if not layer_name_override:
             raise ValueError("日期窗口评估必须提供独立层名称")
@@ -333,11 +380,38 @@ def _prepare_factor_base(
         source = source.with_columns(
             pl.lit(layer_name_override).alias("layer")
         )
+        calendar = calendar.filter(pl.col("trade_date") >= date.fromisoformat(start))
+        if end is not None:
+            calendar = calendar.filter(pl.col("trade_date") <= date.fromisoformat(end))
+        calendar = calendar.with_columns(pl.lit(layer_name_override).alias("layer"))
+        if label_exit in df.columns:
+            actual_end = date.fromisoformat(end) if end else df["trade_date"].max()
+            source = source.filter(pl.col(label_exit) <= actual_end)
     else:
         source = source.filter(pl.col("layer").is_in(layers))
+        calendar = calendar.filter(pl.col("layer").is_in(layers))
+        if label_exit in df.columns:
+            # Purge every label touching the next layer. Embargo the first h
+            # market sessions after a boundary, using a factor-independent
+            # calendar. The first training layer has no predecessor.
+            bounds = get_layer_bounds(market)
+            safe = pl.lit(False)
+            for layer in layers:
+                dates = calendar.filter(pl.col("layer") == layer)["trade_date"].to_list()
+                skip = 0 if layer == "INNER_PUBLIC" else horizon
+                if len(dates) <= skip:
+                    continue
+                safe = safe | ((pl.col("layer") == layer)
+                    & (pl.col("trade_date") >= dates[skip])
+                    & (pl.col(label_exit) <= date.fromisoformat(bounds[layer][1])))
+            source = source.filter(safe)
+    # Sampling cohorts do not change when factor values or future labels are
+    # missing. Never rank the set of securities using future label availability.
+    calendar = calendar.with_columns(pl.col("trade_date").rank(method="dense").over("layer").alias("_date_seq"))
+    source = source.join(calendar.lazy(), on=["trade_date", "layer"], how="left")
     base = (
-        pipe.apply(source)
-        .filter((pl.col("univ_rank") <= universe_n) & pl.col(fwd).is_finite())
+        source
+        .filter(pl.col("univ_rank") <= universe_n)
         .with_columns(pl.len().over("trade_date").alias("_eligible_n"))
         .filter(pl.col("factor").is_finite())
         # A constant or numerically near-constant cross-section has no ranking
@@ -363,9 +437,6 @@ def _prepare_factor_base(
         # fwd_h observations overlap on adjacent dates.  Portfolio statistics
         # therefore use one deterministic, non-overlapping rebalance cohort.
         # This also makes weight turnover an h-day rebalance turnover.
-        .with_columns(
-            pl.col("trade_date").rank(method="dense").over("layer").alias("_date_seq")
-        )
         .select(
             "trade_date",
             "layer",
@@ -377,6 +448,9 @@ def _prepare_factor_base(
             "_return_rank",
             "_factor_pct",
             "_date_seq",
+            "factor",
+            (pl.col(label_exit) if label_exit in df.columns else pl.lit(None, dtype=pl.Date)).alias("_label_exit_date"),
+            (pl.col("label_entry_date") if "label_entry_date" in df.columns else pl.lit(None, dtype=pl.Date)).alias("_label_entry_date"),
         )
         .cache()
     )
@@ -443,20 +517,22 @@ def preflight_expression(
     result never contributes a score or an evaluation trial.
     """
     started = time.perf_counter()
-    df = PanelStore.get(panel_glob, market).ensure_loaded()
+    df = _panel_frame(panel_glob, market)
     fwd = f"fwd_{horizon}"
     if fwd not in df.columns:
         raise ValueError(f"不支持的 horizon: {horizon}")
     pipe = parse(expression, get_dsl_fields(market))
     modulus = max(1, int(sample_modulus))
-    source = df.lazy().filter(pl.col("layer").is_in(DISCOVERY_LAYERS))
+    source = df.lazy()
     if modulus > 1:
         source = source.filter(
             (pl.col("ts_code").hash(seed=1729) % modulus) == 0
         )
     daily = (
         pipe.apply(source)
-        .filter((pl.col("univ_rank") <= universe_n) & pl.col(fwd).is_finite())
+        .cache()
+        .filter(pl.col("layer").is_in(DISCOVERY_LAYERS))
+        .filter(pl.col("univ_rank") <= universe_n)
         .group_by("trade_date")
         .agg(
             pl.len().alias("eligible_n"),
@@ -498,6 +574,7 @@ def _prepare_direction_work(
     target_capital = float(cfg["target_capital"])
     return (
         base.with_columns(
+            (pl.col("factor") * direction).alias("_oriented_factor"),
             (
                 pl.col("_factor_pct")
                 if direction > 0
@@ -581,6 +658,10 @@ def _direction_aggregates(
         work.group_by("trade_date", "layer", "era")
         .agg(
             pl.corr("_signal_pct", "_return_rank").alias("ic"),
+            pl.corr("_oriented_factor", fwd).alias("pearson_ic"),
+            pl.col("_label_entry_date").min().alias("label_entry_date"),
+            pl.col("_label_exit_date").max().alias("label_exit_date"),
+            ((pl.col("_weight").abs() > 0) & ~pl.col(fwd).is_finite().fill_null(False)).sum().alias("missing_selected_labels"),
             pl.col(fwd).mean().alias("benchmark_return"),
             (pl.col("_long_w") * pl.col(fwd)).sum().alias("long_return"),
             (pl.col("_short_w") * pl.col(fwd)).sum().alias("short_return"),
@@ -596,7 +677,7 @@ def _direction_aggregates(
             pl.col("_eligible_n").first().alias("eligible_n"),
         )
         .with_columns(
-            pl.when(pl.col("_date_seq") == 1)
+            pl.when(pl.col("trade_date") == pl.col("trade_date").min().over("layer"))
             .then(0.0)
             .otherwise(
                 (pl.lit(target_gross) - pl.col("_matched_previous_gross"))
@@ -625,8 +706,6 @@ def _direction_aggregates(
         )
         .with_columns((pl.col("n") / pl.col("eligible_n")).alias("coverage"))
         .filter(pl.col("n") >= 50)
-        .drop_nulls("ic")
-        .filter(pl.col("ic").is_finite())
         .with_columns(
             (
                 pl.col("long_return")
@@ -854,8 +933,8 @@ def _layer_metrics(
         if cost_breakeven_bps is not None and base_cost_bps > 0
         else None
     )
-    ic = [_safe_float(v) for v in sub["ic"].to_list()]
-    ic_mean = sum(ic) / len(ic)
+    ic = [float(v) for v in sub["ic"].to_list() if v is not None and math.isfinite(v)]
+    ic_mean = sum(ic) / max(1, len(ic))
     ic_var = sum((value - ic_mean) ** 2 for value in ic) / max(1, len(ic) - 1)
     ic_std = math.sqrt(max(ic_var, 0.0))
     icir = ic_mean / ic_std * math.sqrt(252.0 / max(1, horizon)) if ic_std > 1e-12 else 0.0
@@ -986,6 +1065,8 @@ def _layer_metrics(
         "available": True,
         "window_start": str(sub["trade_date"].min()),
         "window_end": str(sub["trade_date"].max()),
+        "actual_label_entry_start": str(sub["label_entry_date"].min()) if "label_entry_date" in sub.columns else None,
+        "actual_label_exit_end": str(sub["label_exit_date"].max()) if "label_exit_date" in sub.columns else None,
         "n_days": sub.height,
         "n_periods": sub.height,
         "calendar_equivalent_days": sub.height * horizon,
@@ -996,7 +1077,7 @@ def _layer_metrics(
         "ic_mean": round(ic_mean, 6),
         "ic_std": round(ic_std, 6),
         "icir": round(icir, 4),
-        "ic_hit_rate": round(sum(value > 0 for value in ic) / len(ic), 4),
+        "ic_hit_rate": round(sum(value > 0 for value in ic) / max(1, len(ic)), 4),
         "hac_t_stat": hac_t,
         "hac_p_value": hac_p,
         "era_consistency": round(era_consistency, 4),
@@ -1052,6 +1133,20 @@ def _layer_metrics(
         # Compatibility fields used by the existing UI/search context.
         "direction": direction,
     }
+    # Historical ic_* fields were Spearman statistics; retain explicitly
+    # deprecated aliases for old miners, expose correctly named new metrics.
+    pearson = [float(v) for v in sub["pearson_ic"].to_list() if v is not None and math.isfinite(v)] if "pearson_ic" in sub.columns else []
+    pmean = sum(pearson) / len(pearson) if pearson else None
+    pstd = math.sqrt(sum((v-pmean)**2 for v in pearson) / max(1, len(pearson)-1)) if pearson else None
+    result.update({
+        "rank_ic_mean": result["ic_mean"], "rank_ic_std": result["ic_std"],
+        "rank_icir": result["icir"], "rank_ic_hit_rate": result["ic_hit_rate"],
+        "pearson_ic_mean": pmean,
+        "pearson_icir": pmean / pstd * math.sqrt(periods_per_year) if pstd and pstd > 1e-12 else None,
+        "ic_metric_contract": {"ic_mean": "deprecated_alias_of_rank_ic_mean", "icir": "deprecated_alias_of_rank_icir", "pearson": "pearson_ic_mean", "rank": "rank_ic_mean"},
+        "missing_selected_labels": int(sub["missing_selected_labels"].sum()) if "missing_selected_labels" in sub.columns else 0,
+        "isolation_policy": {"revision": AUDIT_REVISION, "purge_label_end": True, "embargo_market_sessions": 0 if layer in {"INNER_PUBLIC", FROZEN_RATING_LAYER} else horizon, "rolling_warmup_preserved": True},
+    })
     return result
 
 
@@ -1078,6 +1173,8 @@ def _sigmoid_margin(value: float, center: float, scale: float) -> float:
 
 def _discovery_score(public: dict, gate: dict, portfolio_mode: str, cfg: dict) -> dict:
     reasons: list[str] = []
+    if any(m.get("missing_selected_labels", 0) for m in (public, gate)):
+        reasons.append("训练选中股票存在缺失日历标签；向量收益不能作为完整证据")
     if not public.get("available") or not gate.get("available"):
         return {
             "score": 0.0,
@@ -1332,6 +1429,8 @@ def _layer_gate(metrics: dict, portfolio_mode: str, cfg: dict, label: str) -> tu
     reasons: list[str] = []
     if not metrics.get("available"):
         return False, [f"{label}: 无有效样本"]
+    if metrics.get("missing_selected_labels", 0):
+        reasons.append(f"{label}: 所选股票缺少准确日历收益标签，不能将缺失视为零收益")
     horizon = max(1, int(metrics.get("horizon") or 1))
     min_periods = max(30, math.ceil(int(cfg["min_layer_days"]) / horizon))
     if int(metrics.get("n_periods") or metrics.get("n_days") or 0) < min_periods:
@@ -1524,7 +1623,7 @@ def _evaluate_frozen_rating(
     )
     evaluated_start = metrics.get("window_start")
     evaluated_end = metrics.get("window_end")
-    panel = PanelStore.get(panel_glob, market).ensure_loaded()
+    panel = _panel_frame(panel_glob, market)
     panel_latest = panel["trade_date"].max()
     metrics.update({
         "rating_protocol_version": FROZEN_RATING_PROTOCOL_VERSION,
@@ -1709,6 +1808,13 @@ def _evaluate_discovery_orientations(
     metrics_finished = time.perf_counter()
     runtime = {
         **runtime,
+        "_raw_paths": [{"direction": d,
+            "dates": [str(v) for v in frames[0]["trade_date"].to_list()],
+            "layers": frames[0]["layer"].to_list(),
+            "returns": [float(g) - float(t) * float(cfg["base_cost_bps"]) / 10000.0
+                - (float(cfg["borrow_cost_bps_annual"]) * horizon / 252.0 / 10000.0 if portfolio_mode == "long_short" else 0)
+                for g, t in zip(frames[0]["gross_return"].to_list(), frames[0]["turnover"].to_list())]}
+            for d, frames in direction_frames.items()],
         "metrics_ms": round(
             (metrics_finished - metrics_started) * 1000.0,
             3,
@@ -1722,6 +1828,7 @@ def _evaluate_discovery_orientations(
     return selected["layers"], selected["cfg"], discovery, runtime
 
 
+@_frozen_evaluation
 def evaluate(
     expression: str,
     universe_n: int = 500,
@@ -1778,7 +1885,8 @@ def evaluate(
     }
 
 
-def evaluate_full(
+@_frozen_evaluation
+def _evaluate_full_vector(
     expression: str,
     universe_n: int = 500,
     horizon: int = 5,
@@ -1879,6 +1987,7 @@ def evaluate_full(
         "eligibility": eligibility,
         "ranking": ranking,
         "runtime": {
+            "_raw_paths": discovery_runtime.pop("_raw_paths", []),
             "discovery": discovery_runtime,
             "validation_ms": round(
                 (validation_finished - validation_started) * 1000.0,
@@ -1894,6 +2003,58 @@ def evaluate_full(
             ),
         },
     }
+
+
+def evaluate_full(
+    expression: str, universe_n: int = 500, horizon: int = 5,
+    portfolio_mode: str = "long_short", direction: int = 1,
+    panel_glob: str | None = None, cost_bps: float | None = None,
+    market: str = "us", evaluation_overrides: dict | None = None,
+    direction_policy: str = DIRECTION_POLICY_BOTH, *,
+    trial_history: list | None = None, audit_artifact_dir=None,
+) -> dict:
+    """Full V4.3 audit. Vector rank is diagnostic, never a promotion bypass."""
+    from ..audit_snapshot import frozen_panel, build_run_provenance
+    from ..research_overfit import formal_overfit_governance
+    from .event_audit import run_event_audit
+    with frozen_panel(panel_glob, market) as snap:
+        audit = _evaluate_full_vector(expression, universe_n, horizon, portfolio_mode, direction,
+            panel_glob, cost_bps, market, evaluation_overrides, direction_policy)
+        cfg = evaluation_config(market, evaluation_overrides)
+        if cost_bps is not None:
+            cfg["base_cost_bps"] = float(cost_bps)
+        audit["audit_provenance"] = build_run_provenance(expression,
+            {**cfg, "universe_n": universe_n, "horizon": horizon, "portfolio_mode": portfolio_mode,
+             "direction": audit["direction"], "isolation": get_layer_bounds(market), "audit_revision": AUDIT_REVISION},
+            str(snap.trading_dates[0]), str(snap.trading_dates[-1]), snap.trading_dates)
+        if snap.manifest.get("immutable_inputs_available"):
+            audit["event_audit"] = run_event_audit(expression, universe_n, horizon, portfolio_mode,
+                audit["direction"], market, panel_glob, cfg, snap, audit_artifact_dir)
+        else:
+            audit["event_audit"] = {"passed": False, "status": "INSUFFICIENT_DATA", "failure_reasons": ["immutable_input_snapshot_missing"]}
+        evidence = audit.get("raw_return_evidence")
+        history = list(trial_history or [])
+        history.append({"id": "current_audit", "statistic": {"raw_return_evidence": evidence}})
+        governance = formal_overfit_governance(history, evidence, direction=audit["direction"],
+            predeclared_trials=int(cfg["multiple_testing_trials"]))
+        if trial_history is None:
+            governance.update(passed=False, status="INSUFFICIENT_DATA")
+            governance["reasons"].append("registered_trial_history_not_supplied")
+        audit["overfit_governance"] = governance
+        eligibility = audit["eligibility"]
+        eligibility.update(event_pass=bool(audit["event_audit"]["passed"]),
+            snapshot_pass=bool(audit["audit_provenance"]["immutable_inputs_available"]),
+            overfit_pass=bool(governance["passed"]))
+        for key in ("event_pass", "snapshot_pass", "overfit_pass"):
+            if not eligibility[key]:
+                eligibility["failure_reasons"].append(key)
+        eligibility["eligible"] = all(eligibility.get(k, False) for k in (
+            "research_pass", "holdout_pass", "vault_pass", "capacity_pass", "event_pass", "snapshot_pass", "overfit_pass"))
+        if not eligibility["eligible"] and eligibility["grade"] == "F5":
+            eligibility.update(grade="F4", stage="audited_candidate")
+        audit["ranking"]["formal_gate_passed"] = eligibility["eligible"]
+        audit["ranking"]["promotion_blockers"] = [k for k in ("event_pass", "snapshot_pass", "overfit_pass") if not eligibility[k]]
+        return audit
 
 
 def era_detail(

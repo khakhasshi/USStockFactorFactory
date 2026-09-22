@@ -195,7 +195,7 @@ def test_weighted_sleeves_cover_both_markets_and_us_modes(tmp_path: Path, market
     )
     assert {row["factor_id"] for row in result["trades"]} == {"F01", "F02"}
     assert len({row["fill_id"] for row in result["trades"]}) == 2
-    assert (tmp_path / "factor_attribution.csv").exists()
+    assert not (tmp_path / "factor_attribution.csv").exists()
     assert (tmp_path / "factor_attribution.parquet").exists()
 
 

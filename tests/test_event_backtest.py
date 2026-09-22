@@ -1,4 +1,6 @@
 import json
+import io
+from backend.app.artifact_exports import csv_chunks
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -284,10 +286,11 @@ class EventLedgerRegressionTests(unittest.TestCase):
             stored = json.loads((Path(tmp) / "manifest.json").read_text())
             self.assertTrue(stored["integrity"]["all_pass"])
             statement_path = Path(tmp) / "settlement_statement.csv"
-            statement = statement_path.read_text()
+            self.assertFalse(statement_path.exists())
+            statement = b"".join(csv_chunks(statement_path)).decode()
             self.assertIn("commission", statement)
             self.assertIn("cash_after", statement)
-            csv_frame = pl.read_csv(statement_path)
+            csv_frame = pl.read_csv(io.BytesIO(statement.encode()))
             parquet_frame = pl.read_parquet(
                 Path(tmp) / "settlement_statement.parquet"
             )

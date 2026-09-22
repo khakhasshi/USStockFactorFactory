@@ -20,6 +20,7 @@ from .config import (
     PORT,
     SERVICE_ARCHITECTURE,
     SERVICE_INSTANCE,
+    SERVICE_MARKET,
     is_loopback_host,
 )
 from .data.panel import PanelStore
@@ -28,6 +29,7 @@ from .models import Experiment
 from .observability import OBSERVABILITY
 from .orchestrator import EngineManager
 from .seed import seed_classics
+from .trade_plans import router as trade_plan_router, scheduler as trade_plan_scheduler, initialize as initialize_trade_plans
 
 FRONTEND = Path(__file__).resolve().parent.parent.parent / "frontend"
 
@@ -140,7 +142,9 @@ async def _supervise_bound_research() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await initialize_trade_plans()
     await OBSERVABILITY.start()
+    trade_plan_task = asyncio.create_task(trade_plan_scheduler(), name="manual_trade_plans")
     seed_task = asyncio.create_task(
         seed_classics(),
         name="startup.seed_classics",
@@ -163,6 +167,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        trade_plan_task.cancel()
+        await asyncio.gather(trade_plan_task, return_exceptions=True)
         if not seed_task.done():
             seed_task.cancel()
         if panel_watch_task is not None and not panel_watch_task.done():
@@ -200,6 +206,7 @@ async def service_identity() -> dict:
         "service_architecture": SERVICE_ARCHITECTURE or None,
         "port": PORT,
         "research_autostart": AUTOSTART_RESEARCH,
+        "service_market": SERVICE_MARKET or None,
     }
 
 
@@ -284,6 +291,7 @@ async def favicon() -> Response:
 
 
 app.include_router(router)
+app.include_router(trade_plan_router)
 app.mount("/", StaticFiles(directory=str(FRONTEND), html=True), name="frontend")
 
 

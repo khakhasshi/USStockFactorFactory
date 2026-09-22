@@ -40,6 +40,7 @@ DEFAULT_CONTEXT_POLICY = {
 }
 
 _FORBIDDEN_TRAINING_KEYS = {
+    "raw_return_evidence", "_raw_paths", "event_audit", "overfit_governance", "audit_provenance",
     "holdout",
     "vault",
     "meta_holdout",

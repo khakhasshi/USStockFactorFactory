@@ -2,6 +2,54 @@
   "schema": "factorfactory.research-documents/v1",
   "documents": [
     {
+      "slug": "us-core-74-26-vol-target-20260827",
+      "file": "us-core-74-26-vol-target-20260827.html",
+      "title": "74% #21 + 26% #19组合级波动率降杠杆测试",
+      "subtitle": "固定60日、10%目标波动和0.50至1.00风险系数的真实事件账本审计",
+      "summary": "全样本Sharpe和MDD小幅改善，但CAGR下降且2022收益与Sharpe恶化，结论为NO_TARGET_GAIN。",
+      "category": "多因子研究",
+      "status": "audited_no_target_gain",
+      "published_at": "2026-08-27",
+      "updated_at": "2026-08-27",
+      "tags": ["美股", "多空", "波动率目标", "降杠杆", "Lag-1", "NO_TARGET_GAIN"]
+    },
+    {
+      "slug": "us-dynamic-26-regime-hedge-20260827",
+      "file": "us-dynamic-26-regime-hedge-20260827.html",
+      "title": "动态 #26 Regime Hedge 开关回测",
+      "subtitle": "固定60日、固定5%且严格lag-1的因果动态Hedge事件账本审计",
+      "summary": "以74% #21 + 26% #19为静态基准，检验#26独立费后60日收益开关；真实执行结果为NO_INCREMENTAL_GAIN。",
+      "category": "多因子研究",
+      "status": "audited_no_incremental_gain",
+      "published_at": "2026-08-27",
+      "updated_at": "2026-08-27",
+      "tags": ["美股", "多空", "动态权重", "Regime Hedge", "Lag-1", "NO_INCREMENTAL_GAIN"]
+    },
+    {
+      "slug": "us-2022-regime-hedge-screen-20260827",
+      "file": "us-2022-regime-hedge-screen-20260827.html",
+      "title": "2022 Regime Hedge 因子筛选",
+      "subtitle": "23个独立资金Sleeve的2022弱势年份对冲能力、相关性与Bootstrap审计",
+      "summary": "复刻69% #21 + 26% #19 + 5% #23冻结基准，对其余23个因子执行同口径事件账本筛选并给出固定5%候选探针。",
+      "category": "多因子研究",
+      "status": "audited_candidate_screen",
+      "published_at": "2026-08-27",
+      "updated_at": "2026-08-27",
+      "tags": ["美股", "多空", "2022", "Regime Hedge", "独立袖套", "Bootstrap", "候选筛选"]
+    },
+    {
+      "slug": "third-low-correlation-factor-screen-20260827",
+      "file": "third-low-correlation-factor-screen-20260827.html",
+      "title": "候选因子独立资金 Sleeve 回测数据",
+      "subtitle": "五个候选的独立资金袖套、Bootstrap、四类相关性与固定10%探针",
+      "summary": "复刻72% #21 + 28% #20基准口径，呈现#11/#18/#19/#23/#25的100万美元独立袖套回测数据。",
+      "category": "多因子研究",
+      "status": "audited_data_snapshot",
+      "published_at": "2026-08-27",
+      "updated_at": "2026-08-27",
+      "tags": ["美股", "多空", "独立袖套", "相关性", "Bootstrap", "数据副档"]
+    },
+    {
       "slug": "ashare-four-top100-return-sources-20260822",
       "file": "ashare-four-top100-return-sources-20260822.html",
       "title": "A股四榜Top100收益来源与稳定性报告",

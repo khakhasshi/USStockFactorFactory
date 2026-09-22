@@ -29,6 +29,21 @@ def _panel() -> tuple[pl.DataFrame, list[date]]:
 
 
 class ScreenerEngineTests(unittest.TestCase):
+    def test_execution_inputs_preserve_unrounded_prices(self):
+        frame, dates = _panel()
+        precise = 10.123456789123
+        frame = frame.with_columns(pl.lit(precise).alias('raw_close'))
+        result = screen_cross_section(
+            df=frame, trading_dates=dates, panel_identity='exact-execution-inputs-test',
+            target_date=dates[-1], factors=[{'expression':'close','weight':1,'direction':1}],
+            fields=['open','high','low','close','vol','amount'], universe_n=100, top_n=5, direction='top',
+        )
+        stock = result['stocks'][0]
+        self.assertEqual(stock['raw_close'], round(precise, 4))
+        self.assertEqual(stock['execution_inputs']['raw_close'], precise)
+        self.assertEqual(stock['execution_inputs']['protocol'], 'step_event_execution_inputs_float64_v1')
+        self.assertIn('adv20_prev', stock['execution_inputs'])
+
     def test_single_plan_components_and_cache(self):
         frame, dates = _panel()
         kwargs = {

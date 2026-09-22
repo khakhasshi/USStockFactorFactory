@@ -24,9 +24,12 @@ from typing import Any, Callable
 
 import polars as pl
 
+from ..artifact_exports import export_metadata
+from ..audit_snapshot import FrozenPanel, build_run_provenance, freeze_panel, pin_backtest_inputs
 from ..config import DEFAULT_PORTFOLIO_MODE, get_dsl_fields
 from ..data.panel import PanelStore
 from ..dsl.engine import parse, required_history
+from .decision import allocation_dollars
 from .fees import (
     ASHARE_WAN2_NO_MIN_PROFILE,
     IBKR_PRO_FIXED_PROFILE,
@@ -78,6 +81,37 @@ def _finite(value: Any) -> bool:
 
 def _round(value: float, digits: int = 6) -> float:
     return round(float(value), digits)
+
+
+def _closed_trade_disclosure(stats: dict, unrealized: float) -> dict:
+    """Closed execution lots are not completed strategies or daily NAV P&L.
+
+    A partial reduction is one closed lot; remaining inventory is marked into
+    NAV but never counted as a winning trade. Financing is owned by the daily
+    account ledger, not arbitrarily allocated across overlapping closed lots.
+    """
+    count = int(stats.get("closed_trades", 0))
+    closed_win_rate = stats.get("win_rate") if count else None
+    closed_pf = stats.get("profit_factor") if count else None
+    return {
+        "closed_lots": count,
+        "closed_lot_win_rate": closed_win_rate,
+        "closed_lot_profit_factor": closed_pf,
+        "win_rate": closed_win_rate,
+        "profit_factor": closed_pf,
+        "trade_statistics_protocol": "closed_execution_lots_excluding_financing_v1",
+        "trade_statistics_status": "AVAILABLE" if count else "NO_CLOSED_LOTS",
+        "trade_statistics_unit": "closed_lot_including_partial_reductions",
+        "trade_statistics_excludes_open_positions": True,
+        "trade_statistics_excludes_financing": True,
+        "unallocated_financing_cost": _round(float(stats.get("borrow_cost", 0)) + float(stats.get("margin_interest", 0)), 6),
+        "open_unrealized_pnl_after_entry_fees": _round(unrealized, 6),
+        "trade_statistics_disclosure": (
+            "PF/胜率只统计已平仓批次（含部分减仓），扣该批次开平仓费用且成交价已含滑点；"
+            "不计未平仓盈亏，不分摊账户借券/融资费用。未平仓按收盘估值进入净值，"
+            "全部融资费用已进入日账本收益；零已平仓批次时PF/胜率不可用。"
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -1038,6 +1072,8 @@ class StepEventBacktester:
             "name": self.names[symbol],
             "side": side,
             "reason": order["reason"],
+            "rebalance_kind": order.get("rebalance_kind"),
+            "target_gross_scale": order.get("target_gross_scale"),
             "order_type": order.get("order_type", "MARKET"),
             "time_in_force": order.get("time_in_force", "DAY"),
             "requested_quantity": _round(requested_abs, 6),
@@ -1335,7 +1371,12 @@ class StepEventBacktester:
             "orders": orders,
         }
 
-    def _target_quantities(self, candidates: list[dict], nlv: float) -> dict[str, float]:
+    def _target_quantities(
+        self,
+        candidates: list[dict],
+        nlv: float,
+        gross_scale: float = 1.0,
+    ) -> dict[str, float]:
         eligible = [
             row for row in candidates
             if int(row.get("univ_rank") or 10**9) <= self.config.universe_n
@@ -1362,41 +1403,17 @@ class StepEventBacktester:
         lot = self.config.lot_size
 
         def dollars_for(rows: list[dict], gross_target: float) -> list[float]:
-            if not rows or nlv <= 0 or gross_target <= 0:
-                return []
-            budget = nlv * gross_target
-            cap = nlv * self.config.max_position_weight
-            if self.config.position_sizing == "atr_risk":
-                stop_multiple = self.config.exit_policy.atr_stop_multiple or 2.0
-                values = []
-                for row in rows:
-                    atr_pct = float(row.get("_atr_pct") or 0.0)
-                    risk_dollars = (
-                        nlv * self.config.risk_per_position_fraction
-                        / max(0.0025, atr_pct * stop_multiple)
-                    )
-                    values.append(min(cap, risk_dollars))
-                total = sum(values)
-                scale = min(1.0, budget / total) if total > 0 else 0.0
-                return [value * scale for value in values]
-            if self.config.position_sizing == "inverse_volatility":
-                raw = [1.0 / max(0.01, float(row.get("_vol20_prev") or 0.0)) for row in rows]
-            else:
-                raw = [1.0] * len(rows)
-            total = sum(raw)
-            values = [min(cap, budget * value / total) for value in raw]
-            # Redistribute residual budget without breaching the name cap.
-            for _ in range(4):
-                residual = budget - sum(values)
-                available = [index for index, value in enumerate(values) if value < cap - 1e-8]
-                if residual <= 1e-8 or not available:
-                    break
-                share = residual / len(available)
-                for index in available:
-                    values[index] = min(cap, values[index] + share)
-            return values
+            return allocation_dollars(
+                rows, nlv=nlv, gross_target=gross_target,
+                position_sizing=self.config.position_sizing,
+                max_position_weight=self.config.max_position_weight,
+                risk_per_position_fraction=self.config.risk_per_position_fraction,
+                atr_stop_multiple=self.config.exit_policy.atr_stop_multiple,
+            )
 
-        long_target = self.config.effective_long_gross_target
+        if not 0.0 <= gross_scale <= 1.0:
+            raise ValueError("gross_scale 必须在 [0, 1]")
+        long_target = self.config.effective_long_gross_target * gross_scale
         for row, dollars in zip(longs, dollars_for(longs, long_target)):
             quantity = math.floor(dollars / float(row["raw_close"]) / lot) * lot
             if quantity > 0:
@@ -1404,7 +1421,10 @@ class StepEventBacktester:
                 self.names[row["ts_code"]] = str(row.get("name") or row["ts_code"])
         for row, dollars in zip(
             shorts,
-            dollars_for(shorts, self.config.effective_short_gross_target),
+            dollars_for(
+                shorts,
+                self.config.effective_short_gross_target * gross_scale,
+            ),
         ):
             quantity = math.floor(dollars / float(row["raw_close"]) / lot) * lot
             if quantity > 0:
@@ -1419,8 +1439,13 @@ class StepEventBacktester:
         execute_date: date,
         candidates: list[dict],
         close_nlv: float,
+        target_gross_scale: float = 1.0,
     ) -> int:
-        targets = self._target_quantities(candidates, close_nlv)
+        targets = self._target_quantities(
+            candidates,
+            close_nlv,
+            gross_scale=target_gross_scale,
+        )
         candidate_by_symbol = {str(row["ts_code"]): row for row in candidates}
         created = 0
         for symbol in sorted(set(self.positions) | set(targets)):
@@ -1448,6 +1473,8 @@ class StepEventBacktester:
                 "time_in_force": "DAY" if self.config.unfilled_order_policy == "cancel" else "GTC",
                 "age_sessions": 0,
                 "atr_pct_at_signal": candidate_by_symbol.get(symbol, {}).get("_atr_pct"),
+                "target_gross_scale": target_gross_scale,
+                "rebalance_kind": "factor_selection",
             }
             self.pending_orders.append(order)
             created += 1
@@ -1477,6 +1504,120 @@ class StepEventBacktester:
                 ),
                 "targets": len(targets),
                 "orders": created,
+                "target_gross_scale": target_gross_scale,
+            },
+        )
+        return created
+
+    def _create_scale_orders(
+        self,
+        *,
+        signal_date: date,
+        execute_date: date,
+        candidates: list[dict],
+        close_nlv: float,
+        target_gross_scale: float,
+    ) -> int:
+        """Scale existing long/short books without refreshing factor selection."""
+        if not 0.0 <= target_gross_scale <= 1.0:
+            raise ValueError("target_gross_scale 必须在 [0, 1]")
+        candidate_by_symbol = {str(row["ts_code"]): row for row in candidates}
+        long_value = sum(
+            max(0.0, quantity)
+            * float(candidate_by_symbol.get(symbol, {}).get("raw_close") or self.last_close.get(symbol, 0.0))
+            for symbol, quantity in self.positions.items()
+        )
+        short_value = sum(
+            abs(min(0.0, quantity))
+            * float(candidate_by_symbol.get(symbol, {}).get("raw_close") or self.last_close.get(symbol, 0.0))
+            for symbol, quantity in self.positions.items()
+        )
+        desired_long = (
+            close_nlv
+            * self.config.effective_long_gross_target
+            * target_gross_scale
+        )
+        desired_short = (
+            close_nlv
+            * self.config.effective_short_gross_target
+            * target_gross_scale
+        )
+        long_scale = desired_long / long_value if long_value > 1e-12 else 0.0
+        short_scale = desired_short / short_value if short_value > 1e-12 else 0.0
+        lot = self.config.lot_size
+        created = 0
+        for symbol in sorted(self.positions):
+            current = float(self.positions[symbol])
+            scale = long_scale if current > 0 else short_scale
+            signed = 1.0 if current > 0 else -1.0
+            target = signed * math.floor(abs(current) * scale / lot) * lot
+            if abs(target - current) < 1e-8:
+                continue
+            reference = float(
+                candidate_by_symbol.get(symbol, {}).get("raw_close")
+                or self.last_close.get(symbol, 0.0)
+            )
+            trade_notional = abs(target - current) * reference
+            target_notional = abs(target) * reference
+            if trade_notional < self.config.min_trade_notional:
+                continue
+            if (
+                target_notional > 0
+                and trade_notional / target_notional
+                < self.config.rebalance_buffer_pct
+            ):
+                continue
+            self._order_seq += 1
+            order = {
+                "order_id": f"ORD-{self._order_seq:08d}",
+                "signal_date": str(signal_date),
+                "execute_date": str(execute_date),
+                "symbol": symbol,
+                "target_quantity": target,
+                "quantity_at_signal": current,
+                "reason": "factor_rebalance_next_open",
+                "order_type": "MARKET",
+                "time_in_force": (
+                    "DAY"
+                    if self.config.unfilled_order_policy == "cancel"
+                    else "GTC"
+                ),
+                "age_sessions": 0,
+                "atr_pct_at_signal": candidate_by_symbol.get(symbol, {}).get("_atr_pct"),
+                "target_gross_scale": target_gross_scale,
+                "rebalance_kind": "portfolio_vol_scale",
+            }
+            self.pending_orders.append(order)
+            created += 1
+            self._emit(
+                signal_date,
+                "CLOSE_SIGNAL",
+                "VOL_SCALE_ORDER_CREATED",
+                symbol=symbol,
+                order_id=order["order_id"],
+                message=(
+                    f"波动率目标缩放至 {target_gross_scale:.6f}，"
+                    f"目标持仓 {target:g}，计划 {execute_date} 开盘执行"
+                ),
+                payload={
+                    "target_quantity": target,
+                    "quantity_at_signal": current,
+                    "execute_date": str(execute_date),
+                    "target_gross_scale": target_gross_scale,
+                },
+            )
+        self._emit(
+            signal_date,
+            "CLOSE_SIGNAL",
+            "VOL_SCALE_SNAPSHOT",
+            message=f"组合波动率缩放生成 {created} 笔次日开盘订单",
+            payload={
+                "orders": created,
+                "target_gross_scale": target_gross_scale,
+                "desired_long_gross": self.config.effective_long_gross_target
+                * target_gross_scale,
+                "desired_short_gross": self.config.effective_short_gross_target
+                * target_gross_scale,
             },
         )
         return created
@@ -1736,6 +1877,8 @@ class StepEventBacktester:
         next_trade_date: date | None,
         rebalance: bool,
         market_by_symbol: dict[str, dict] | None = None,
+        target_gross_scale: float = 1.0,
+        scale_only_rebalance: bool = False,
     ) -> dict:
         """Advance one session and return that session's reconciled state."""
         market = market_by_symbol or {
@@ -1910,22 +2053,34 @@ class StepEventBacktester:
         if self._portfolio_risk_active:
             self._portfolio_risk_active_sessions += 1
 
+        if not 0.0 <= target_gross_scale <= 1.0:
+            raise ValueError("target_gross_scale 必须在 [0, 1]")
         created_orders = 0
         if (
             not portfolio_trigger
             and not portfolio_risk_rearmed
             and not self._portfolio_risk_active
             and self._risk_cooldown_remaining == 0
-            and rebalance
+            and (rebalance or scale_only_rebalance)
             and next_trade_date is not None
             and close_nlv > 0
         ):
-            created_orders = self._create_orders(
-                signal_date=trade_date,
-                execute_date=next_trade_date,
-                candidates=rows,
-                close_nlv=close_nlv,
-            )
+            if rebalance:
+                created_orders = self._create_orders(
+                    signal_date=trade_date,
+                    execute_date=next_trade_date,
+                    candidates=rows,
+                    close_nlv=close_nlv,
+                    target_gross_scale=target_gross_scale,
+                )
+            else:
+                created_orders = self._create_scale_orders(
+                    signal_date=trade_date,
+                    execute_date=next_trade_date,
+                    candidates=rows,
+                    close_nlv=close_nlv,
+                    target_gross_scale=target_gross_scale,
+                )
 
         for symbol, row in market.items():
             if _finite(row.get("raw_close")) and float(row["raw_close"]) > 0:
@@ -1977,6 +2132,8 @@ class StepEventBacktester:
             # SESSION_CLOSE is emitted immediately after this snapshot.
             "events": self._event_seq - event_start + 1,
             "orders_created": created_orders,
+            "target_gross_scale_next_open": _round(target_gross_scale, 8),
+            "scale_only_rebalance": bool(scale_only_rebalance and not rebalance),
             "positions": len(self.positions),
             "borrow_fee": _round(borrow_fee, 6),
             "margin_interest": _round(margin_interest, 6),
@@ -2359,6 +2516,13 @@ class StepEventBacktester:
                 self._online_integrity["max_open_gross_leverage_after_control"], 8
             ),
         }
+        unrealized = sum(
+            float(state.quantity) * (self.last_close.get(symbol, state.avg_entry_price) - state.avg_entry_price)
+            - state.entry_fees_remaining
+            for symbol, state in self.position_states.items()
+            if symbol in self.positions
+        )
+        stats.update(_closed_trade_disclosure(stats, unrealized))
         return {
             "protocol": BACKTEST_PROTOCOL,
             "config": asdict(self.config) | {
@@ -2397,6 +2561,11 @@ class StepEventBacktester:
                     "quantity": _round(quantity, 6),
                     "last_price": _round(self.last_close.get(symbol, 0.0), 6),
                     "market_value": _round(quantity * self.last_close.get(symbol, 0.0), 6),
+                    "unrealized_pnl_after_entry_fees": (
+                        _round(quantity * (self.last_close.get(symbol, 0.0) - self.position_states[symbol].avg_entry_price)
+                               - self.position_states[symbol].entry_fees_remaining, 6)
+                        if symbol in self.position_states else None
+                    ),
                     "state": self.position_states[symbol].snapshot()
                     if symbol in self.position_states else None,
                     "risk_levels": (
@@ -2435,21 +2604,20 @@ def _prepare_backtest_frame(
     forward_horizon: int | None = None,
     dsl_fields: list[str] | tuple[str, ...] | None = None,
     atr_period: int = 14,
+    minimum_sessions: int = 60,
 ) -> tuple[pl.DataFrame, PanelStore]:
     fields = list(dsl_fields or get_dsl_fields(market))
     store = PanelStore.get(panel_glob, market, factor_fields=fields)
-    snapshot_reader = getattr(store, "read_snapshot", None)
-    if callable(snapshot_reader):
-        df, dates, _, _ = snapshot_reader()
-    else:  # Compatibility with lightweight integrations and test doubles.
-        df = store.ensure_loaded()
-        dates = tuple(store.trading_dates)
+    # Freeze before materialization, preserving exactly this generation through
+    # diagnostics and event replay even if the live PanelStore is hot-reloaded.
+    store = freeze_panel(store)
+    df, dates, _, _ = store.read_snapshot()
     pipe = parse(expression, fields)
     start_date = date.fromisoformat(start)
     end_date = date.fromisoformat(end)
     in_range = [value for value in dates if start_date <= value <= end_date]
-    if len(in_range) < 60:
-        raise ValueError("回测样本不足 (有效交易日 < 60)")
+    if len(in_range) < minimum_sessions:
+        raise ValueError(f"样本不足 (有效交易日 < {minimum_sessions})")
     first_index = dates.index(in_range[0])
     history_need = max(required_history(expression), int(atr_period) + 22)
     history_start = dates[max(0, first_index - history_need - 2)]
@@ -2492,6 +2660,9 @@ def _prepare_backtest_frame(
         if forward_column not in df.columns:
             raise ValueError(f"不支持的 forward_horizon: {forward_horizon}")
         select_columns.append(forward_column)
+        for label_column in ("label_entry_date", f"label_exit_date_{int(forward_horizon)}"):
+            if label_column in df.columns:
+                select_columns.append(label_column)
     # Factor semantics must match the evaluator: calculate every DSL stage on
     # the complete market cross-section first, then select securities needed
     # by the requested liquidity universe and position ledger.  Filtering to
@@ -2601,41 +2772,19 @@ def _write_artifacts(result: dict, artifact_dir: Path) -> dict:
             "sha256": _hash_file(path),
             "rows": len(rows),
         }
-    csv_path = artifact_dir / "settlement_statement.csv"
-    if result["trades"]:
-        pl.DataFrame(result["trades"], infer_schema_length=None).write_csv(csv_path)
-    else:
-        csv_path.write_text("fill_id,order_id,signal_date,trade_date\n", encoding="utf-8")
-    files["statement_csv"] = {
-        "filename": csv_path.name,
-        "sha256": _hash_file(csv_path),
-        "rows": len(result["trades"]),
-    }
-    round_trip_csv = artifact_dir / "round_trip_statement.csv"
-    if result.get("round_trips"):
-        pl.DataFrame(
-            result["round_trips"], infer_schema_length=None
-        ).write_csv(round_trip_csv)
-    else:
-        round_trip_csv.write_text(
-            "symbol,entry_date,exit_date,direction,quantity,entry_price,exit_price,net_pnl,exit_reason\n",
-            encoding="utf-8",
-        )
-    files["round_trip_csv"] = {
-        "filename": round_trip_csv.name,
-        "sha256": _hash_file(round_trip_csv),
-        "rows": len(result.get("round_trips", [])),
-    }
-    if result.get("factor_attribution"):
-        attribution_csv = artifact_dir / "factor_attribution.csv"
-        pl.DataFrame(
-            result["factor_attribution"], infer_schema_length=None
-        ).write_csv(attribution_csv)
-        files["factor_attribution_csv"] = {
-            "filename": attribution_csv.name,
-            "sha256": _hash_file(attribution_csv),
-            "rows": len(result["factor_attribution"]),
-        }
+    for key, filename, rows in (
+        ("statement_csv", "settlement_statement.csv", result["trades"]),
+        ("round_trip_csv", "round_trip_statement.csv", result.get("round_trips", [])),
+        ("factor_attribution_csv", "factor_attribution.csv", result.get("factor_attribution", [])),
+    ):
+        if key == "factor_attribution_csv" and not rows:
+            continue
+        files[key] = export_metadata(artifact_dir / filename, len(rows))
+        # Re-running an artifact directory must not serve a stale legacy export.
+        (artifact_dir / filename).unlink(missing_ok=True)
+        (artifact_dir / filename).with_suffix(".csv.gz").unlink(missing_ok=True)
+        from ..artifact_exports import archive_export_descriptor
+        archive_export_descriptor(artifact_dir / filename)
     for key, filename in (
         ("stability_analysis", "stability_analysis.json"),
         ("signal_diagnostics", "signal_diagnostics.json"),
@@ -2665,6 +2814,7 @@ def _write_artifacts(result: dict, artifact_dir: Path) -> dict:
         "monte_carlo": result.get("monte_carlo"),
         "factor_performance_correlation": result.get("factor_performance_correlation"),
         "execution": result.get("execution"),
+        "input_provenance": result.get("input_provenance"),
         "files": files,
     }
     manifest_path = artifact_dir / "manifest.json"
@@ -2676,6 +2826,7 @@ def _write_artifacts(result: dict, artifact_dir: Path) -> dict:
     return manifest
 
 
+@pin_backtest_inputs
 def run_backtest(
     expression: str,
     universe_n: int = 500,
@@ -2727,6 +2878,9 @@ def run_backtest(
     monte_carlo_simulations: int = 2000,
     monte_carlo_block_size_sessions: int = 20,
     monte_carlo_seed: int = 20260824,
+    _prepared_frame_override: pl.DataFrame | None = None,
+    _extra_rebalance_dates: set[date] | None = None,
+    _target_gross_scale_by_signal_date: dict[date, float] | None = None,
 ) -> dict:
     """Run the event engine.
 
@@ -2797,16 +2951,24 @@ def run_backtest(
             "total": None,
         })
     materialize_started = time.perf_counter()
-    frame, _ = _prepare_backtest_frame(
-        expression=expression,
-        universe_n=universe_n,
-        start=start,
-        end=end,
-        panel_glob=panel_glob,
-        market=market,
-        forward_horizon=rebalance_every,
-        atr_period=resolved_exit_policy.atr_period,
-    )
+    if _prepared_frame_override is None:
+        frame, materialized_store = _prepare_backtest_frame(
+            expression=expression,
+            universe_n=universe_n,
+            start=start,
+            end=end,
+            panel_glob=panel_glob,
+            market=market,
+            forward_horizon=rebalance_every,
+            atr_period=resolved_exit_policy.atr_period,
+        )
+    else:
+        materialized_store = None
+        required_columns = {"trade_date", "ts_code", "factor", "univ_rank"}
+        missing = sorted(required_columns - set(_prepared_frame_override.columns))
+        if missing:
+            raise ValueError(f"预计算回测帧缺少字段: {missing}")
+        frame = _prepared_frame_override.sort("trade_date", "ts_code")
     materialize_seconds = time.perf_counter() - materialize_started
     requested_backend = str(
         execution_backend or os.getenv("FF_BACKTEST_BACKEND", "python")
@@ -2821,6 +2983,13 @@ def run_backtest(
     rust_error = None
     rust_total_seconds = None
     rust_is_eligible, rust_reasons = rust_eligibility(config)
+    if (
+        _prepared_frame_override is not None
+        or _extra_rebalance_dates
+        or _target_gross_scale_by_signal_date
+    ):
+        rust_is_eligible = False
+        rust_reasons = [*rust_reasons, "动态因子帧/额外调仓日暂由Python权威引擎执行"]
     if shadow_requested and not capture_detail:
         rust_is_eligible = False
         rust_reasons = [*rust_reasons, "影子逐笔对齐要求capture_detail=true"]
@@ -2842,8 +3011,19 @@ def run_backtest(
     runner = StepEventBacktester(config, capture_detail=capture_detail)
     sessions = frame.partition_by("trade_date", maintain_order=True)
     session_dates = [session["trade_date"][0] for session in sessions]
+    extra_rebalance_dates = set(_extra_rebalance_dates or ())
+    gross_scale_by_signal_date = dict(
+        _target_gross_scale_by_signal_date or {}
+    )
+    prior_target_gross_scale = 1.0
     progress_stride = max(1, len(sessions) // 200)
     for index, session in enumerate(sessions):
+        target_gross_scale = float(
+            gross_scale_by_signal_date.get(session_dates[index], 1.0)
+        )
+        scale_changed = (
+            abs(target_gross_scale - prior_target_gross_scale) > 1e-12
+        )
         runner.step(
             trade_date=session_dates[index],
             rows=session.to_dicts(),
@@ -2852,8 +3032,14 @@ def run_backtest(
                 if index + 1 < len(session_dates)
                 else None
             ),
-            rebalance=index % rebalance_every == 0,
+            rebalance=(
+                index % rebalance_every == 0
+                or session_dates[index] in extra_rebalance_dates
+            ),
+            target_gross_scale=target_gross_scale,
+            scale_only_rebalance=scale_changed,
         )
+        prior_target_gross_scale = target_gross_scale
         completed_sessions = index + 1
         if progress_callback is not None and (
             completed_sessions == 1
@@ -2867,6 +3053,37 @@ def run_backtest(
                 "total": len(sessions),
             })
     result = runner.result()
+    result["input_provenance"] = build_run_provenance(
+        expression, {
+            **asdict(config),
+            "extra_rebalance_signal_dates": sorted(str(value) for value in extra_rebalance_dates),
+            "target_gross_scale_by_signal_date": {str(key): float(value) for key, value in sorted(gross_scale_by_signal_date.items())},
+            "prepared_frame_override": _prepared_frame_override is not None,
+        }, start, end, session_dates, frame,
+        snapshot=materialized_store if isinstance(materialized_store, FrozenPanel) else None,
+    )
+    if _prepared_frame_override is not None:
+        result["input_provenance"]["prepared_frame_override"] = True
+        result["input_provenance"]["immutable_inputs_available"] = False
+        result["input_provenance"]["disclosure"] = "Caller-supplied prepared frame fingerprinted; its source derivation is not independently frozen"
+    result["config"]["rebalance_schedule"] = (
+        "fixed_interval_plus_dynamic_gross_scale"
+        if gross_scale_by_signal_date
+        else (
+            "fixed_interval_plus_declared_extra_signal_dates"
+            if extra_rebalance_dates else "fixed_interval"
+        )
+    )
+    result["config"]["extra_rebalance_signal_dates"] = len(
+        extra_rebalance_dates
+    )
+    result["config"]["dynamic_gross_scale_signal_dates"] = len(
+        gross_scale_by_signal_date
+    )
+    result["config"]["dynamic_gross_scale_timing"] = (
+        "scale observed through t close; target orders execute t+1 raw open"
+        if gross_scale_by_signal_date else None
+    )
     python_event_seconds = time.perf_counter() - python_event_started
     if progress_callback is not None:
         progress_callback({
@@ -3143,6 +3360,7 @@ def _tag_sleeve_rows(rows: list[dict], spec: dict, id_fields: tuple[str, ...]) -
     return tagged
 
 
+@pin_backtest_inputs
 def run_multi_factor_backtest(
     factors: list[dict],
     **kwargs: Any,
@@ -3409,6 +3627,10 @@ def run_multi_factor_backtest(
         "max_open_gross_leverage_after_control": max(float(row["open_gross_exposure"]) for row in combined_daily),
         "factor_count": len(specs),
     }
+    stats.update(_closed_trade_disclosure(stats, sum(
+        float(sleeve_result["stats"].get("open_unrealized_pnl_after_entry_fees", 0))
+        for _, sleeve_result in sleeves
+    )))
     for row in round_trips:
         reason = str(row.get("exit_reason") or "unknown")
         stats["exit_reason_counts"][reason] = stats["exit_reason_counts"].get(reason, 0) + 1
@@ -3615,6 +3837,11 @@ def run_multi_factor_backtest(
         "positions": positions,
         "integrity": integrity,
         "execution": execution,
+        "input_provenance": {
+            "protocol": "immutable_weighted_sleeve_inputs_v1",
+            "immutable_inputs_available": all(bool(r.get("input_provenance", {}).get("immutable_inputs_available")) for _, r in sleeves),
+            "sleeves": [{"factor_id": s["factor_id"], "provenance": r.get("input_provenance")} for s, r in sleeves],
+        },
         "detail_capture": "full_statement_per_factor_sleeve",
     }
     manifest = None

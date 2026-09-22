@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT, SERVICE_MARKET
 from .dsl.engine import expression_to_latex, expression_profile
 from .factors.economics import explain_factor_economics
 
@@ -223,6 +223,8 @@ def build_leaderboard_catalog(project_root: Path = PROJECT_ROOT) -> dict[str, An
             location,
             archive_snapshot,
         )
+        if SERVICE_MARKET and record["market"] != SERVICE_MARKET:
+            continue
         if location == "archive":
             archive_copy_count += 1
         existing = by_identity.get(identity)

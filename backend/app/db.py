@@ -228,8 +228,9 @@ async def init_db() -> None:
             "  AND f.evaluation_protocol = 'legacy_unoriented'"
         ))
         await conn.execute(text(
-            "INSERT INTO experiments (id, name, description, status, research_config) VALUES "
-            "(1, '实验1-初始双层挖掘', '2026-08 首轮: 旧评分函数(exp换手衰减, 无退化检测), 328因子/31外层步; 已冻结存档', 'archived', '{}'::jsonb) "
+            "INSERT INTO experiments (id, name, description, status, research_config) "
+            "SELECT 1, '实验1-初始双层挖掘', '2026-08 首轮: 旧评分函数(exp换手衰减, 无退化检测), 328因子/31外层步; 已冻结存档', 'archived', '{}'::jsonb "
+            "WHERE NOT EXISTS (SELECT 1 FROM experiments) "
             "ON CONFLICT (id) DO NOTHING"
         ))
         await conn.execute(text(

@@ -24,12 +24,14 @@ import numpy as np
 import polars as pl
 
 from .config import PROJECT_ROOT, get_dsl_fields
+from . import feature_cache
 from .data.panel import PanelStore
+from .data.causal import purged_fold_masks, purged_layer_predicate
 from .dsl.engine import normalize_hash, parse, validate
 from .qlib_native import ALPHA158_FEATURES, QLIB_UPSTREAM_COMMIT
 
 
-PROTOCOL = "factorfactory.qlib-joint-residual-distill/v3"
+PROTOCOL = "factorfactory.qlib-joint-residual-distill/v4-purged"
 ARTIFACT_ROOT = PROJECT_ROOT / "var" / "reports" / "qlib-joint"
 AUTOMATED_LAYERS = ("INNER_PUBLIC", "META_TRAIN")
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -229,7 +231,7 @@ def _materialize_matrix(
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{key}.parquet"
     meta_path = cache_dir / f"{key}.json"
-    if cache_path.exists() and meta_path.exists():
+    if feature_cache.exists(cache_path) and meta_path.exists():
         _progress(
             progress_callback,
             phase="feature_cache",
@@ -237,7 +239,7 @@ def _materialize_matrix(
             completed=1,
             total=1,
         )
-        return pl.read_parquet(cache_path), {
+        return feature_cache.read(cache_path), {
             **json.loads(meta_path.read_text(encoding="utf-8")),
             "cache_hit": True,
             "cache_path": str(cache_path.resolve()),
@@ -245,12 +247,12 @@ def _materialize_matrix(
 
     label = f"fwd_{spec.horizon}"
     base_columns = [
-        "trade_date", "ts_code", "layer", "univ_rank", label,
+        "trade_date", "ts_code", "layer", "univ_rank", label, f"label_exit_date_{spec.horizon}",
         *fields,
     ]
     available = [column for column in dict.fromkeys(base_columns) if column in panel.columns]
     lf = panel.select(available).sort("ts_code", "trade_date").lazy()
-    output_columns = ["trade_date", "ts_code", "layer", "univ_rank", label]
+    output_columns = ["trade_date", "ts_code", "layer", "univ_rank", label, f"label_exit_date_{spec.horizon}"]
     feature_total = len(features) + len(incumbent_expressions)
     for feature_index, feature in enumerate(features, start=1):
         lf = parse(feature.expression, fields).apply(lf, alias=feature.name)
@@ -283,8 +285,8 @@ def _materialize_matrix(
         phase="feature_materialize",
         message="物化特征矩阵；该阶段无法可靠预估耗时",
     )
-    automated = lf.select(output_columns).filter(
-        pl.col("layer").is_in(list(AUTOMATED_LAYERS))
+    automated = lf.select(output_columns).cache().filter(
+        purged_layer_predicate(panel, spec.market, spec.horizon, AUTOMATED_LAYERS)
         & (pl.col("univ_rank") <= spec.universe_n)
         & pl.col(label).is_not_null()
     ).collect()
@@ -301,9 +303,7 @@ def _materialize_matrix(
             - 0.5
         ).alias("label")
     ).drop(label)
-    temp_path = cache_path.with_suffix(".tmp.parquet")
-    matrix.write_parquet(temp_path, compression="zstd")
-    os.replace(temp_path, cache_path)
+    feature_cache.write(cache_path, matrix)
     metadata = {
         "schema": PROTOCOL,
         "cache_key": key,
@@ -493,6 +493,7 @@ def _walk_forward_oof(
     folds: int,
     seed: int,
     progress_callback: ProgressCallback | None = None,
+    *, label_exit_dates=None, embargo_sessions=0, incumbent_raw=None,
 ):
     unique_dates = np.unique(dates)
     blocks = [block for block in np.array_split(unique_dates, folds + 1) if len(block)]
@@ -503,8 +504,8 @@ def _walk_forward_oof(
     for index in range(1, len(blocks)):
         train_dates = np.concatenate(blocks[:index])
         test_dates = blocks[index]
-        train_mask = np.isin(dates, train_dates)
-        test_mask = np.isin(dates, test_dates)
+        train_mask, test_mask = purged_fold_masks(dates, test_dates,
+            label_exit_dates=label_exit_dates, embargo_sessions=embargo_sessions)
         if train_mask.sum() < 1000 or test_mask.sum() < 100:
             _progress(
                 progress_callback,
@@ -517,16 +518,30 @@ def _walk_forward_oof(
         processor = _fit_processor(x[train_mask])
         train_x = _transform(x[train_mask], processor)
         test_x = _transform(x[test_mask], processor)
-        model = _train_lgbm(train_x, y[train_mask], test_x, y[test_mask], seed + index)
-        predictions[test_mask] = model.predict(test_x)
+        target = y[train_mask]
+        incumbent_test_prediction = 0.0
+        if incumbent_raw is not None and incumbent_raw.shape[1]:
+            inc_processor = _fit_processor(incumbent_raw[train_mask])
+            inc_train = _transform(incumbent_raw[train_mask], inc_processor)
+            inc_test = _transform(incumbent_raw[test_mask], inc_processor)
+            train_prediction, _ = _ridge_fit_predict(inc_train, target, inc_train)
+            incumbent_test_prediction, _ = _ridge_fit_predict(inc_train, target, inc_test)
+            target = target - train_prediction
+        # Fixed rounds. The OOF fold's labels must not choose early-stopping
+        # rounds, preprocessing, or incumbent residualization coefficients.
+        model = _train_lgbm(train_x, target, np.empty((0, x.shape[1])), np.empty(0), seed + index)
+        predictions[test_mask] = incumbent_test_prediction + model.predict(test_x)
         importances.append(np.asarray(model.feature_importances_, dtype=float))
         fold_rows.append({
             "fold": index,
-            "train_end": str(train_dates[-1]),
-            "test_start": str(test_dates[0]),
+            "train_end": str(np.max(dates[train_mask])),
+            "train_label_exit_max": str(np.max(np.asarray(label_exit_dates)[train_mask])) if label_exit_dates is not None else None,
+            "test_start": str(np.min(dates[test_mask])),
             "test_end": str(test_dates[-1]),
             "train_rows": int(train_mask.sum()),
             "test_rows": int(test_mask.sum()),
+            "embargo_sessions": embargo_sessions,
+            "validation_labels_used_for_fitting": False,
         })
         _progress(
             progress_callback,
@@ -624,11 +639,14 @@ def run_joint_alpha158(
     train_dates = train["trade_date"].to_numpy()
     oof_prediction, fold_importances, fold_rows = _walk_forward_oof(
         train_raw,
-        train_target,
+        train_y,
         train_dates,
         spec.folds,
         spec.seed,
         progress_callback,
+        label_exit_dates=train[f"label_exit_date_{spec.horizon}"].to_numpy(),
+        embargo_sessions=spec.horizon,
+        incumbent_raw=inc_train_raw if incumbent_names else None,
     )
     _progress(
         progress_callback,
@@ -638,7 +656,7 @@ def run_joint_alpha158(
     processor = _fit_processor(train_raw)
     train_x = _transform(train_raw, processor)
     valid_x = _transform(valid_raw, processor)
-    model = _train_lgbm(train_x, train_target, valid_x, valid_target, spec.seed)
+    model = _train_lgbm(train_x, train_target, np.empty((0, train_x.shape[1])), np.empty(0), spec.seed)
     residual_prediction = model.predict(valid_x)
     total_prediction = incumbent_valid_prediction + residual_prediction
     equal_weight_prediction = np.mean(valid_x, axis=1)
@@ -718,9 +736,11 @@ def run_joint_alpha158(
             **_daily_ic(
                 train_dates[oof_mask],
                 oof_prediction[oof_mask],
-                train_target[oof_mask],
+                train_y[oof_mask],
             ),
             "strictly_past_only": True,
+            "metric_target": "raw_forward_rank_label_joint_prediction",
+            "label_boundary_policy": "purged_layer_and_fold_exit_dates_with_h_session_embargo",
             "folds": fold_rows,
         },
         "meta_train": {

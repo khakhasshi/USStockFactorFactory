@@ -2,6 +2,12 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+# Deployment-local settings are intentionally outside version control.
+if [[ -f .service.env ]]; then
+  set -a
+  source .service.env
+  set +a
+fi
 
 service_root="$PWD"
 service_port="${FF_PORT:-10010}"
@@ -87,6 +93,8 @@ start_service() {
     "FF_LLM_MAX_ATTEMPTS=$llm_max_attempts"
     "FF_SKIP_HISTORICAL_FEEDBACK_BACKFILL=$skip_historical_feedback_backfill"
   )
+  [[ -n "${FF_MARKET:-}" ]] && launch_environment+=("FF_MARKET=$FF_MARKET")
+  [[ -n "${FF_SERVICE_MARKET:-}" ]] && launch_environment+=("FF_SERVICE_MARKET=$FF_SERVICE_MARKET")
   [[ -n "$polars_max_threads" ]] && launch_environment+=("POLARS_MAX_THREADS=$polars_max_threads")
   [[ -n "$database_url" ]] && launch_environment+=("FF_DATABASE_URL=$database_url")
   [[ -n "$backtest_artifact_root" ]] && launch_environment+=("FF_BACKTEST_ARTIFACT_ROOT=$backtest_artifact_root")

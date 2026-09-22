@@ -11,9 +11,10 @@ import polars as pl
 
 from .config import get_dsl_fields
 from .data.panel import PanelStore
+from .data.causal import purged_fold_masks, purged_layer_predicate
 from .dsl.engine import normalize_hash, parse, validate
 
-PROTOCOL = "factorfactory.residual-oof-beam/v2"
+PROTOCOL = "factorfactory.residual-oof-beam/v3-purged"
 AUTOMATED_LAYERS = ("INNER_PUBLIC", "META_TRAIN")
 
 
@@ -49,6 +50,8 @@ def time_ordered_oof_residuals(
     folds: int = 5,
     ridge_alpha: float = 1e-3,
     groups: list | np.ndarray | None = None,
+    label_exit_dates: list | np.ndarray | None = None,
+    embargo_sessions: int = 0,
 ) -> np.ndarray:
     """Return expanding-window residuals without training on future folds.
 
@@ -89,6 +92,12 @@ def time_ordered_oof_residuals(
         if index == 0:
             continue
         train_rows = np.concatenate(blocks[:index])
+        if groups is not None:
+            train_mask, test_mask = purged_fold_masks(group_values, np.unique(group_values[test_rows]),
+                label_exit_dates=label_exit_dates, embargo_sessions=embargo_sessions)
+            train_rows, test_rows = np.flatnonzero(train_mask), np.flatnonzero(test_mask)
+        if not len(train_rows) or not len(test_rows):
+            continue
         prediction[test_rows] = _ridge_predict(x[train_rows], y[train_rows], x[test_rows], ridge_alpha)
     return y - prediction
 
@@ -115,12 +124,16 @@ def residual_oof_beam_search(
     turnover: dict[str, float] | None = None,
     complexity: dict[str, float] | None = None,
     groups: list | np.ndarray | None = None,
+    label_exit_dates: list | np.ndarray | None = None,
+    embargo_sessions: int = 0,
 ) -> dict:
     residual = time_ordered_oof_residuals(
         target,
         incumbent_predictions,
         folds=folds,
         groups=groups,
+        label_exit_dates=label_exit_dates,
+        embargo_sessions=embargo_sessions,
     )
     incumbent = np.asarray(incumbent_predictions, dtype=float)
     if incumbent.ndim == 1:
@@ -275,7 +288,8 @@ def build_dsl_residual_oof_artifact(
         raise ValueError("Residual OOF 没有字段合法且未与在位者重复的候选")
     if progress_callback:
         progress_callback({"phase": "feature_graph", "completed": 0, "total": len(incumbents) + len(candidates)})
-    lf = panel.lazy().filter(pl.col("layer").is_in(list(AUTOMATED_LAYERS)))
+    safe_layers = purged_layer_predicate(panel, market, horizon, AUTOMATED_LAYERS)
+    lf = panel.lazy()
     modulus = max(1, int(security_sample_modulus))
     if modulus > 1:
         lf = lf.filter((pl.col("ts_code").hash(seed=1729) % modulus) == 0)
@@ -293,10 +307,10 @@ def build_dsl_residual_oof_artifact(
         aliases[alias] = row
         if progress_callback:
             progress_callback({"phase": "feature_graph", "completed": len(incumbents) + index + 1, "total": len(incumbents) + len(candidates)})
-    columns = ["trade_date", "ts_code", "layer", "univ_rank", label, *incumbent_aliases, *aliases]
+    columns = ["trade_date", "ts_code", "layer", "univ_rank", label, f"label_exit_date_{horizon}", *incumbent_aliases, *aliases]
     matrix = (
-        lf.select(columns)
-        .filter((pl.col("univ_rank") <= int(universe_n)) & pl.col(label).is_finite())
+        lf.select(columns).cache().filter(safe_layers)
+        .filter(pl.col("univ_rank") <= int(universe_n))
         .collect()
     )
     matrix, sampling = _sample_complete_dates(matrix, max(5_000, int(max_rows)))
@@ -313,7 +327,7 @@ def build_dsl_residual_oof_artifact(
                 - 0.5
             ).fill_null(0.0).alias(f"{column}_rank")
         )
-    ranked = matrix.with_columns(*expressions).sort("trade_date", "ts_code")
+    ranked = matrix.with_columns(*expressions).filter(pl.col(label).is_finite()).sort("trade_date", "ts_code")
     target = ranked[f"{label}_rank"].to_numpy().astype(float)
     groups = ranked["trade_date"].to_numpy()
     if incumbent_aliases:
@@ -338,6 +352,8 @@ def build_dsl_residual_oof_artifact(
         beam_width=beam_width,
         complexity=complexity,
         groups=groups,
+        label_exit_dates=ranked[f"label_exit_date_{horizon}"].to_numpy(),
+        embargo_sessions=horizon,
     )
     def enrich(row: dict) -> dict:
         source = aliases[str(row["name"])]
@@ -355,6 +371,7 @@ def build_dsl_residual_oof_artifact(
         "panel_generation": generation,
         "automated_feedback_layers": list(AUTOMATED_LAYERS),
         "holdout_vault_consumed": False,
+        "label_boundary_policy": "purged_layer_and_fold_exit_dates_with_h_session_embargo",
         "rows": ranked.height,
         "dates": ranked["trade_date"].n_unique(),
         "date_min": str(ranked["trade_date"].min()),

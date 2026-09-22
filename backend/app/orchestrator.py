@@ -3052,6 +3052,7 @@ class Engine:
                     ),
                     statistic={
                         "public_score": node.public_score,
+                        "raw_return_evidence": metrics.get("raw_return_evidence") if node.status == "ok" else None,
                         "learning_score": node.public_score,
                         "gate_score": (
                             node.public_metrics.get("discovery") or {}
@@ -4209,6 +4210,7 @@ class Engine:
                     ),
                     statistic={
                         "public_score": node.public_score,
+                        "raw_return_evidence": metrics.get("raw_return_evidence") if node.status == "ok" else None,
                         "learning_score": node.public_score,
                         "gate_score": (
                             node.public_metrics.get("discovery") or {}
