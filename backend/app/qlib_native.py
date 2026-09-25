@@ -23,7 +23,7 @@ from .config import PROJECT_ROOT, get_layer_bounds
 from .dsl.engine import validate
 
 QLIB_NATIVE_SCHEMA = "factorfactory.qlib-native/v1"
-ALPHA158_SCHEMA = "factorfactory.qlib-alpha158/v1"
+ALPHA158_SCHEMA = "factorfactory.qlib-alpha158/v2-pearson"
 QLIB_TASK_INTEGRATION_SCHEMA = "factorfactory.qlib-task-integration/v2"
 QLIB_UPSTREAM_COMMIT = "79633dd9506ea689e5400dea0197717b5b3d74b7"
 QLIB_UPSTREAM_SOURCE = (
@@ -216,8 +216,8 @@ def _rolling_feature_rows(window: int) -> list[Alpha158Feature]:
         ("IMAX", f"ts_argmax(high,{w})/{w}", "extreme_timing"),
         ("IMIN", f"ts_argmin(low,{w})/{w}", "extreme_timing"),
         ("IMXD", f"(ts_argmax(high,{w})-ts_argmin(low,{w}))/{w}", "extreme_timing"),
-        ("CORR", f"ts_corr(close,log(vol+1),{w})", "price_volume"),
-        ("CORD", f"ts_corr(close/({lag_close}+1e-12),log(vol/({lag_vol}+1e-12)+1),{w})", "price_volume"),
+        ("CORR", f"ts_corr_v2(close,log(vol+1),{w})", "price_volume"),
+        ("CORD", f"ts_corr_v2(close/({lag_close}+1e-12),log(vol/({lag_vol}+1e-12)+1),{w})", "price_volume"),
         ("CNTP", f"ts_mean(gt(close,{lag_close}),{w})", "direction_count"),
         ("CNTN", f"ts_mean(lt(close,{lag_close}),{w})", "direction_count"),
         ("CNTD", f"ts_mean(gt(close,{lag_close}),{w})-ts_mean(lt(close,{lag_close}),{w})", "direction_count"),

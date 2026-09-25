@@ -66,6 +66,7 @@ from ..db import (
 )
 from ..dsl.engine import (
     OPERATORS_DOC,
+    DSL_REVISION,
     expression_profile,
     normalize_hash,
     parse,
@@ -173,6 +174,7 @@ from ..search_pool import (
 from ..screener import SCREEN_CACHE, screen_cross_section
 
 router = APIRouter(prefix="/api")
+_batch_evaluation_slots = asyncio.Semaphore(1)
 _similarity_cache: OrderedDict[tuple[int, int, int, float], dict] = OrderedDict()
 _similarity_cache_lock = asyncio.Lock()
 _similarity_cache_stats = {
@@ -380,6 +382,13 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
         current_code_review=current_review,
         current_rating_protocol=FROZEN_RATING_PROTOCOL_VERSION,
     )
+    # Read-time compatibility: never advertise old capital/paper labels when
+    # current evidence gates say no, without rewriting historical audit rows.
+    display_ranking = dict(full_ranking if include_validation else _compact_ranking(validation))
+    if display_ranking.get("available") and not evidence_state.get("formal_factor"):
+        display_ranking["historical_status"] = display_ranking.get("status")
+        display_ranking["status"] = "audit_blocked"
+        display_ranking["formal_gate_passed"] = False
     payload = {
         "id": f.id,
         "experiment_id": f.experiment_id,
@@ -406,9 +415,7 @@ def _factor_payload(f: Factor, include_validation: bool = False) -> dict:
         "evaluation_protocol": f.evaluation_protocol or "legacy_unoriented",
         "eligibility": f.eligibility or {},
         "ranking": (
-            full_ranking
-            if include_validation
-            else _compact_ranking(validation)
+            display_ranking
         ),
         "evaluated_at": str(f.evaluated_at) if f.evaluated_at else None,
         "created_at": str(f.created_at),
@@ -1501,6 +1508,7 @@ async def list_research_records(
         raise HTTPException(400, "limit 必须在 1..500")
     exp_id = experiment_id or await get_active_experiment_id()
     records = await _ranked_research_records(exp_id)
+    from ..discovery_evidence import algorithm_diagnostics, combination_pool
     summaries = task_research_summary(records)
     filtered = records
     if task_name:
@@ -1530,6 +1538,8 @@ async def list_research_records(
             "grant formal factor, holdout, vault, paper, live, or production approval"
         ),
         "tasks": summaries,
+        "algorithm_diagnostics": algorithm_diagnostics(records),
+        "combination_pool": combination_pool(exp_id),
         "total": len(filtered),
         "offset": offset,
         "limit": limit,
@@ -3039,6 +3049,98 @@ async def research_document_to_dsl(req: DocumentToDslRequest):
     return result
 
 
+class BatchEvaluationTask(BaseModel):
+    model_config = {"extra": "forbid"}
+    name: str = Field(default="", max_length=64)
+    universe_n: int = Field(default=500, ge=1, le=1500)
+    horizon: int = Field(default=5, ge=1, le=20)
+    portfolio_mode: str | None = None
+    direction: int = 1
+    cost_bps: float | None = Field(default=None, ge=0, le=1000)
+
+
+class BatchEvaluationRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    experiment_id: int | None = None
+    expression: str = Field(min_length=1, max_length=4000)
+    tasks: list[BatchEvaluationTask] = Field(min_length=1, max_length=32)
+
+
+@router.get("/compute-cache")
+async def compute_cache_status():
+    from ..factor_compute_cache import cache_stats
+    return cache_stats()
+
+
+@router.post("/evaluations/batch")
+async def batch_factor_evaluation(req: BatchEvaluationRequest):
+    from ..eval.harness import evaluate_batch
+    from ..orchestrator import _EVALUATION_SEMAPHORE
+    eid, cfg = await _experiment_context(req.experiment_id)
+    market = cfg.get("market", "us")
+    error = validate(req.expression, get_dsl_fields(market))
+    if error:
+        raise HTTPException(400, error)
+    tasks = []
+    for item in req.tasks:
+        task = item.model_dump(exclude_none=True)
+        task["portfolio_mode"] = task.get("portfolio_mode", cfg.get("portfolio_mode", DEFAULT_PORTFOLIO_MODE))
+        if item.horizon not in {1, 5, 10, 20} or item.direction not in {-1, 1}:
+            raise HTTPException(400, "horizon仅支持1/5/10/20，direction仅支持+1/-1")
+        if task["portfolio_mode"] not in {"long_only", "long_short"} or (market == "ashare" and task["portfolio_mode"] != "long_only"):
+            raise HTTPException(400, "市场与持仓模式不兼容")
+        task["name"] = item.name or f"top{item.universe_n}_{item.horizon}d"
+        task["evaluation_overrides"] = cfg.get("evaluation_config") or {}
+        task["direction_policy"] = cfg.get("direction_policy", DEFAULT_RESEARCH_DIRECTION_POLICY)
+        tasks.append(task)
+    job_id = f"batch-evaluation:{uuid.uuid4().hex}"
+    COMPUTE_PROGRESS.start(job_id, kind="batch_evaluation", title="同因子多配置评价",
+                           experiment_id=eid, phase="queued", completed=0, total=len(tasks))
+    rows = []
+    try:
+        async with _batch_evaluation_slots, _EVALUATION_SEMAPHORE:
+            # Register before compute, even for cache hits. Interrupted batches
+            # retain pending evidence rather than erasing attempted trials.
+            async with SessionLocal() as session:
+                for index, task in enumerate(tasks):
+                    row = Trial(experiment_id=eid, expression=req.expression,
+                        expression_hash=normalize_hash(req.expression), layer="INNER_PUBLIC+META_TRAIN",
+                        task_name=task["name"], search_method="batch_configuration_evaluation",
+                        evaluation_protocol=EVALUATION_PROTOCOL_VERSION, selected=False,
+                        failure_reason="batch_pending_evidence",
+                        statistic={"batch_id": job_id, "index": index, "parameters": task,
+                                   "status": "pending", "formal_eligible": False})
+                    session.add(row)
+                    rows.append(row)
+                await session.commit()
+                for row in rows:
+                    await session.refresh(row)
+                trial_ids = [row.id for row in rows]
+            result = await asyncio.to_thread(evaluate_batch, req.expression, tasks,
+                market=market, panel_glob=cfg.get("panel_glob"),
+                progress_callback=lambda p: COMPUTE_PROGRESS.update(job_id, **p))
+            async with SessionLocal() as session:
+                for trial_id, item in zip(trial_ids, result["results"]):
+                    row = await session.get(Trial, trial_id)
+                    metrics = item.get("metrics") or {}
+                    row.failure_reason = item.get("error") or "; ".join((metrics.get("discovery") or {}).get("failure_reasons", []))
+                    row.statistic = {**row.statistic, "status": item["status"],
+                        "raw_return_evidence": metrics.get("raw_return_evidence"),
+                        "selected_direction": metrics.get("direction"),
+                        "configuration_result": metrics, "formal_eligible": False}
+                    item["trial_id"] = trial_id
+                await session.commit()
+            result["trials_registered"] = True
+            result["job_id"] = job_id
+    except BaseException as exc:
+        COMPUTE_PROGRESS.finish(job_id, state="failed", message="批量评价未完整完成；已登记试验保留", error=str(exc)[:500])
+        raise
+    failed = any(item["status"] != "ok" for item in result["results"])
+    COMPUTE_PROGRESS.finish(job_id, state="failed" if failed else "done",
+                            message="部分配置失败" if failed else "批量评价完成，逐配置试验已登记")
+    return result
+
+
 @router.post("/research-intelligence/residual-beam")
 async def research_residual_beam(req: ResidualBeamRequest):
     job_id = f"residual-beam:{uuid.uuid4().hex[:12]}"
@@ -3700,6 +3802,7 @@ async def update_experiment(eid: int, req: ExperimentPatchReq):
             merged["return_source_governance"] = return_source_governance
             e.research_config = merged
             material_keys = {
+                "dsl_revision",
                 "market",
                 "portfolio_mode",
                 "panel_glob",
@@ -4828,6 +4931,7 @@ async def meta(experiment_id: int | None = None, load_panel: bool = False):
         "dsl_field_contract": field_contract(market),
         "mechanism_families": list(mechanisms_for_market(market)),
         "operators": OPERATORS_DOC,
+        "dsl_revision": DSL_REVISION,
     }
 
 

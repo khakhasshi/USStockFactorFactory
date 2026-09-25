@@ -503,6 +503,7 @@ const FactorLibraryWorkbench = {
         <div class="failure-list" v-if="auditEvidence.event.failure_reasons?.length"><b>事件审计阻断</b><ul><li v-for="reason in auditEvidence.event.failure_reasons" :key="reason">{{ reason }}</li></ul></div>
       </div>
       <div class="card audit-controls">
+        <details v-if="detail.factor.validation?.execution_comparison"><summary>向量与事件执行差异</summary><p class="sub">两种成交模型不是逐笔相等关系；正式资格仍以事件账本及全部审计门槛为准。缺少新协议证据时不推算历史差异。</p><table><tr><th>窗口</th><th>向量 / 事件 Sharpe</th><th>向量 / 事件年化</th><th>向量 / 事件回撤</th><th>事件阻断</th></tr><tr v-for="(c,k) in detail.factor.validation.execution_comparison" :key="k"><td>{{ k }}</td><td>{{ f(c.vector?.sharpe) }} / {{ f(c.event?.sharpe) }}</td><td>{{ pct(c.vector?.ann_return) }} / {{ pct(c.event?.ann_return) }}</td><td>{{ pct(c.vector?.max_drawdown) }} / {{ pct(c.event?.max_drawdown) }}</td><td>{{ c.failure_reasons?.join('；') || (c.event_passed ? 'PASS' : '未通过') }}</td></tr></table></details>
         <div class="panel-title-row"><div><h3>完整审计 + Rating V4.3</h3><span class="sub">冻结面板、代码、实际日期与方向；隔离标签采用 purge/embargo，向量通过后必须通过事件回测与 DSR/PBO 门槛。手动翻向作为新假设重审。</span></div><button class="btn primary" @click="runAudit" :disabled="auditing">{{ auditing ? '审计中…' : '运行完整审计' }}</button></div>
         <div class="form-row"><div><label>股票池</label><input type="number" v-model.number="auditForm.universe_n" /></div><div><label>持有期</label><select v-model.number="auditForm.horizon"><option :value="1">1日</option><option :value="5">5日</option><option :value="10">10日</option><option :value="20">20日</option></select></div><div><label>冻结方向</label><select v-model.number="auditForm.direction"><option :value="1">+1 高值偏多</option><option :value="-1">-1 低值偏多</option></select></div><div><label>基础成本 bps</label><input type="number" v-model.number="auditForm.cost_bps" /></div><div><label>目标资金规模</label><input type="number" v-model.number="auditForm.target_capital" /></div></div>
         <div v-if="auditErr" style="color:var(--red)">{{ auditErr }}</div>
@@ -548,6 +549,7 @@ const FactorLibraryWorkbench = {
       not_applicable_full_window_rating:"全窗口口径",
     })[value] || "未知";
     const rankStatusLabel = value => ({
+      audit_blocked:"正式审计未通过",
       capital_priority_non_pit:"资本候选", paper_priority:"模拟优先",
       passed_low_conviction:"低置信通过", capacity_limited:"容量受限",
       vault_rejected:"Vault 拒绝", holdout_rejected:"OOS 拒绝",
@@ -557,7 +559,7 @@ const FactorLibraryWorkbench = {
     const rankStatusClass = value => (
       value === "capital_priority_non_pit" ? "green"
       : value === "paper_priority" ? "blue"
-      : value?.includes("rejected") ? "red"
+      : value?.includes("rejected") || value === "audit_blocked" ? "red"
       : value ? "amber" : ""
     );
     const componentLabel = value => ({
@@ -2345,12 +2347,23 @@ const ResearchRecordsView = {
   template: `
   <section>
     <div class="selector-heading">
-      <div><div class="eyebrow">TRAINING-SAFE CANDIDATE LEDGER</div><h1>任务研究记录库</h1><p>保留每个已评价候选，按任务内学习分排名；不等同于正式因子、封存验证或交易批准。</p></div>
+      <div><div class="eyebrow">TRAINING-SAFE CANDIDATE LEDGER</div><h1>任务研究记录库</h1><p>探索分用于分配研究资源；独立质量与组合增量分开记录。所有分数均未获前瞻校准，不等同于正式因子或交易批准。</p></div>
       <span class="tag amber">研究记录 ≠ 正式因子</span>
     </div>
     <div class="metric-strip" v-if="data.tasks?.length">
       <div class="metric-card" v-for="task in data.tasks" :key="task.task_name"><span>{{ task.task_name }}</span><b>{{ task.records }}</b><small>有效 {{ task.valid }} · 预筛拒绝 {{ task.pre_eval_rejected || 0 }} · 通过 {{ task.passed }} · 正式 {{ task.formal_factors }} · 最高 {{ num(task.best_learning_score) }}</small></div>
     </div>
+    <details class="card" style="margin-bottom:14px"><summary>算法实际执行与计算预算</summary>
+      <p class="sub">按实际执行方法归因；legacy_unverified 表示旧记录没有保存实际执行方法，不能当作请求算法已执行。历史缺少计时/费用时不推算。这里是观察性统计，不是等预算随机对照实验。</p>
+      <table><tr><th>任务</th><th>请求 → 实际执行</th><th>提案 / 已评价</th><th>回退</th><th>训练通过</th><th>已知计算秒</th></tr>
+        <tr v-for="(r,i) in data.algorithm_diagnostics?.rows || []" :key="i"><td>{{ r.task_name }}</td><td>{{ r.requested }} → {{ r.executed }}</td><td>{{ r.attempts }} / {{ r.evaluated }}</td><td>{{ r.fallbacks }}</td><td>{{ r.training_passed }}</td><td>{{ r.timed_evaluations ? num(r.known_compute_seconds) : '未记录' }}</td></tr></table>
+    </details>
+    <details class="card" style="margin-bottom:14px"><summary>组合增量候选池（{{ data.combination_pool?.length || 0 }} 个任务快照）</summary>
+      <p class="sub">同折重新拟合原组合与扩展组合；仅训练预测证据。费后 Sharpe、可成交性及正式资格仍需事件确认。历史任务没有新协议产物时保持为空。</p>
+      <div v-for="pool in data.combination_pool || []" :key="pool.artifact_sha256 || pool.error"><h3>{{ pool.task_name || pool.status }}</h3><p class="sub">{{ pool.created_at }} · {{ pool.protocol }} · 有效 OOF {{ pool.valid_oof_rows }} · {{ pool.error }}</p>
+        <table><tr><th>路径表达式（不是已冻结交易权重）</th><th>ΔRankIC</th><th>残差 RankIC</th><th>改善日期比例</th></tr><tr v-for="(p,i) in pool.paths || []" :key="i"><td class="mono-expr">{{ p.expressions?.join('；') }}</td><td>{{ num(p.incremental_oof_ic) }}</td><td>{{ num(p.residual_rank_ic) }}</td><td>{{ num(p.stability) }}</td></tr></table>
+      </div>
+    </details>
     <div class="card" style="margin-bottom:14px">
       <div class="form-row">
         <div style="flex:2"><input v-model="q" @keyup.enter="refresh" placeholder="搜索表达式、假设或机制" /></div>
@@ -2362,9 +2375,9 @@ const ResearchRecordsView = {
     </div>
     <div class="card">
       <div class="panel-title-row"><div><h3>候选排名（{{ data.total || 0 }}）</h3><span class="sub">排名仅在各 task 内可比；列表总序按学习分降序展示</span></div></div>
-      <table><tr><th>Task 排名</th><th>学习分</th><th>硬门分</th><th>结果</th><th>机制</th><th>算法 / Epoch</th><th>表达式</th><th>主要失败</th><th>时间</th></tr>
+      <table><tr><th>Task 排名</th><th>探索分 / 独立质量</th><th>硬门分 / 组合增量</th><th>结果</th><th>机制</th><th>算法 / Epoch</th><th>表达式</th><th>主要失败</th><th>时间</th></tr>
         <tr v-for="row in data.records" :key="row.id" class="clickable" @click="open(row)">
-          <td><b>#{{ row.task_rank }}</b><div class="sub">{{ row.task_name }}</div></td><td>{{ num(row.learning_score) }}</td><td>{{ num(row.hard_gate_score) }}</td><td><span class="tag" :class="row.discovery_passed?'green':row.status==='ok'?'amber':'red'">{{ row.discovery_passed?'训练通过':row.status==='ok'?'待改进':row.status==='rejected'?'预筛拒绝':'失败' }}</span><div v-if="row.formal_factor_admitted" class="tag blue">正式研究因子</div><div v-else-if="row.research_candidate_registered" class="tag amber">已登记研究候选</div></td><td>{{ row.mechanism_family }}</td><td>{{ row.search_audit?.algorithm || row.source }}<div class="sub">epoch {{ row.search_audit?.search_epoch || 0 }} · {{ row.search_audit?.health_state || 'legacy' }}<span v-if="row.search_audit?.novelty_retries"> · retry {{ row.search_audit.novelty_retries }}</span></div></td><td class="mono-expr" style="max-width:360px">{{ row.expression || '—' }}</td><td class="sub">{{ row.failure_reasons?.[0] || '—' }}</td><td class="sub">{{ row.created_at?.slice(5,16) }}</td>
+          <td><b>#{{ row.task_rank }}</b><div class="sub">{{ row.task_name }}</div></td><td>{{ num(row.learning_score) }}<div class="sub">独立 {{ num(row.score_channels?.standalone_quality) }}/100</div></td><td>{{ num(row.hard_gate_score) }}<div class="sub">增量 {{ num(row.score_channels?.incremental_quality) }}/100</div></td><td><span class="tag" :class="row.discovery_passed?'green':row.status==='ok'?'amber':'red'">{{ row.discovery_passed?'训练通过':row.status==='ok'?'待改进':row.status==='rejected'?'预筛拒绝':'失败' }}</span><div v-if="row.formal_factor_admitted" class="tag blue">正式研究因子</div><div v-else-if="row.research_candidate_registered" class="tag amber">已登记研究候选</div></td><td>{{ row.mechanism_family }}</td><td>{{ row.search_audit?.executed_algorithm || row.search_audit?.algorithm || row.source }}<div class="sub" v-if="row.search_audit?.fallback_reason">回退：{{ row.search_audit.fallback_reason }}</div><div class="sub">epoch {{ row.search_audit?.search_epoch || 0 }} · {{ row.search_audit?.health_state || 'legacy' }}<span v-if="row.search_audit?.novelty_retries"> · retry {{ row.search_audit.novelty_retries }}</span></div></td><td class="mono-expr" style="max-width:360px">{{ row.expression || '—' }}</td><td class="sub">{{ row.failure_reasons?.[0] || '—' }}</td><td class="sub">{{ row.created_at?.slice(5,16) }}</td>
         </tr>
       </table>
     </div>

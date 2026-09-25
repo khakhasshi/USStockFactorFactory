@@ -445,6 +445,7 @@ def test_residual_arm_consumes_actual_oof_candidate_metadata():
             "independence": 0.74,
             "stability": 0.81,
             "normalized_hash": "candidate-1",
+            "eligible": True,
         }],
     )
     assert proposal.expression == "rank(ts_mean(close, 20))"

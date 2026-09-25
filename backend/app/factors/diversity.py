@@ -80,7 +80,7 @@ def infer_mechanism(expression: str, hypothesis: str = "") -> str:
         return "gap_intraday"
     if fields & _PRICE and fields & _LIQUIDITY:
         return "volume_price_interaction"
-    if "ts_corr" in operators:
+    if operators & {"ts_corr", "ts_corr_v2", "ts_beta", "ts_residual"}:
         return "price_relationship"
     if "ts_std" in operators or {"high", "low"}.issubset(fields):
         return "volatility"
@@ -107,13 +107,13 @@ def mechanism_compatible(expression: str, family: str) -> bool:
     fields = set(profile["fields"])
     operators = set(profile["operators"])
     rules = {
-        "momentum": bool(fields & _PRICE and operators & {"ts_delta", "delay", "ts_mean", "ts_rank"}),
-        "reversal": bool(fields & _PRICE and operators & {"ts_delta", "delay", "ts_mean", "ts_rank"}),
-        "volatility": bool("ts_std" in operators or {"high", "low"}.issubset(fields)),
+        "momentum": bool(fields & _PRICE and operators & {"returns", "ts_delta", "delay", "ts_mean", "ts_rank", "ts_decay_linear", "ts_ewm", "ts_streak"}),
+        "reversal": bool(fields & _PRICE and operators & {"returns", "ts_delta", "delay", "ts_mean", "ts_rank", "ts_drawdown", "ts_bars_since", "ts_robust_zscore"}),
+        "volatility": bool(operators & {"ts_std", "ts_mad", "ts_median"} or {"high", "low"}.issubset(fields)),
         "liquidity": bool(fields & _LIQUIDITY),
         "volume_price_interaction": bool(fields & _PRICE and fields & _LIQUIDITY),
         "gap_intraday": bool("open" in fields and fields & {"close", "high", "low"}),
-        "price_relationship": "ts_corr" in operators,
+        "price_relationship": bool(operators & {"ts_corr", "ts_corr_v2", "ts_beta", "ts_residual"}),
         "valuation": bool(fields & _VALUATION),
         "size": bool(fields & _SIZE),
         "capital_flow": bool(fields & _FLOW),

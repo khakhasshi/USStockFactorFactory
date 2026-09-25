@@ -12,6 +12,9 @@ RUNTIME_IDENTITY_SCHEMA = "factorfactory.runtime-identity/v1"
 _APP_ROOT = Path(__file__).resolve().parent
 _PROJECT_ROOT = _APP_ROOT.parent.parent
 _CRITICAL_FILES = (
+    "backend/app/dsl/engine.py",
+    "backend/app/dsl/operators_v2.py",
+    "backend/app/dsl/grammar_v2.py",
     "backend/app/config.py",
     "backend/app/orchestrator.py",
     "backend/app/search_pool.py",

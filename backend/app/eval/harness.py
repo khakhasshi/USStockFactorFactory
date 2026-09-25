@@ -22,6 +22,7 @@ this protocol, not production approval.
 from __future__ import annotations
 
 import math
+import os
 import time
 import functools
 import inspect
@@ -41,7 +42,7 @@ from ..config import (
     get_layer_bounds,
 )
 from ..data.panel import PanelStore
-from ..dsl.engine import parse
+from ..dsl.engine import parse, expression_profile, DSL_REVISION
 from ..factors.return_path import build_return_path_signature
 from .ranking import build_live_ranking
 
@@ -92,6 +93,8 @@ def _frozen_evaluation(func):
                 result["raw_return_evidence"] = build_trial_return_evidence(paths=raw, context=context,
                     expected_directions=[p["direction"] for p in raw])
             result["audit_revision"] = AUDIT_REVISION
+            result["dsl_revision"] = DSL_REVISION
+            result["operator_semantics"] = expression_profile(params["expression"])
             result["input_snapshot_id"] = snap.manifest["snapshot_id"]
             return result
     return wrapped
@@ -360,12 +363,26 @@ def _prepare_factor_base(
     if fwd not in df.columns:
         raise ValueError(f"不支持的 horizon: {horizon}")
     pipe = parse(expression, get_dsl_fields(market))
+    calendar = df.select("trade_date", "layer").unique().sort("trade_date")
     # Compute rolling/cross-sectional features BEFORE evaluation slicing.
     # A cache is an optimizer barrier: later predicates must not truncate DSL
     # warm-up or change the cross-sectional rank universe.
-    source = pipe.apply(df.lazy()).cache()
+    source_frame = df.lazy()
+    upper = None
+    # All admitted DSL windows are backward-looking. Avoid evaluating unused
+    # later years, while retaining EVERY earlier row and the full historical
+    # cross-section (never trim warmup or filter a future Top-N union here).
+    if os.getenv("FF_EVALUATION_WINDOW_OPTIMIZATIONS", "1") != "0":
+        upper = date_window[1] if date_window is not None else calendar.filter(
+            pl.col("layer").is_in(layers)
+        )["trade_date"].max()
+        if upper is not None:
+            source_frame = source_frame.filter(pl.col("trade_date") <= date.fromisoformat(str(upper)))
+    from ..factor_compute_cache import factor_column
+    cached_factor = factor_column(df, expression, get_dsl_fields(market), market, end=upper)
+    source = (df.lazy().with_columns(cached_factor) if cached_factor is not None
+              else pipe.apply(source_frame)).cache()
     label_exit = f"label_exit_date_{horizon}"
-    calendar = df.select("trade_date", "layer").unique().sort("trade_date")
     if date_window is not None:
         if not layer_name_override:
             raise ValueError("日期窗口评估必须提供独立层名称")
@@ -1885,6 +1902,49 @@ def evaluate(
     }
 
 
+def evaluate_batch(expression: str, tasks: list[dict], *, market: str = "us",
+                   panel_glob: str | None = None, progress_callback=None) -> dict:
+    """One frozen panel, shared causal columns, independent training-only trials.
+
+    No task is implicitly added and no best-of-batch winner is selected. Caller
+    must register each evaluated configuration in its existing trial budget.
+    This endpoint intentionally cannot perform or return HOLDOUT/Vault ratings.
+    """
+    from ..audit_snapshot import frozen_panel
+    from ..factor_compute_cache import cache_stats
+    if not 1 <= len(tasks) <= 32:
+        raise ValueError("批量评价配置数必须为1..32")
+    allowed = {"universe_n", "horizon", "portfolio_mode", "direction", "cost_bps",
+               "evaluation_overrides", "direction_policy", "name"}
+    for task in tasks:
+        if not isinstance(task, dict) or set(task) - allowed:
+            raise ValueError("批量配置包含未知字段；禁止覆盖市场、面板或审计范围")
+    results = []
+    before = cache_stats()
+    with frozen_panel(panel_glob, market) as snapshot:
+        for index, task in enumerate(tasks):
+            kwargs = {k: v for k, v in task.items() if k != "name"}
+            if progress_callback:
+                progress_callback({"phase": "batch_evaluation", "completed": index,
+                                   "total": len(tasks), "message": f"配置 {index + 1}/{len(tasks)}"})
+            try:
+                metrics = evaluate(expression, market=market, panel_glob=panel_glob, **kwargs)
+                results.append({"index": index, "name": task.get("name", str(index + 1)),
+                                "status": "ok", "parameters": task, "metrics": metrics})
+            except Exception as exc:
+                results.append({"index": index, "name": task.get("name", str(index + 1)),
+                                "status": "error", "parameters": task, "error": str(exc)[:500]})
+        if progress_callback:
+            progress_callback({"phase": "batch_evaluation", "completed": len(tasks),
+                               "total": len(tasks), "message": "批量训练评价完成"})
+        return {"protocol": "factorfactory.batch-discovery/v1", "scope": "discovery_only",
+                "expression": expression, "market": market, "input_snapshot_id": snapshot.manifest["snapshot_id"],
+                "results": results, "configuration_trials": len(tasks),
+                "budget_policy": "each_configuration_and_tested_direction_is_a_separate_trial",
+                "holdout_vault_consumed": False, "formal_eligible": False,
+                "cache_before": before, "cache_after": cache_stats()}
+
+
 @_frozen_evaluation
 def _evaluate_full_vector(
     expression: str,
@@ -2054,6 +2114,20 @@ def evaluate_full(
             eligibility.update(grade="F4", stage="audited_candidate")
         audit["ranking"]["formal_gate_passed"] = eligibility["eligible"]
         audit["ranking"]["promotion_blockers"] = [k for k in ("event_pass", "snapshot_pass", "overfit_pass") if not eligibility[k]]
+        if audit["ranking"]["promotion_blockers"]:
+            audit["ranking"]["pre_confirmation_status"] = audit["ranking"].get("status")
+            audit["ranking"]["status"] = "audit_blocked"
+        # These are different execution models, not an equality test. Preserve
+        # both results and explain implementation drag explicitly.
+        comparisons = {}
+        for name, event in (audit["event_audit"].get("windows") or {}).items():
+            vector = (audit["layers"].get(name) or {}).get("net") or {}
+            actual = event.get("stats") or {}
+            comparisons[name] = {"vector": {key: vector.get(key) for key in ("sharpe", "ann_return", "max_drawdown")},
+                "event": {"sharpe": actual.get("sharpe"), "ann_return": actual.get("ann_ret"), "max_drawdown": actual.get("max_dd")},
+                "event_passed": bool(event.get("passed")), "failure_reasons": event.get("failure_reasons", []),
+                "basis": "absolute_net_both; daily_event_versus_horizon_vector_not_identical"}
+        audit["execution_comparison"] = comparisons
         return audit
 
 

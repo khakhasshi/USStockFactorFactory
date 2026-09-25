@@ -1,0 +1,19 @@
+title = "FactorFactory source publication checks"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed non-secret research component identifiers, not API keys"
+regexTarget = "secret"
+regexes = [
+  '''^A0001_large_order_participation$''',
+  '''^A0003_volume_ratio_persistence$''',
+  '''^A0004_float_market_cap_variation$''',
+  '''^U0010_momentum_x_volatility$''',
+  '''^U0013_residual_momentum$''',
+  '''^U0001_share_volume_liquidity$''',
+  '''^U0012_price_relationship$''',
+  '''^U0006_short_reversal$''',
+  '''^naive_equal_7_factors$''',
+]

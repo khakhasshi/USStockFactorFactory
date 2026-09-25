@@ -10,7 +10,7 @@ from .dsl.engine import validate
 from .mechanism_catalog import catalog
 
 
-PROTOCOL = "factorfactory.document-to-dsl/v1"
+PROTOCOL = "factorfactory.document-to-dsl/v2-pearson"
 _TEMPLATES = {
     "trend_multi_scale": "rank(returns(close, 20) + returns(close, 60))",
     "trend_efficiency": "rank(returns(close, 60) / (ts_std(returns(close, 1), 60) + 1e-9))",
@@ -19,7 +19,7 @@ _TEMPLATES = {
     "range_compression": "rank(-ts_mean((high - low) / (close + 1e-9), 20))",
     "volume_burst": "rank(vol / (ts_mean(vol, 20) + 1e-9))",
     "volume_exhaustion": "rank(-returns(close, 5) / (ts_mean(vol, 20) + 1e-9))",
-    "price_volume_confirmation": "rank(ts_corr(returns(close, 1), ts_delta(log(vol), 1), 20))",
+    "price_volume_confirmation": "rank(ts_corr_v2(returns(close, 1), ts_delta(log(vol), 1), 20))",
     "amihud_illiquidity": "rank(ts_mean(abs(returns(close, 1)) / (amount + 1e-9), 20))",
     "overnight_gap": "rank((open - delay(close, 1)) / (delay(close, 1) + 1e-9))",
     "intraday_reversal": "rank(-(close - open) / (open + 1e-9))",

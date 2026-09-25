@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -14,14 +13,18 @@ from .data.panel import PanelStore
 from .data.causal import purged_fold_masks, purged_layer_predicate
 from .dsl.engine import normalize_hash, parse, validate
 
-PROTOCOL = "factorfactory.residual-oof-beam/v3-purged"
+PROTOCOL = "factorfactory.residual-oof-beam/v4-joint-refit"
 AUTOMATED_LAYERS = ("INNER_PUBLIC", "META_TRAIN")
 
 
 def _rank(values: np.ndarray) -> np.ndarray:
+    """Average ranks: ties must never encode input row/security order."""
     order = np.argsort(values, kind="mergesort")
     ranks = np.empty(len(values), dtype=float)
-    ranks[order] = np.arange(len(values), dtype=float)
+    sorted_values = values[order]
+    starts = np.r_[0, np.flatnonzero(sorted_values[1:] != sorted_values[:-1]) + 1]
+    ends = np.r_[starts[1:], len(values)]
+    ranks[order] = np.repeat((starts + ends - 1) / 2.0, ends - starts)
     return ranks
 
 
@@ -31,15 +34,22 @@ def rank_correlation(left: np.ndarray, right: np.ndarray) -> float:
     mask = np.isfinite(left) & np.isfinite(right)
     if int(mask.sum()) < 3:
         return 0.0
+    if np.ptp(left[mask]) <= 1e-12 or np.ptp(right[mask]) <= 1e-12:
+        return 0.0
     value = float(np.corrcoef(_rank(left[mask]), _rank(right[mask]))[0, 1])
     return value if np.isfinite(value) else 0.0
 
 
 def _ridge_predict(train_x, train_y, test_x, alpha: float) -> np.ndarray:
+    # Fit scaling on this training fold only. No imputation from future data.
+    center = np.mean(train_x, axis=0)
+    scale = np.std(train_x, axis=0)
+    scale = np.where(scale > 1e-12, scale, 1.0)
+    train_x, test_x = (train_x - center) / scale, (test_x - center) / scale
     design = np.column_stack([np.ones(len(train_x)), train_x])
     penalty = np.eye(design.shape[1]) * float(alpha)
     penalty[0, 0] = 0.0
-    coefficients = np.linalg.solve(design.T @ design + penalty, design.T @ train_y)
+    coefficients = np.linalg.lstsq(design.T @ design + penalty, design.T @ train_y, rcond=None)[0]
     return np.column_stack([np.ones(len(test_x)), test_x]) @ coefficients
 
 
@@ -55,15 +65,14 @@ def time_ordered_oof_residuals(
 ) -> np.ndarray:
     """Return expanding-window residuals without training on future folds.
 
-    The first block is an explicit warm-up and receives the zero-prediction
-    baseline.  Every later block is predicted using strictly earlier rows.
-    This is intentionally more conservative than ordinary K-fold OOF.
+    Warm-up, embargo and invalid rows remain NaN, never zero-prediction
+    pseudo-OOF observations. Every fitted fold uses strictly prior labels.
     """
     y = np.asarray(target, dtype=float)
     x = np.asarray(incumbent_predictions, dtype=float)
     if x.ndim == 1:
         x = x[:, None]
-    if len(y) != len(x) or len(y) < max(10, folds * 2):
+    if int(folds) < 2 or len(y) != len(x) or len(y) < max(10, folds * 2):
         raise ValueError("target/incumbent rows must match and cover at least two rows per fold")
     if groups is not None:
         group_values = np.asarray(groups)
@@ -87,7 +96,8 @@ def time_ordered_oof_residuals(
                 np.arange(len(y)), min(int(folds), len(y) // 2)
             )
         )
-    prediction = np.zeros(len(y), dtype=float)
+    prediction = np.full(len(y), np.nan, dtype=float)
+    finite = np.isfinite(y) & np.isfinite(x).all(axis=1)
     for index, test_rows in enumerate(blocks):
         if index == 0:
             continue
@@ -96,22 +106,43 @@ def time_ordered_oof_residuals(
             train_mask, test_mask = purged_fold_masks(group_values, np.unique(group_values[test_rows]),
                 label_exit_dates=label_exit_dates, embargo_sessions=embargo_sessions)
             train_rows, test_rows = np.flatnonzero(train_mask), np.flatnonzero(test_mask)
-        if not len(train_rows) or not len(test_rows):
+        train_rows = train_rows[finite[train_rows]]
+        test_rows = test_rows[finite[test_rows]]
+        if len(train_rows) < max(3, x.shape[1] + 2) or not len(test_rows):
             continue
         prediction[test_rows] = _ridge_predict(x[train_rows], y[train_rows], x[test_rows], ridge_alpha)
     return y - prediction
 
 
-@dataclass(frozen=True)
-class BeamCandidate:
-    name: str
-    residual_rank_ic: float
-    incremental_oof_ic: float
-    independence: float
-    stability: float
-    turnover: float
-    complexity: float
-    score: float
+def _date_rows(groups):
+    order = np.argsort(groups, kind="stable")
+    boundaries = np.flatnonzero(groups[order][1:] != groups[order][:-1]) + 1
+    return np.split(order, boundaries)
+
+
+def _ic_path(left, right, groups=None, grouped_rows=None):
+    mask = np.isfinite(left) & np.isfinite(right)
+    if groups is None:
+        return [rank_correlation(left[mask], right[mask])] if mask.sum() >= 3 else []
+    result = []
+    for rows in grouped_rows if grouped_rows is not None else _date_rows(groups):
+        selected = rows[mask[rows]]
+        if len(selected) >= 3:
+            result.append(rank_correlation(left[selected], right[selected]))
+    return result
+
+
+def signal_quality(matrix: pl.DataFrame, column: str) -> dict:
+    finite = pl.col(column).is_finite().fill_null(False)
+    daily = matrix.group_by("trade_date").agg(
+        finite.sum().alias("finite"),
+        pl.col(column).filter(finite).n_unique().alias("unique"),
+    )
+    coverage = float(matrix.select(finite.mean()).item() or 0)
+    variable_days = float(daily.select(((pl.col("finite") >= 3) & (pl.col("unique") >= 2)).mean()).item() or 0)
+    return {"finite_coverage": coverage, "variable_date_fraction": variable_days,
+            "accepted": coverage >= .2 and variable_days >= .2,
+            "thresholds": {"finite_coverage": .2, "variable_date_fraction": .2}}
 
 
 def residual_oof_beam_search(
@@ -126,73 +157,113 @@ def residual_oof_beam_search(
     groups: list | np.ndarray | None = None,
     label_exit_dates: list | np.ndarray | None = None,
     embargo_sessions: int = 0,
+    beam_depth: int = 2,
+    max_joint_fits: int = 64,
 ) -> dict:
-    residual = time_ordered_oof_residuals(
-        target,
-        incumbent_predictions,
-        folds=folds,
-        groups=groups,
-        label_exit_dates=label_exit_dates,
-        embargo_sessions=embargo_sessions,
-    )
+    """Bounded joint-refit beam; predictive evidence, not executable P&L.
+
+    All alternatives use identical finite observations and fold boundaries.
+    Each expansion refits baseline+selected features using only past labels.
+    The beam is adaptively selected training evidence, never an untouched OOS.
+    """
+    if not 1 <= beam_width <= 50 or not 1 <= beam_depth <= 3:
+        raise ValueError("beam_width must be 1..50; beam_depth must be 1..3")
+    y = np.asarray(target, dtype=float)
     incumbent = np.asarray(incumbent_predictions, dtype=float)
     if incumbent.ndim == 1:
         incumbent = incumbent[:, None]
-    rows: list[BeamCandidate] = []
+    group_values = np.asarray(groups) if groups is not None else None
+    grouped_rows = _date_rows(group_values) if group_values is not None else None
+    def ic_path(left, right):
+        return _ic_path(left, right, group_values, grouped_rows)
+    clean = {}
+    rejected = []
     for name, raw in candidates.items():
         prediction = np.asarray(raw, dtype=float)
-        if len(prediction) != len(residual):
+        if prediction.ndim != 1 or len(prediction) != len(y):
             raise ValueError(f"candidate {name!r} length mismatch")
-        residual_ic = rank_correlation(prediction, residual)
-        base_ic = rank_correlation(np.mean(incumbent, axis=1), np.asarray(target, dtype=float))
-        joint_ic = rank_correlation(
-            np.mean(np.column_stack([incumbent, prediction]), axis=1),
-            np.asarray(target, dtype=float),
-        )
-        incremental = joint_ic - base_ic
-        correlations = [abs(rank_correlation(prediction, incumbent[:, index])) for index in range(incumbent.shape[1])]
-        independence = 1.0 - max(correlations, default=0.0)
-        if groups is not None:
-            group_values = np.asarray(groups)
-            group_blocks = np.array_split(
-                np.unique(group_values), min(folds, len(np.unique(group_values)))
-            )
-            blocks = [
-                np.flatnonzero(np.isin(group_values, block))
-                for block in group_blocks
-                if len(block)
-            ]
+        if not np.isfinite(prediction).all() or np.ptp(prediction) <= 1e-12:
+            rejected.append({"name": name, "reason": "nonfinite_or_constant_signal"})
         else:
-            blocks = np.array_split(
-                np.arange(len(prediction)), min(folds, len(prediction))
-            )
-        block_ics = [rank_correlation(prediction[index], residual[index]) for index in blocks]
-        stability = max(0.0, 1.0 - float(np.std(block_ics)))
-        turn = float((turnover or {}).get(name, 0.0))
-        comp = float((complexity or {}).get(name, 0.0))
-        score = 0.35 * residual_ic + 0.25 * incremental + 0.20 * independence + 0.20 * stability - 0.10 * turn - 0.05 * comp
-        rows.append(BeamCandidate(name, residual_ic, incremental, independence, stability, turn, comp, score))
-    rows.sort(key=lambda row: (row.score, row.independence, row.name), reverse=True)
+            clean[name] = prediction
+    common = np.isfinite(y) & np.isfinite(incumbent).all(axis=1)
+    y = np.where(common, y, np.nan)
+    def predict(names):
+        x = np.column_stack([incumbent, *[clean[name] for name in names]])
+        return y - time_ordered_oof_residuals(y, x, folds=folds, groups=group_values,
+            label_exit_dates=label_exit_dates, embargo_sessions=embargo_sessions)
+    baseline = predict(())
+    valid = np.isfinite(baseline) & np.isfinite(y)
+    residual = y - baseline
+    base_path = ic_path(baseline, y)
+    base_ic = float(np.mean(base_path)) if base_path else 0.0
+    cache = {(): baseline}
+    states = [{"names": (), "ic": base_ic}]
+    rows, paths = [], []
+    fit_limit = max(1, int(max_joint_fits))
+    for depth in range(1, beam_depth + 1):
+        expansions = []
+        visited = set()
+        for parent in states:
+            for name in sorted(clean):
+                names = tuple(sorted((*parent["names"], name)))
+                if name in parent["names"] or names in visited:
+                    continue
+                visited.add(names)
+                if names not in cache:
+                    if len(cache) - 1 >= fit_limit:
+                        continue
+                    cache[names] = predict(names)
+                joint = cache[names]
+                pair_mask = valid & np.isfinite(joint)
+                path = ic_path(np.where(pair_mask, joint, np.nan), y)
+                paired_base = ic_path(np.where(pair_mask, baseline, np.nan), y)
+                joint_ic = float(np.mean(path)) if path else 0.0
+                incremental = joint_ic - (float(np.mean(paired_base)) if paired_base else 0.0)
+                parent_path = ic_path(np.where(pair_mask, cache[parent["names"]], np.nan), y)
+                marginal = joint_ic - (float(np.mean(parent_path)) if parent_path else 0.0)
+                # The fitted model determines the incremental prediction direction.
+                residual_path = ic_path(joint - baseline, residual)
+                residual_ic = float(np.mean(residual_path)) if residual_path else 0.0
+                differences = np.asarray(path) - np.asarray(paired_base)
+                stability = float(np.mean(differences > 0)) if len(differences) else 0.0
+                independence = 1 - max((abs(rank_correlation(clean[name][valid], incumbent[valid, j]))
+                    for j in range(incumbent.shape[1])), default=0.0)
+                turn = sum(float((turnover or {}).get(n, 0)) for n in names)
+                comp = sum(float((complexity or {}).get(n, 0)) for n in names)
+                eligible = bool(pair_mask.sum() >= 10 and residual_ic > 1e-6 and incremental > 1e-6 and marginal > 1e-6)
+                score = max(0.0, incremental) * (0.5 + 0.5 * stability) + .1 * max(0.0, residual_ic) * max(0.0, independence)
+                score = score / (1 + .1 * turn + .05 * comp) if eligible else 0.0
+                row = {"name": name, "names": list(names), "residual_rank_ic": residual_ic,
+                    "incremental_oof_ic": incremental, "marginal_oof_ic": marginal,
+                    "independence": independence, "stability": stability, "turnover": turn,
+                    "complexity": comp, "score": score, "eligible": eligible,
+                    "valid_oof_rows": int(pair_mask.sum()), "joint_oof_ic": joint_ic,
+                    "turnover_available": turnover is not None,
+                    "net_sharpe_available": False, "event_confirmation_required": True}
+                if depth == 1:
+                    rows.append(row)
+                if eligible:
+                    expansions.append({"names": names, "ic": joint_ic, "score": score})
+                    paths.append(row)
+        states = sorted(expansions, key=lambda r: (-r["score"], r["names"]))[:beam_width]
+        if not states:
+            break
+    rows.sort(key=lambda row: (-row["score"], row["name"]))
+    accepted = [row for row in rows if row["eligible"]]
     return {
         "protocol": PROTOCOL,
         "folds": folds,
-        "beam_width": min(beam_width, len(rows)),
-        "residual_std": round(float(np.std(residual)), 8),
+        "beam_width": min(beam_width, len(accepted)),
+        "residual_std": round(float(np.nanstd(residual)), 8) if valid.any() else None,
         "date_grouped_folds": groups is not None,
-        "candidates": [
-            {
-                key: (round(value, 8) if isinstance(value, float) else value)
-                for key, value in row.__dict__.items()
-            }
-            for row in rows
-        ],
-        "beam": [
-            {
-                key: (round(value, 8) if isinstance(value, float) else value)
-                for key, value in row.__dict__.items()
-            }
-            for row in rows[:beam_width]
-        ],
+        "valid_oof_rows": int(valid.sum()), "excluded_oof_rows": int((~valid).sum()),
+        "baseline_oof_ic": base_ic, "joint_refits": len(cache) - 1,
+        "fit_budget_exhausted": len(cache) - 1 >= fit_limit,
+        "candidates": rows, "beam": accepted[:beam_width],
+        "combination_paths": sorted(paths, key=lambda r: -r["score"])[:beam_width],
+        "rejected": rejected,
+        "score_scope": "adaptive_training_oof_predictive_increment_not_net_pnl",
     }
 
 
@@ -316,6 +387,12 @@ def build_dsl_residual_oof_artifact(
     matrix, sampling = _sample_complete_dates(matrix, max(5_000, int(max_rows)))
     if matrix.height < 1_000 or matrix["trade_date"].n_unique() < max(10, folds * 2):
         raise ValueError("Residual OOF 训练层样本或完整日期不足")
+    screening = {name: signal_quality(matrix, name) for name in [*incumbent_aliases, *aliases]}
+    if any(not screening[name]["accepted"] for name in incumbent_aliases):
+        raise ValueError("Residual OOF 在位组合存在常数/低覆盖信号，拒绝伪造原组合残差")
+    aliases = {name: row for name, row in aliases.items() if screening[name]["accepted"]}
+    if not aliases:
+        raise ValueError("Residual OOF 所有候选均未通过常数/覆盖率预筛")
     rank_columns = [label, *incumbent_aliases, *aliases]
     expressions = []
     for column in rank_columns:
@@ -369,6 +446,8 @@ def build_dsl_residual_oof_artifact(
         "market": market,
         "panel_identity": identity,
         "panel_generation": generation,
+        "signal_screening": screening,
+        "missing_feature_policy": "training_model_only_neutral_rank_zero_after_coverage_screen",
         "automated_feedback_layers": list(AUTOMATED_LAYERS),
         "holdout_vault_consumed": False,
         "label_boundary_policy": "purged_layer_and_fold_exit_dates_with_h_session_embargo",
@@ -381,4 +460,6 @@ def build_dsl_residual_oof_artifact(
         "sampling": {**sampling, "security_hash_modulus": modulus},
         "candidates": [enrich(row) for row in result["candidates"]],
         "beam": [enrich(row) for row in result["beam"]],
+        "combination_paths": [{**row, "expressions": [aliases[name]["expression"] for name in row["names"]]}
+                              for row in result["combination_paths"]],
     }

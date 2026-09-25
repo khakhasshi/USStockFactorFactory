@@ -15,13 +15,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .dsl.engine import normalize_hash, validate
+from .dsl.engine import normalize_hash, validate, expression_profile, DSL_REVISION
 from .factors.similarity import expression_similarity
 from .miner.agent import mutate_expression, random_expression_for_family
 from .qlib_native import ALPHA158_FEATURES, QLIB_UPSTREAM_COMMIT
 
 
-SEARCH_POOL_SCHEMA_VERSION = "discovery_fabric_l1_v5"
+SEARCH_POOL_SCHEMA_VERSION = "discovery_fabric_l1_v6_dsl2"
 SEARCH_POLICY_SCHEMA = "factorfactory.discovery-fabric/v5"
 SEARCH_HEALTH_SCHEMA = "factorfactory.search-health/v3"
 DEFAULT_SEARCH_HEALTH_CONFIG = {
@@ -164,7 +164,8 @@ def _reward(node: dict) -> float:
 
 
 def _algorithm(node: dict) -> str:
-    return str((node.get("proposal_meta") or {}).get("search_algorithm") or "")
+    meta = node.get("proposal_meta") or {}
+    return str(meta.get("executed_algorithm") or meta.get("search_algorithm") or "")
 
 
 def _compatible_nodes(nodes: list[dict], family: str) -> list[dict]:
@@ -392,7 +393,9 @@ def _quota_ucb(
     for name in algorithms:
         algorithm_nodes = [node for node in unique_nodes if _algorithm(node) == name]
         rewards = [reward_by_id.get(int(node.get("id") or 0), 0.0) for node in algorithm_nodes]
-        final_attempts = [node for node in nodes if _algorithm(node) == name]
+        final_attempts = [node for node in nodes if str((node.get("proposal_meta") or {}).get("requested_algorithm") or
+                           (node.get("proposal_meta") or {}).get("search_algorithm") or "") == name]
+        fallback_attempts = sum(bool((node.get("proposal_meta") or {}).get("dependency_fallback")) for node in final_attempts)
         hidden_duplicate_attempts = sum(
             1
             for node in nodes
@@ -413,6 +416,8 @@ def _quota_ucb(
             "n": len(rewards),
             "unique_evaluations": len(rewards),
             "proposal_attempts": proposal_attempts,
+            "fallback_attempts": fallback_attempts,
+            "fallback_rate": fallback_attempts / max(1, proposal_attempts),
             "hidden_duplicate_resamples": hidden_duplicate_attempts,
             "duplicate_attempts": duplicate_attempts,
             "duplicate_rate": round(
@@ -483,7 +488,7 @@ def _quota_ucb(
             "actual_share": round(n / cohort_total, 6) if cohort_total else 0.0,
             "deficit_trials": round(target * (cohort_total + 1) - n, 6),
         }
-    unseen = [name for name in algorithms if stats[name]["n"] == 0]
+    unseen = [name for name in algorithms if stats[name]["proposal_attempts"] == 0]
     if unseen:
         group = max({ALGORITHM_GROUPS[name] for name in unseen},
                     key=lambda item: (group_stats[item]["deficit_trials"], SEARCH_GROUP_WEIGHTS[item], item))
@@ -500,7 +505,7 @@ def _quota_ucb(
                 members = ["qlib_alpha158_prior"]
             elif len(members) > 1:
                 members = [name for name in members if name != "qlib_alpha158_prior"]
-        chosen = max((stats[name]["mean_reward"] + math.sqrt(2 * math.log(max(2, total)) / stats[name]["n"]) - 0.60 * stats[name]["duplicate_rate"], rng.random(), name)
+        chosen = max((stats[name]["mean_reward"] + math.sqrt(2 * math.log(max(2, total)) / max(1, stats[name]["proposal_attempts"])) - 0.60 * stats[name]["duplicate_rate"] - stats[name]["fallback_rate"], rng.random(), name)
                      for name in members)[2]
         reason = "unique_quota_then_gate_delta_ucb1"
     return chosen, {
@@ -680,6 +685,7 @@ def _residual_oof_candidate(
         row for row in (candidates or [])
         if str(row.get("expression") or "").strip()
         and validate(str(row["expression"]), fields) is None
+        and row.get("eligible", False)
         and (
             not row.get("family")
             or str(row.get("family")) == family
@@ -692,6 +698,7 @@ def _residual_oof_candidate(
             row for row in (candidates or [])
             if str(row.get("expression") or "").strip()
             and validate(str(row["expression"]), fields) is None
+            and row.get("eligible", False)
         ]
     unseen = [
         row for row in valid
@@ -723,6 +730,7 @@ def _residual_oof_candidate(
         "residual_stability": selected.get("stability"),
         "residual_beam_score": selected.get("score"),
         "residual_candidate_hash": selected.get("normalized_hash"),
+        "combination_evidence": {**selected, "evidence_protocol": "factorfactory.residual-oof-beam/v4-joint-refit"},
         "exact_oof_completed_before_full_evaluation": True,
         "fidelity_stage": "actual_training_layer_oof_residual_then_v4_2",
     }
@@ -739,7 +747,7 @@ def _features(expression: str) -> dict[str, float]:
         "function_diversity": len(set(functions)) / max(1, len(functions)),
         "window_mean": min(1.0, sum(numbers) / max(1, len(numbers)) / 252),
         "window_max": min(1.0, max(numbers, default=0) / 504),
-        "rank": float("rank(" in lowered), "corr": float("corr(" in lowered),
+        "rank": float("rank(" in lowered), "corr": float("corr(" in lowered or "corr_v2(" in lowered),
         "volatility": float("std(" in lowered or "atr(" in lowered),
         "returns": float("returns(" in lowered or "delta(" in lowered),
         "fundamental": float(any(field in lowered for field in ("pe_", "pb", "ps_", "mv"))),
@@ -789,7 +797,8 @@ def _mcts(family: str, fields: list[str], nodes: list[dict], rng: random.Random)
     total = len(nodes)
     candidates = []
     for node in sorted(nodes, key=_reward, reverse=True)[:12]:
-        visits = max(1, int((node.get("proposal_meta") or {}).get("mcts_visits") or 1))
+        visits = 1 + sum(1 for child in nodes if
+            (child.get("proposal_meta") or {}).get("selected_parent_id") == node.get("id"))
         prior = .5 + .5 * _reward(node)
         candidates.append((_reward(node) + 1.25 * prior * math.sqrt(total) / (1 + visits), rng.random(), node))
     parent = max(candidates)[2]
@@ -1235,7 +1244,24 @@ def propose_search_seed(*, family: str, fields: list[str], feedback_nodes: list[
     else:  # pragma: no cover - validated algorithm registry is exhaustive
         raise ValueError(f"第一层算法未实现: {algorithm}")
     group = ALGORITHM_GROUPS[algorithm]
+    executed = algorithm
+    if meta.get("dependency_fallback"):
+        executed = "structured_random"
+        if algorithm == "cegis_repair":
+            executed = "grammar_enumerative"
+        elif algorithm == "gbdt_residual_distill":
+            executed = "novelty_search"
+        elif algorithm == "tpe_smac" and parent:
+            executed = "evolutionary"
+        elif algorithm == "qlib_joint_residual_distill" and meta.get("qlib_feature"):
+            executed = "qlib_alpha158_prior"
+    if targeted_branch:
+        executed = "conditional_gate_probe"
     metadata = {"search_pool_schema": SEARCH_POOL_SCHEMA_VERSION, "search_algorithm": algorithm,
+                "dsl_revision": DSL_REVISION, "operator_profile": expression_profile(expression),
+                "requested_algorithm": algorithm, "executed_algorithm": executed,
+                "fallback_reason": meta.get("dependency_fallback"),
+                "algorithm_implementation": "training_heuristic_not_independent_strategy",
                 "search_group": group, "search_group_target_share": SEARCH_GROUP_WEIGHTS[group],
                 "search_action": action, "search_policy": policy,
                 "search_epoch": health["search_epoch"],

@@ -134,7 +134,7 @@ def _price_scale_invariant(node: ast.AST) -> bool:
         return False
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         fn = node.func.id
-        if fn in {"ts_corr", "ts_rank", "sign"}:
+        if fn in {"ts_corr", "ts_corr_v2", "ts_rank", "sign", "returns", "ts_robust_zscore", "ts_drawdown"}:
             return True
         price_args = [arg for arg in node.args if _contains_price(arg)]
         return bool(price_args) and all(
@@ -190,4 +190,3 @@ def audit_expression_semantics(expression: str, market: str) -> dict[str, Any]:
         "price_scale_invariant": _price_scale_invariant(root),
         "audit_fingerprint": hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16],
     }
-

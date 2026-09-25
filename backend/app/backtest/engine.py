@@ -28,7 +28,7 @@ from ..artifact_exports import export_metadata
 from ..audit_snapshot import FrozenPanel, build_run_provenance, freeze_panel, pin_backtest_inputs
 from ..config import DEFAULT_PORTFOLIO_MODE, get_dsl_fields
 from ..data.panel import PanelStore
-from ..dsl.engine import parse, required_history
+from ..dsl.engine import parse, required_history, expression_profile, DSL_REVISION
 from .decision import allocation_dollars
 from .fees import (
     ASHARE_WAN2_NO_MIN_PROFILE,
@@ -291,6 +291,12 @@ class StepEventBacktester:
         fee_schedule_snapshot(config.market, config.resolved_fee_profile)
         self.config = config
         self.capture_detail = bool(capture_detail)
+        # Rollback switch and differential oracle. Caches are scoped to one
+        # immutable session only; direct/realtime calls retain the reference path.
+        self.execution_optimizations = os.getenv("FF_PYTHON_EVENT_OPTIMIZATIONS", "1") != "0"
+        self._valuation_market = None
+        self._valuation_values: dict[str, dict[str, float]] = {}
+        self._valuation_totals: dict[str, tuple[float, float]] = {}
         self.cash = float(config.initial_capital)
         self.positions: dict[str, float] = {}
         self.position_states: dict[str, PositionState] = {}
@@ -484,6 +490,37 @@ class StepEventBacktester:
         return float(self.last_close.get(symbol, 0.0))
 
     def _nlv(self, market: dict[str, dict], field: str) -> tuple[float, float, float]:
+        if market is not self._valuation_market:
+            return self._nlv_reference(market, field)
+        totals = self._valuation_totals.get(field)
+        if totals is None:
+            values = self._valuation_values.setdefault(field, {})
+            long_value = short_value = 0.0
+            # Preserve the reference insertion order and arithmetic exactly.
+            # Do not use incremental sums, numpy reductions or Python sum's
+            # compensated arithmetic near hard leverage/rounding thresholds.
+            for symbol, quantity in self.positions.items():
+                value = values.get(symbol)
+                if value is None:
+                    value = quantity * self._price(symbol, market, field)
+                    values[symbol] = value
+                if value >= 0:
+                    long_value += value
+                else:
+                    short_value += value
+            totals = (long_value, short_value)
+            self._valuation_totals[field] = totals
+        long_value, short_value = totals
+        # Cash is deliberately never cached: fees, financing and writeoffs
+        # can change it independently of a holding's market value.
+        return self.cash + long_value + short_value, long_value, short_value
+
+    def _invalidate_valuation(self, symbol: str) -> None:
+        self._valuation_totals.clear()
+        for values in self._valuation_values.values():
+            values.pop(symbol, None)
+
+    def _nlv_reference(self, market: dict[str, dict], field: str) -> tuple[float, float, float]:
         long_value = 0.0
         short_value = 0.0
         for symbol, quantity in self.positions.items():
@@ -836,6 +873,7 @@ class StepEventBacktester:
             # statement never hides extra quantity decimals.
             after = _round(before * ratio, 6)
             self.positions[symbol] = after
+            self._invalidate_valuation(symbol)
             state = self.position_states.get(symbol)
             if state is not None:
                 state.quantity = after
@@ -1037,6 +1075,7 @@ class StepEventBacktester:
             self.positions.pop(symbol, None)
         else:
             self.positions[symbol] = position_after
+        self._invalidate_valuation(symbol)
         entry_price_before, realized_pnl, holding_sessions = self._update_position_state_for_fill(
             symbol=symbol,
             signed_quantity=signed_quantity,
@@ -1785,6 +1824,7 @@ class StepEventBacktester:
                 )
             self.positions.pop(symbol, None)
             self.position_states.pop(symbol, None)
+            self._invalidate_valuation(symbol)
             self._missing_position_sessions.pop(symbol, None)
             self._online_integrity["stale_position_writeoffs"] += 1
             self._emit(
@@ -1870,6 +1910,33 @@ class StepEventBacktester:
             )
 
     def step(
+        self,
+        *,
+        trade_date: date,
+        rows: list[dict],
+        next_trade_date: date | None,
+        rebalance: bool,
+        market_by_symbol: dict[str, dict] | None = None,
+        target_gross_scale: float = 1.0,
+        scale_only_rebalance: bool = False,
+    ) -> dict:
+        market = market_by_symbol or {str(row["ts_code"]): row for row in rows}
+        self._valuation_values.clear()
+        self._valuation_totals.clear()
+        self._valuation_market = market if self.execution_optimizations else None
+        try:
+            return self._step_impl(
+                trade_date=trade_date, rows=rows, next_trade_date=next_trade_date,
+                rebalance=rebalance, market_by_symbol=market,
+                target_gross_scale=target_gross_scale,
+                scale_only_rebalance=scale_only_rebalance,
+            )
+        finally:
+            self._valuation_market = None
+            self._valuation_values.clear()
+            self._valuation_totals.clear()
+
+    def _step_impl(
         self,
         *,
         trade_date: date,
@@ -2674,10 +2741,17 @@ def _prepare_backtest_frame(
         source = source.with_columns(pl.col("high").alias("raw_high"))
     if "raw_low" not in df.columns:
         source = source.with_columns(pl.col("low").alias("raw_low"))
-    enriched = (
-        pipe.apply(
+    from ..factor_compute_cache import factor_column
+    cached_factor = factor_column(df, expression, fields, market, snapshot=store,
+                                  start=history_start, end=end_date)
+    factor_source = (
+        source.with_columns(cached_factor).filter(pl.col("trade_date").is_between(history_start, end_date))
+        if cached_factor is not None else pipe.apply(
             source.filter(pl.col("trade_date").is_between(history_start, end_date))
         )
+    )
+    enriched = (
+        factor_source
         .with_columns(
             pl.col("close").shift(1).over("ts_code").alias("_prev_close_for_atr"),
             pl.col("vol")
@@ -3009,7 +3083,13 @@ def run_backtest(
         rust_total_seconds = time.perf_counter() - rust_started
     python_event_started = time.perf_counter()
     runner = StepEventBacktester(config, capture_detail=capture_detail)
-    sessions = frame.partition_by("trade_date", maintain_order=True)
+    # Forward labels belong only to diagnostics, never to the event runner.
+    # Keep the complete original frame for IC and provenance below.
+    event_frame = frame.drop([
+        name for name in frame.columns
+        if name.startswith("fwd_") or name.startswith("label_")
+    ]) if runner.execution_optimizations else frame
+    sessions = event_frame.partition_by("trade_date", maintain_order=True)
     session_dates = [session["trade_date"][0] for session in sessions]
     extra_rebalance_dates = set(_extra_rebalance_dates or ())
     gross_scale_by_signal_date = dict(
@@ -3053,6 +3133,8 @@ def run_backtest(
                 "total": len(sessions),
             })
     result = runner.result()
+    result["dsl_revision"] = DSL_REVISION
+    result["operator_semantics"] = expression_profile(expression)
     result["input_provenance"] = build_run_provenance(
         expression, {
             **asdict(config),
@@ -3170,6 +3252,12 @@ def run_backtest(
         backend_used = "python_fallback"
     execution = {
         "requested_backend": requested_backend,
+        "python_optimizations": {
+            "enabled": runner.execution_optimizations,
+            "protocol": "session_exact_valuation_cache_v1",
+            "arithmetic": "reference_order_no_incremental_sums",
+            "diagnostic_labels_excluded_from_event_rows": runner.execution_optimizations,
+        },
         "backend_used": backend_used,
         "python_authoritative": True,
         "rust_eligible": rust_is_eligible,
@@ -3788,6 +3876,9 @@ def run_multi_factor_backtest(
     )
     result = {
         "protocol": MULTI_FACTOR_BACKTEST_PROTOCOL,
+        "dsl_revision": DSL_REVISION,
+        "operator_semantics": [{"factor_id": spec["factor_id"],
+            **expression_profile(spec["expression"])} for spec in specs],
         "config": sleeves[0][1]["config"] | {
             "initial_capital": total_initial,
             "combination_method": "independent_capital_sleeves",

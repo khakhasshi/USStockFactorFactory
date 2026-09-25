@@ -83,6 +83,15 @@ def code_snapshot(root: Path | None = None, *, persist: bool = True) -> dict:
     allowed = {".py", ".rs", ".js", ".ts", ".tsx", ".jsx", ".toml", ".lock"}
     source_paths = sorted({REPO_ROOT / os.fsdecode(p) for p in paths if p and
                            (Path(os.fsdecode(p)).suffix in allowed or Path(os.fsdecode(p)).name == "requirements.txt")})
+    if not source_paths:
+        # Market deployments may be source copies without .git. Freeze only
+        # executable application roots; never recurse into data or secrets.
+        source_paths = sorted({p for directory in (REPO_ROOT / "backend" / "app", REPO_ROOT / "frontend")
+                               for p in directory.rglob("*") if p.is_file() and p.suffix in allowed
+                               and "__pycache__" not in p.parts and not p.is_symlink()})
+        requirements = REPO_ROOT / "requirements.txt"
+        if requirements.is_file():
+            source_paths.append(requirements)
     files = []
     for path in source_paths:
         if path.is_file():

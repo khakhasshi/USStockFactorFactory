@@ -28,10 +28,12 @@ from . import feature_cache
 from .data.panel import PanelStore
 from .data.causal import purged_fold_masks, purged_layer_predicate
 from .dsl.engine import normalize_hash, parse, validate
-from .qlib_native import ALPHA158_FEATURES, QLIB_UPSTREAM_COMMIT
+from .qlib_native import ALPHA158_FEATURES, QLIB_UPSTREAM_COMMIT, Alpha158Feature
+from .dsl.grammar_v2 import candidates as v2_candidates
+from .dsl.operators_v2 import DSL_REVISION
 
 
-PROTOCOL = "factorfactory.qlib-joint-residual-distill/v4-purged"
+PROTOCOL = "factorfactory.qlib-joint-residual-distill/v6-dsl2"
 ARTIFACT_ROOT = PROJECT_ROOT / "var" / "reports" / "qlib-joint"
 AUTOMATED_LAYERS = ("INNER_PUBLIC", "META_TRAIN")
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -88,8 +90,14 @@ def _safe_slug(value: str) -> str:
     return rendered[:96] or "task"
 
 
+def _extension_rows(fields):
+    return [Alpha158Feature(f"DSL2_{family}_{i}", expression, family, 20)
+            for family in ("momentum", "reversal", "volatility", "liquidity", "volume_price_interaction", "gap_intraday", "price_relationship")
+            for i, expression in enumerate(v2_candidates(family, fields, 20))]
+
+
 def _feature_rows(spec: JointModelSpec):
-    rows = list(ALPHA158_FEATURES)
+    rows = list(ALPHA158_FEATURES) + _extension_rows(get_dsl_fields(spec.market))
     if not spec.include_low_fidelity_vwap:
         rows = [row for row in rows if row.name != "VWAP0"]
     return rows
@@ -104,7 +112,8 @@ def _cache_key(spec: JointModelSpec, identity: str, incumbent_expressions: Itera
         "horizon": spec.horizon,
         "max_rows": spec.max_rows,
         "min_meta_dates": spec.min_meta_dates,
-        "features": [row.name for row in _feature_rows(spec)],
+        "features": [(row.name, row.expression) for row in _feature_rows(spec)],
+        "dsl_revision": DSL_REVISION,
         "incumbents": [normalize_hash(value, direction_invariant=True) for value in incumbent_expressions],
         "upstream": QLIB_UPSTREAM_COMMIT,
     }
@@ -428,20 +437,19 @@ def _train_lgbm(train_x, train_y, valid_x, valid_y, seed: int):
 
 
 def _rank_correlation(left: np.ndarray, right: np.ndarray) -> float:
+    from .residual_beam import rank_correlation
     mask = np.isfinite(left) & np.isfinite(right)
     if mask.sum() < 5:
         return 0.0
-    a, b = left[mask], right[mask]
-    ar = np.argsort(np.argsort(a, kind="mergesort"), kind="mergesort")
-    br = np.argsort(np.argsort(b, kind="mergesort"), kind="mergesort")
-    value = np.corrcoef(ar, br)[0, 1]
-    return float(value) if math.isfinite(value) else 0.0
+    return rank_correlation(left[mask], right[mask])
 
 
 def _daily_ic(dates: np.ndarray, prediction: np.ndarray, target: np.ndarray) -> dict:
     values = []
     for day in np.unique(dates):
-        mask = dates == day
+        mask = (dates == day) & np.isfinite(prediction) & np.isfinite(target)
+        if mask.sum() < 5 or np.ptp(prediction[mask]) <= 1e-12 or np.ptp(target[mask]) <= 1e-12:
+            continue
         values.append(_rank_correlation(prediction[mask], target[mask]))
     array = np.asarray(values, dtype=float)
     mean = float(np.mean(array)) if len(array) else 0.0
@@ -561,7 +569,7 @@ def _distilled_candidates(feature_names, importances, *, fields: list[str]) -> l
     stability = 1.0 / (1.0 + matrix.std(axis=0) / (mean + 1e-9))
     score = mean * stability
     order = np.argsort(score)[::-1]
-    lookup = {row.name: row for row in ALPHA158_FEATURES}
+    lookup = {row.name: row for row in [*ALPHA158_FEATURES, *_extension_rows(fields)]}
     top = [feature_names[index] for index in order if feature_names[index] in lookup][:8]
     candidates = []
     seen = set()
@@ -580,13 +588,40 @@ def _distilled_candidates(feature_names, importances, *, fields: list[str]) -> l
             "complexity": len(expression),
         })
 
-    for name in top[:5]:
+    for name in top[:3]:
         add(lookup[name].expression, [name], "stable_feature")
-    for left, right in zip(top[:4], top[1:5]):
+    for left, right in zip(top[:3], top[1:4]):
         a, b = lookup[left].expression, lookup[right].expression
         add(f"rank({a})+rank({b})", [left, right], "equal_rank_blend")
         add(f"rank({a})-rank({b})", [left, right], "signed_rank_contrast")
+        add(f"(rank({a})-0.5)*gt(rank({b}),0.5)", [left, right], "conditional_high_rank_gate")
     return candidates[:12]
+
+
+def _distillation_fidelity(candidates, valid, teacher):
+    """Measured sampled-universe fidelity, not a full DSL execution proof.
+
+    Uses unfilled raw feature values. All validation evidence is META_TRAIN;
+    DSL must still pass the authoritative evaluator on the full panel.
+    """
+    dates = valid["trade_date"].to_numpy()
+    output = []
+    for row in candidates:
+        names = row["components"]
+        ranks = valid.select([(pl.col(n).rank(method="average").over("trade_date") /
+                 (pl.col(n).count().over("trade_date") + 1e-12)).alias(n) for n in names])
+        a = ranks[names[0]].to_numpy()
+        kind = row["distillation_kind"]
+        if kind == "stable_feature":
+            prediction = valid[names[0]].to_numpy()
+        else:
+            b = ranks[names[1]].to_numpy()
+            prediction = a + b if kind == "equal_rank_blend" else a - b if kind == "signed_rank_contrast" else (a - .5) * (b > .5)
+        metrics = _daily_ic(dates, prediction, np.asarray(teacher))
+        output.append({**row, "teacher_fidelity": metrics,
+            "fidelity_scope": "META_TRAIN_sampled_universe_proxy_requires_full_DSL_validation",
+            "teacher_fidelity_passed": bool(metrics["days"] >= 30 and abs(metrics["mean_rank_ic"]) >= .1)})
+    return output
 
 
 def run_joint_alpha158(
@@ -668,6 +703,7 @@ def run_joint_alpha158(
     best_single_prediction = valid_x[:, best_single_index]
     importances = [*fold_importances, np.asarray(model.feature_importances_, dtype=float)]
     candidates = _distilled_candidates(feature_names, importances, fields=get_dsl_fields(spec.market))
+    candidates = _distillation_fidelity(candidates, valid, residual_prediction)
     _progress(
         progress_callback,
         phase="dsl_distillation",
@@ -689,8 +725,9 @@ def run_joint_alpha158(
     incremental_ic = float(joint_metrics["mean_rank_ic"]) - float(
         (incumbent_metrics or {"mean_rank_ic": 0.0})["mean_rank_ic"]
     )
+    search_candidates = [row for row in candidates if row["teacher_fidelity_passed"]]
     search_eligible = _search_eligible(
-        candidates=candidates,
+        candidates=search_candidates,
         joint_metrics=joint_metrics,
         incremental_mean_rank_ic=incremental_ic,
         min_meta_dates=spec.min_meta_dates,
@@ -760,7 +797,8 @@ def run_joint_alpha158(
             },
             "incumbent": incumbent_metrics,
         },
-        "distilled_candidates": candidates,
+        "distilled_candidates": search_candidates,
+        "distillation_diagnostics": candidates,
         "search_eligible": search_eligible,
         "search_eligibility_rule": (
             f"META_TRAIN abs RankIC>=0.01, abs ICIR>=0.10, "

@@ -14,6 +14,7 @@ import numpy as np
 import polars as pl
 
 from ..config import DSL_FIELDS
+from .operators_v2 import DSL_REVISION, OPERATORS_V2, WINDOW_ARGUMENTS, build_v2, upgrade_correlation
 
 _BY_CODE = {"partition_by": "ts_code", "order_by": "trade_date"}
 MAX_EXPRESSION_LENGTH = 4000
@@ -70,7 +71,7 @@ OPERATORS_DOC = {
     "ts_rank(x, w)": "当前值在过去 w 日中的分位",
     "ts_delta(x, w)": "x - delay(x, w)",
     "returns(x, w)": "x / delay(x, w) - 1",
-    "ts_corr(x, y, w)": "w 日滚动相关系数",
+    "ts_corr(x, y, w)": "LEGACY v1相关：分母样本标准差导致约(w-1)/w缩放；只供历史复现，新研究用ts_corr_v2",
     "ts_quantile(x, w, q)": "w 日滚动 q 分位数",
     "ts_slope(x, w)": "w 日线性回归斜率（Qlib 兼容）",
     "ts_rsquare(x, w)": "w 日线性回归 R²（Qlib 兼容）",
@@ -90,14 +91,18 @@ OPERATORS_DOC = {
     "abs(x)": "绝对值",
     "sign(x)": "符号",
 }
+OPERATORS_DOC.update(OPERATORS_V2)
+PROPOSAL_OPERATORS_DOC = {k: v for k, v in OPERATORS_DOC.items() if not k.startswith("ts_corr(")}
 
 
 class FactorPipeline:
     """有序临时列阶段 + 最终表达式; apply 后临时列被丢弃."""
 
-    def __init__(self, stages: list[tuple[str, pl.Expr]], final: pl.Expr) -> None:
+    def __init__(self, stages: list[tuple[str, pl.Expr]], final: pl.Expr,
+                 node_outputs: dict[str, pl.Expr] | None = None) -> None:
         self.stages = stages
         self.final = final
+        self.node_outputs = node_outputs or {}
 
     def apply(self, lf: pl.LazyFrame, alias: str = "factor") -> pl.LazyFrame:
         for name, expr in self.stages:
@@ -108,9 +113,12 @@ class FactorPipeline:
 
 
 class _Builder:
-    def __init__(self, fields: list[str] | None = None) -> None:
+    def __init__(self, fields: list[str] | None = None,
+                 overrides: dict[str, str] | None = None) -> None:
         self.stages: list[tuple[str, pl.Expr]] = []
         self.fields = fields or DSL_FIELDS
+        self.overrides = overrides or {}
+        self.node_outputs: dict[str, pl.Expr] = {}
 
     def _mat(self, expr: pl.Expr) -> pl.Expr:
         name = f"__t{len(self.stages)}"
@@ -140,7 +148,12 @@ class _Builder:
                 return left / (right + 1e-12)
             raise ValueError(f"非法运算符: {type(node.op).__name__}")
         if isinstance(node, ast.Call):
-            return self._call(node)
+            key = ast.dump(node, include_attributes=False)
+            if key in self.overrides:
+                return pl.col(self.overrides[key])
+            result = self._call(node)
+            self.node_outputs[key] = result
+            return result
         raise ValueError(f"非法语法节点: {type(node).__name__}")
 
     def _call(self, node: ast.Call) -> pl.Expr:
@@ -148,6 +161,9 @@ class _Builder:
             raise ValueError("非法调用形式")
         fn = node.func.id
         a = node.args
+        new_operator = build_v2(self, fn, a, _win)
+        if new_operator is not None:
+            return new_operator
 
         def arity(n: int) -> None:
             if len(a) != n:
@@ -246,7 +262,7 @@ class _Builder:
             sum_y2 = self._mat(_ts((x * x).rolling_sum(w, min_samples=w)))
             sum_xy = self._mat(
                 _ts(
-                    x.rolling_sum(
+                    x.fill_null(0.).rolling_sum(
                         w,
                         weights=[float(i) for i in range(1, w + 1)],
                         min_samples=w,
@@ -333,15 +349,19 @@ class _Builder:
 def _degenerate_check(root: ast.expr) -> None:
     """拒绝数学退化子式 (恒常数经 rank 放大浮点噪声可刷分, 实验1已被随机搜索利用)."""
     for n in ast.walk(root):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {"ts_beta", "ts_residual", "cs_residual"}:
+            if len(n.args) >= 2 and ast.dump(n.args[0]) == ast.dump(n.args[1]):
+                raise ValueError("退化表达式: 同一变量的回归恒为常数")
         if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Sub, ast.Div)):
             if ast.dump(n.left) == ast.dump(n.right):
                 raise ValueError("退化表达式: x-x / x/x 恒为常数")
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "ts_corr":
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {"ts_corr", "ts_corr_v2"}:
             if len(n.args) >= 2 and ast.dump(n.args[0]) == ast.dump(n.args[1]):
                 raise ValueError("退化表达式: ts_corr(x, x, w) 恒为 1")
 
 
-def parse(expression: str, fields: list[str] | None = None) -> FactorPipeline:
+def parse(expression: str, fields: list[str] | None = None, *,
+          _overrides: dict[str, str] | None = None) -> FactorPipeline:
     """解析 DSL 表达式为 FactorPipeline; 非法即抛 ValueError."""
     if len(expression) > MAX_EXPRESSION_LENGTH:
         raise ValueError(f"表达式过长（最大 {MAX_EXPRESSION_LENGTH} 字符）")
@@ -352,9 +372,12 @@ def parse(expression: str, fields: list[str] | None = None) -> FactorPipeline:
             f"表达式结构过于复杂（最大 {MAX_EXPRESSION_AST_NODES} 个语法节点）"
         )
     _degenerate_check(tree.body)
-    b = _Builder(fields)
+    # Overrides are internal materialization columns, never a validation bypass.
+    if _overrides:
+        _Builder(fields).build(tree.body)
+    b = _Builder(fields, _overrides)
     final = b.build(tree.body)
-    return FactorPipeline(b.stages, final)
+    return FactorPipeline(b.stages, final, b.node_outputs)
 
 
 def _flatten_root_multiplication(node: ast.expr) -> list[ast.expr]:
@@ -427,6 +450,10 @@ def _history_for_node(node: ast.expr) -> int:
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         fn = node.func.id
         child = max((_history_for_node(arg) for arg in node.args if not isinstance(arg, ast.Constant)), default=1)
+        if fn in WINDOW_ARGUMENTS:
+            return child + _win(node.args[WINDOW_ARGUMENTS[fn]])
+        if fn in {"ts_quantile", "ts_slope", "ts_rsquare", "ts_resi", "ts_argmax", "ts_argmin"}:
+            return child + _win(node.args[1])
         if fn in {"delay", "returns"} and len(node.args) == 2:
             return child + _win(node.args[1])
         if fn in {"ts_mean", "ts_std", "ts_sum", "ts_min", "ts_max", "ts_rank", "ts_delta"} \
@@ -442,7 +469,7 @@ def required_history(expression: str) -> int:
     """Return a safe lookback count used by fast point-in-time screening."""
     tree = ast.parse(expression, mode="eval")
     _degenerate_check(tree.body)
-    return min(1000, max(1, _history_for_node(tree.body)))
+    return max(1, _history_for_node(tree.body))
 
 
 def _latex_name(name: str) -> str:
@@ -521,6 +548,8 @@ def _latex_for_node(node: ast.expr, parent_precedence: int = 0) -> str:
         }
         if fn in rolling:
             return rf"\operatorname{{{rolling[fn]}}}_{{{rendered[1]}}}\left({rendered[0]}\right)"
+        if any(k.startswith(fn + "(") for k in OPERATORS_DOC):
+            return _latex_name(fn) + r"\left(" + ",\\,".join(rendered) + r"\right)"
         raise ValueError(f"无法转换的 DSL 算子: {fn}")
     raise ValueError(f"无法转换的语法节点: {type(node).__name__}")
 
@@ -542,6 +571,8 @@ def expression_profile(expression: str) -> dict:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             operators.append(node.func.id)
+            if node.func.id in WINDOW_ARGUMENTS:
+                windows.append(_win(node.args[WINDOW_ARGUMENTS[node.func.id]]))
             if node.func.id in {
                 "delay",
                 "returns",
@@ -568,6 +599,8 @@ def expression_profile(expression: str) -> dict:
     fields = [name for name in fields if name not in set(operators)]
     canonical = re.sub(r"\s+", "", ast.unparse(tree.body))
     return {
+        "dsl_revision": DSL_REVISION,
+        "correlation_semantics": "mixed_explicit_v1_v2" if {"ts_corr", "ts_corr_v2"} <= set(operators) else "legacy_v1" if "ts_corr" in operators else "pearson_v2" if "ts_corr_v2" in operators else "not_used",
         "canonical": canonical,
         "operators": sorted(set(operators)),
         "fields": sorted(set(fields)),

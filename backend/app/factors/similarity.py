@@ -14,10 +14,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from ..dsl.engine import expression_profile, normalize_hash
+from ..dsl.operators_v2 import WINDOW_ARGUMENTS
 from .diversity import infer_mechanism
 
 _WRAPPERS = {"rank", "zscore", "winsor"}
 _ROLLING = {"ts_mean", "ts_std", "ts_sum", "ts_min", "ts_max", "ts_rank", "ts_delta", "ts_corr", "delay"}
+_ROLLING |= set(WINDOW_ARGUMENTS)
 
 
 def _strip_equivalent_wrappers(node: ast.expr) -> ast.expr:
@@ -54,7 +56,7 @@ def _family(fields: set[str], operators: set[str]) -> str:
         return "volatility"
     if "amount" in fields or "vol" in fields or fields & {"turnover_rate", "volume_ratio"}:
         return "liquidity_volume"
-    if "ts_corr" in operators:
+    if operators & {"ts_corr", "ts_corr_v2", "ts_beta", "ts_residual", "cs_residual"}:
         return "relationship"
     if operators & {"ts_delta", "delay", "ts_rank", "ts_mean"} and fields & {"open", "close"}:
         return "price_trend_reversal"

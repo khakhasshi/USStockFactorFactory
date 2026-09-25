@@ -193,7 +193,8 @@ def test_residual_oof_never_uses_future_blocks():
     changed[24:] += 10_000
     after_future_change = time_ordered_oof_residuals(changed, incumbent, folds=5)
     # A mutation confined to the final fold cannot alter earlier residuals.
-    assert np.allclose(baseline[:24], after_future_change[:24])
+    assert np.isnan(baseline[:6]).all()  # warm-up is not a zero-prediction OOF fold
+    assert np.allclose(baseline[:24], after_future_change[:24], equal_nan=True)
 
 
 def test_residual_oof_keeps_whole_dates_in_the_same_fold():
@@ -208,7 +209,7 @@ def test_residual_oof_keeps_whole_dates_in_the_same_fold():
     after = time_ordered_oof_residuals(
         changed, incumbent, folds=6, groups=groups
     )
-    assert np.allclose(baseline[groups < 11], after[groups < 11])
+    assert np.allclose(baseline[groups < 11], after[groups < 11], equal_nan=True)
 
 
 def test_dsl_residual_artifact_uses_real_training_rows(monkeypatch):

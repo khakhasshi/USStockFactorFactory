@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 from .models import Node
 from .observability import redact_value
+from .discovery_evidence import score_channels
 
 
 RESEARCH_RECORD_SCHEMA_VERSION = "factorfactory.task-research-record/v1"
@@ -67,6 +68,7 @@ def research_record_payload(
         "learning_score": float(
             discovery.get("learning_score", node.public_score or 0.0) or 0.0
         ),
+        "score_channels": score_channels(discovery, proposal, node.status),
         "hard_gate_score": float(discovery.get("gate_score") or 0.0),
         "discovery_passed": bool(discovery.get("passed")),
         "direction": discovery.get("selected_direction"),
@@ -101,6 +103,11 @@ def research_record_payload(
         "targeted_failures": list(proposal.get("targeted_failures") or []),
         "search_audit": {
             "algorithm": proposal.get("search_algorithm"),
+            "requested_algorithm": proposal.get("requested_algorithm", proposal.get("search_algorithm")),
+            "executed_algorithm": proposal.get("executed_algorithm") or "legacy_unverified",
+            "fallback_reason": proposal.get("fallback_reason", proposal.get("dependency_fallback")),
+            "evaluation_seconds": ((public.get("evaluation_runtime") or {}).get("total_ms") / 1000
+                if isinstance((public.get("evaluation_runtime") or {}).get("total_ms"), (int, float)) else None),
             "group": proposal.get("search_group"),
             "search_epoch": proposal.get("search_epoch", 0),
             "health_state": proposal.get("search_health_state"),

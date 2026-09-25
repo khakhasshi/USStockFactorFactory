@@ -175,6 +175,7 @@ class Engine:
         self._qlib_joint_refresh_counts: dict[str, int] = {}
         self._residual_oof_by_task: dict[str, dict] = {}
         self._residual_oof_refresh_counts: dict[str, int] = {}
+        self._residual_campaign_progress: dict[str, dict] = {}
 
     @classmethod
     def get(cls) -> "Engine":
@@ -620,7 +621,7 @@ class Engine:
             if key and key not in seen:
                 seen.add(key)
                 unique.append(str(expression))
-        current_count = len(seen)
+        current_count = await self._discovery_unique_count(task_name)
         refresh_every = int(integration.get("model_refresh_unique_evals") or 100)
         last_count = self._qlib_joint_refresh_counts.get(task_name, -refresh_every)
         cached = self._qlib_joint_by_task.get(task_name) or latest_joint_result(task_key)
@@ -752,6 +753,20 @@ class Engine:
             )
             await self.log(f"Qlib联合模型降级: {exc}", "warning")
 
+    async def _discovery_unique_count(self, task_name: str) -> int:
+        progress = self._residual_campaign_progress.setdefault(task_name, {"cursor": 0, "hashes": set()})
+        async with SessionLocal() as session:
+            rows = (await session.execute(select(Node.id, Node.expression).where(
+                Node.experiment_id == self.exp_id, Node.task_name == task_name,
+                Node.status == "ok", Node.evaluation_protocol == EVALUATION_PROTOCOL_VERSION,
+            ))).all()
+        for row in rows:
+            # Evaluations finish out of ID order. Do not exclude a lower-ID
+            # candidate that completed after a newer one.
+            progress["hashes"].add(self._normalized_expression_hash(str(row.expression or "")))
+            progress["cursor"] = max(progress["cursor"], row.id)
+        return len(progress["hashes"] - {"", None})
+
     async def _prepare_residual_oof_for_task(self, task: dict) -> None:
         """Build a real training-layer residual beam for one task when due."""
         algorithms = set(self._search_algorithms())
@@ -760,6 +775,8 @@ class Engine:
         ):
             return
         task_name = str(task.get("name") or "task")
+        campaign_count = await self._discovery_unique_count(task_name)
+        campaign_hashes = self._residual_campaign_progress[task_name]["hashes"]
         async with SessionLocal() as session:
             rows = list((await session.execute(
                 select(
@@ -790,7 +807,7 @@ class Engine:
                 "score": float(score or 0.0),
                 "family": str((proposal_meta or {}).get("target_family") or ""),
             })
-        current_count = len(unique_rows)
+        current_count = campaign_count
         refresh_every = int(
             (self.task_config.get("search_policy") or {}).get(
                 "residual_oof_refresh_unique_evals", 40
@@ -806,7 +823,7 @@ class Engine:
             return
         fields = get_dsl_fields(self.task_config.get("market"))
         candidate_rows = []
-        candidate_hashes = set(seen)
+        candidate_hashes = set(campaign_hashes)
         candidate_rng = random.Random(
             f"residual-oof:{self.exp_id}:{task_name}:{current_count}"
         )
@@ -883,6 +900,8 @@ class Engine:
                 progress_callback=progress,
             )
             artifact["source_unique_evaluations"] = current_count
+            from .discovery_evidence import persist_residual_artifact
+            artifact = persist_residual_artifact(artifact, self.exp_id, task_name)
             self._residual_oof_by_task[task_name] = artifact
             self._residual_oof_refresh_counts[task_name] = current_count
             self.status["residual_oof"] = {
@@ -2866,6 +2885,9 @@ class Engine:
                     else "new_draft"
                 ),
             }
+            from .discovery_evidence import bind_proposal_evidence
+            proposal_meta = bind_proposal_evidence(expr, proposal_meta,
+                assignment["search_seed"].expression if assignment.get("search_seed") else None)
             self.status["proposal_generation_attempts"] = int(
                 self.status.get("proposal_generation_attempts") or 0
             ) + novelty_retries + 1

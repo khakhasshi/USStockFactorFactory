@@ -8,7 +8,8 @@ import logging
 import random
 
 from ..config import DEFAULT_MINER_TEMPLATE, DSL_FIELDS, get_dsl_fields
-from ..dsl.engine import OPERATORS_DOC, validate
+from ..dsl.engine import PROPOSAL_OPERATORS_DOC as OPERATORS_DOC, validate, upgrade_correlation, DSL_REVISION
+from ..dsl.grammar_v2 import candidates as v2_candidates
 from ..factors.diversity import (
     MECHANISM_LABELS,
     mechanism_compatible,
@@ -60,13 +61,14 @@ def random_expression(
             "{-}",
             "-" if generator.random() < 0.5 else "",
         )
+        expr = upgrade_correlation(expr)
         if validate(expr, fields or _FIELDS) is None:
             return expr
 
     # 内置回退模板
     builtin = [
         lambda: f"-rank(ts_delta(close, {w()}))",
-        lambda: f"rank(ts_corr({field()}, {field()}, {w()}))",
+        lambda: f"rank(ts_corr_v2({field()}, {field()}, {w()}))",
         lambda: f"-zscore(ts_std({field()}, {w()}))",
         lambda: f"rank((close - ts_min(low, {w()})) / (ts_max(high, {w()}) - ts_min(low, {w()})))",
         lambda: f"zscore(ts_mean(amount, {f([3, 5])}) / ts_mean(amount, {f([40, 60])}))",
@@ -159,11 +161,11 @@ def _random_tree_expression_for_family(
             f"({trend_temporal(trend)}/({comparator}+1e-9))",
             f"({trend_temporal(trend)}-ts_mean({ret1}, {slow}))",
             f"ts_mean(sign({ret1}), {medium})",
-            f"ts_corr({trend}, delay({trend}, {fast}), {medium})",
+            f"ts_corr_v2({trend}, delay({trend}, {fast}), {medium})",
             f"ts_rank({trend}, {slow})",
             f"(ts_mean({trend}, {fast})-ts_mean({trend}, {slow}))",
             f"ts_delta({trend}, {medium})",
-            f"ts_corr({trend}, {range1}, {medium})",
+            f"ts_corr_v2({trend}, {range1}, {medium})",
         ])
         prefix = "-" if family == "reversal" else ""
         return f"{prefix}rank({tree})"
@@ -177,11 +179,11 @@ def _random_tree_expression_for_family(
             f"ts_max(abs({base}), {transform_window})",
             f"(ts_std({base}, {fast})/(ts_std({base}, {slow})+1e-9))",
             f"ts_delta(ts_std({base}, {medium}), {fast})",
-            f"ts_corr(abs({ret1}), {range1}, {medium})",
+            f"ts_corr_v2(abs({ret1}), {range1}, {medium})",
             f"ts_std(ts_mean({base}, {fast}), {slow})",
             f"ts_mean(({base})*({base}), {medium})",
             f"(ts_max({base}, {slow})-ts_min({base}, {slow}))",
-            f"ts_corr(abs({base}), abs({other}), {medium})",
+            f"ts_corr_v2(abs({base}), abs({other}), {medium})",
             f"(ts_mean(abs({base}), {fast})/(ts_mean(abs({base}), {slow})+1e-9))",
             f"ts_rank(ts_std({base}, {medium}), {slow})",
         ])
@@ -206,7 +208,7 @@ def _random_tree_expression_for_family(
         base = generator.choice(liquidity_bases)
         tree = generator.choice([
             temporal(base),
-            f"ts_corr({base}, delay({base}, {fast}), {medium})",
+            f"ts_corr_v2({base}, delay({base}, {fast}), {medium})",
             f"(ts_mean({base}, {fast})-ts_mean({base}, {slow}))",
             f"(ts_std({base}, {fast})/(ts_std({base}, {slow})+1e-9))",
         ])
@@ -218,18 +220,18 @@ def _random_tree_expression_for_family(
         price_signal = temporal(price)
         liquidity_signal = temporal(liquidity)
         tree = generator.choice([
-            f"ts_corr({price}, {liquidity}, {medium})",
+            f"ts_corr_v2({price}, {liquidity}, {medium})",
             f"ts_mean(({price})*({liquidity}), {medium})",
             f"ts_mean(sign({price})*({liquidity}), {medium})",
             f"(ts_mean({price}, {fast})/"
             f"(ts_std({liquidity}, {slow})+1e-9))",
-            f"ts_delta(ts_corr({price}, {liquidity}, {medium}), {fast})",
+            f"ts_delta(ts_corr_v2({price}, {liquidity}, {medium}), {fast})",
             f"ts_mean(abs({price})/(amount+1e-9), {medium})",
-            f"ts_corr({price_signal}, {liquidity_signal}, {medium})",
+            f"ts_corr_v2({price_signal}, {liquidity_signal}, {medium})",
             f"ts_mean(({price_signal})*({liquidity_signal}), {medium})",
             f"(ts_mean({price}, {fast})*ts_mean({liquidity}, {slow}))",
             f"(ts_mean({price}, {fast})-ts_mean(sign({price})*({liquidity}), {slow}))",
-            f"ts_corr(ts_rank({price}, {fast}), ts_rank({liquidity}, {fast}), {medium})",
+            f"ts_corr_v2(ts_rank({price}, {fast}), ts_rank({liquidity}, {fast}), {medium})",
             f"ts_delta(ts_mean(sign({price})*({liquidity}), {medium}), {fast})",
         ])
         return f"rank({tree})"
@@ -238,7 +240,7 @@ def _random_tree_expression_for_family(
         base = generator.choice([overnight, intraday, f"({overnight}-{intraday})"])
         tree = generator.choice([
             temporal(base),
-            f"ts_corr({overnight}, {intraday}, {medium})",
+            f"ts_corr_v2({overnight}, {intraday}, {medium})",
             f"(ts_mean({overnight}, {fast})-ts_mean({intraday}, {slow}))",
             f"(ts_mean({base}, {medium})/(ts_std({base}, {slow})+1e-9))",
         ])
@@ -250,10 +252,10 @@ def _random_tree_expression_for_family(
             value for value in price_bases if value != left
         ])
         tree = generator.choice([
-            f"ts_corr({left}, {right}, {medium})",
-            f"ts_delta(ts_corr({left}, {right}, {slow}), {fast})",
-            f"ts_corr(ts_rank({left}, {fast}), ts_rank({right}, {fast}), {medium})",
-            f"ts_corr({left}, delay({right}, {fast}), {medium})",
+            f"ts_corr_v2({left}, {right}, {medium})",
+            f"ts_delta(ts_corr_v2({left}, {right}, {slow}), {fast})",
+            f"ts_corr_v2(ts_rank({left}, {fast}), ts_rank({right}, {fast}), {medium})",
+            f"ts_corr_v2({left}, delay({right}, {fast}), {medium})",
         ])
         return f"rank({tree})"
 
@@ -265,7 +267,7 @@ def _random_tree_expression_for_family(
             temporal(value),
             f"({value}/(ts_mean({value}, {slow})+1e-9))",
             f"(zscore({value})-zscore({other}))",
-            f"ts_corr({value}, delay({other}, {fast}), {medium})",
+            f"ts_corr_v2({value}, delay({other}, {fast}), {medium})",
         ])
         return f"rank({tree})"
 
@@ -294,10 +296,10 @@ def _random_tree_expression_for_family(
             temporal(left),
             f"({size}/({other}+1e-9))",
             f"({size}/(ts_mean({size}, {slow})+1e-9))",
-            f"ts_corr(log({size}), delay(log({other}), {fast}), {medium})",
+            f"ts_corr_v2(log({size}), delay(log({other}), {fast}), {medium})",
             f"({left}-{right})",
             f"({left}/(abs({right})+1e-9))",
-            f"ts_corr({left}, delay({right}, {fast}), {medium})",
+            f"ts_corr_v2({left}, delay({right}, {fast}), {medium})",
             f"(ts_mean({left}, {fast})-ts_mean({left}, {slow}))",
             f"ts_delta({left}, {medium})",
             f"ts_rank({left}, {slow})",
@@ -318,7 +320,7 @@ def _random_tree_expression_for_family(
         tree = generator.choice([
             temporal(normalized),
             f"(ts_mean({normalized}, {fast})-ts_mean({normalized}, {slow}))",
-            f"ts_corr({normalized}, {ret1}, {medium})",
+            f"ts_corr_v2({normalized}, {ret1}, {medium})",
             f"(ts_mean({normalized}, {medium})/(ts_std({normalized}, {slow})+1e-9))",
         ])
         return f"rank({tree})"
@@ -386,28 +388,28 @@ def random_expression_for_family(
                 lambda: f"rank(ts_std(amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
             ],
             "volume_price_interaction": [
-                lambda: f"rank(ts_corr({returns}, amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
-                lambda: f"rank(ts_corr(abs({returns}), vol/(ts_mean(vol, {slow})+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2({returns}, amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2(abs({returns}), vol/(ts_mean(vol, {slow})+1e-9), {medium}))",
                 lambda: f"rank(ts_mean(sign({returns})*amount/(ts_mean(amount, {slow})+1e-9), {medium}))",
                 lambda: f"rank(ts_mean({returns}*vol/(ts_mean(vol, {slow})+1e-9), {medium}))",
-                lambda: f"rank(ts_corr({fast_return}, log(amount), {medium}))",
-                lambda: f"rank(ts_corr((high-low)/(close+1e-9), vol, {medium}))",
+                lambda: f"rank(ts_corr_v2({fast_return}, log(amount), {medium}))",
+                lambda: f"rank(ts_corr_v2((high-low)/(close+1e-9), vol, {medium}))",
             ],
             "gap_intraday": [
                 lambda: f"rank(ts_mean((open-delay(close, 1))/{previous}, {medium}))",
                 lambda: f"rank(ts_mean((close-open)/(open+1e-9), {medium}))",
-                lambda: f"rank(ts_corr((open-delay(close, 1))/{previous}, (close-open)/(open+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2((open-delay(close, 1))/{previous}, (close-open)/(open+1e-9), {medium}))",
                 lambda: f"rank(ts_mean((open-delay(close, 1))/{previous}-(close-open)/(open+1e-9), {medium}))",
                 lambda: f"rank((open-delay(close, 1))/{previous})",
                 lambda: f"rank(ts_std((open-delay(close, 1))/{previous}, {medium}))",
             ],
             "price_relationship": [
-                lambda: f"rank(ts_corr(high/(close+1e-9), low/(close+1e-9), {medium}))",
-                lambda: f"rank(ts_corr(close/(open+1e-9), high/(low+1e-9), {medium}))",
-                lambda: f"rank(ts_corr({returns}, (high-low)/(close+1e-9), {medium}))",
-                lambda: f"rank(ts_corr(high/(low+1e-9), close/(delay(close, 1)+1e-9), {medium}))",
-                lambda: f"rank(ts_corr(high/(close+1e-9), close/(low+1e-9), {medium}))",
-                lambda: f"rank(ts_corr({returns}, delay({returns}, {fast}), {medium}))",
+                lambda: f"rank(ts_corr_v2(high/(close+1e-9), low/(close+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2(close/(open+1e-9), high/(low+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2({returns}, (high-low)/(close+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2(high/(low+1e-9), close/(delay(close, 1)+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2(high/(close+1e-9), close/(low+1e-9), {medium}))",
+                lambda: f"rank(ts_corr_v2({returns}, delay({returns}, {fast}), {medium}))",
             ],
         }
 
@@ -458,7 +460,7 @@ def random_expression_for_family(
             candidates["capital_flow"] = [
                 lambda: f"rank(ts_mean({flow}/(amount+1e-9), {medium}))",
                 lambda: f"rank(ts_sum({signed_flow}, {medium})/(ts_mean(amount, {medium})+1e-9))",
-                lambda: f"rank(ts_corr({flow}/(amount+1e-9), {returns}, {medium}))",
+                lambda: f"rank(ts_corr_v2({flow}/(amount+1e-9), {returns}, {medium}))",
                 lambda: f"rank(({flow}/(amount+1e-9))/"
                         f"(ts_mean({flow}/(amount+1e-9), {slow})+1e-9))",
                 lambda: f"rank(ts_delta({signed_flow}/(amount+1e-9), {medium}))",
@@ -471,7 +473,9 @@ def random_expression_for_family(
         # draws use the larger compositional grammar so long campaigns spend
         # their budget on distinct economic structures instead of repeatedly
         # revisiting the same canonical window grid.
+        extension = v2_candidates(family, fields, medium)
         expression = (
+            generator.choice(extension) if extension and generator.random() < .30 else
             _random_tree_expression_for_family(family, fields, generator)
             if generator.random() < 0.90
             else generator.choice(builders)()
@@ -491,9 +495,9 @@ def random_expression_for_family(
         "reversal": "-rank(ts_delta(close, 5)/(delay(close, 5)+1e-9))",
         "volatility": "-rank(ts_std(ts_delta(close, 1)/(delay(close, 1)+1e-9), 40))",
         "liquidity": "-rank(ts_mean(amount, 40))",
-        "volume_price_interaction": "rank(ts_corr(ts_delta(close, 1)/(delay(close, 1)+1e-9), amount, 40))",
+        "volume_price_interaction": "rank(ts_corr_v2(ts_delta(close, 1)/(delay(close, 1)+1e-9), amount, 40))",
         "gap_intraday": "rank(ts_mean((open-delay(close, 1))/(delay(close, 1)+1e-9), 40))",
-        "price_relationship": "rank(ts_corr(high/(close+1e-9), low/(close+1e-9), 40))",
+        "price_relationship": "rank(ts_corr_v2(high/(close+1e-9), low/(close+1e-9), 40))",
         "valuation": "-rank(pb)",
         "size": "-rank(total_mv)",
         "capital_flow": "rank(ts_mean(net_mf_amount/(amount+1e-9), 40))",
@@ -518,6 +522,12 @@ def mutate_expression(
     """轻量随机变异: 换窗口/翻方向/加 rank。"""
     generator = rng or random
     out = expr
+    if generator.random() < .25:
+        out = generator.choice([
+            f"ts_decay_linear(({expr}),5)", f"ts_ewm(({expr}),10)",
+            f"ts_robust_zscore(({expr}),20)",
+            f"where(gt(returns(close,20),0),({expr}),-({expr}))",
+        ])
     for old, new in [(str(a), str(b)) for a in _WINDOWS for b in _WINDOWS if a != b]:
         token = f", {old})"
         if token in out and generator.random() < 0.3:
@@ -525,7 +535,8 @@ def mutate_expression(
             break
     if out == expr:
         out = f"-({expr})" if not expr.startswith("-") else expr[1:].strip("()") or expr
-    return out if validate(out, fields or _FIELDS) is None else expr
+    out = upgrade_correlation(out)
+    return out if validate(out, fields or _FIELDS) is None else upgrade_correlation(expr)
 
 
 # ============================================================
@@ -544,7 +555,7 @@ def _build_system_prompt(
     """从模板组装 system prompt。约束块强制置顶 (外层不可稀释)。"""
     ops_doc = "\n".join(f"- {k}: {v}" for k, v in OPERATORS_DOC.items())
     anti = template.get("anti_overfit_instruction", "")
-    sys_tpl = template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"])
+    sys_tpl = upgrade_correlation(template.get("system_prompt", DEFAULT_MINER_TEMPLATE["system_prompt"]))
     fields = fields or _FIELDS
     strategy_part = sys_tpl.format(fields=", ".join(fields), ops=ops_doc, anti=anti)
     family_instruction = (
@@ -586,11 +597,17 @@ def _build_system_prompt(
         "禁止把绝对前复权价格尺度直接与原始成交额 amount 混合；"
         "价格变化必须先归一化为收益率或振幅比例。\n"
         f"{family_instruction}"
+        f"DSL版本: {DSL_REVISION}；新提案使用ts_corr_v2，不使用历史ts_corr。\n"
+        "条件统计、残差、稳健标准化、衰减、路径状态与分组算子可用于机制探索，禁止无理由堆叠。\n"
         f"可用算子 ({len(OPERATORS_DOC)}个):\n{ops_doc}\n"
         f"窗口: 1..250 整数\n"
         "权威目标: 改善 V4.2 连续学习分的最弱组件，同时不得削弱硬门槛；"
         "费后收益/下置信界、HAC 置信度、跨期稳定性、分位单调性、"
         "压力成本和可实施性不能由高 ICIR 抵消。\n"
+        "证据驱动改进：先区分数据/覆盖率不足、统计不确定、成本失效、收益来源重复；"
+        "每轮只修改一个轴，在 expected_effect 中预声明目标指标和改善方向。"
+        "重复失败的窗口变体不算新机制；优先提出可证伪条件门控或互补机制。"
+        "组合增量必须经同折联合重训及事件确认，禁止凭叙事宣称增量收益。\n"
         "输出格式: 只回复 JSON: "
         "{\"expression\":\"...\",\"hypothesis\":\"...\","
         "\"mechanism_family\":\"...\","
@@ -825,7 +842,8 @@ async def propose(
                 trace=trace,
             )
             data = llm.extract_json(text)
-            expr = str(data.get("expression", "")).strip()
+            original_expression = str(data.get("expression", "")).strip()
+            expr = upgrade_correlation(original_expression)
             err = validate(expr, fields or _FIELDS)
             if err:
                 raise llm.LLMError(f"表达式非法: {err} | {expr}")
@@ -884,7 +902,8 @@ async def propose(
                 raise llm.LLMError(
                     "已有评价反馈时 targeted_failures 不能为空"
                 )
-            semantic_normalizations = []
+            semantic_normalizations = (["new_proposal_ts_corr_upgraded_to_pearson_v2"]
+                if expr != original_expression else [])
             if not expected_effect:
                 # expected_effect is useful explanatory metadata, but it is not
                 # part of expression validity or the evaluator gate.  Some
@@ -901,6 +920,8 @@ async def propose(
                     "expected_effect_derived_from_targeted_failures"
                 )
             proposal_meta = {
+                "dsl_revision": DSL_REVISION,
+                "original_proposal_expression": original_expression,
                 "reflection": reflection,
                 "change_axis": change_axis,
                 "targeted_failures": targeted,
@@ -1196,7 +1217,8 @@ async def propose_batch(
             if item is None:
                 error = "LLM 未返回该 request_id"
                 item = {}
-            expr = str(item.get("expression") or "").strip()
+            original_expression = str(item.get("expression") or "").strip()
+            expr = upgrade_correlation(original_expression)
             hypothesis = str(item.get("hypothesis") or "").strip()[:500]
             reflection = str(item.get("reflection") or "").strip()[:800]
             declared = str(item.get("mechanism_family") or "").strip()
@@ -1255,6 +1277,10 @@ async def propose_batch(
             if not error and row["feedback_nodes"] and not targeted:
                 error = "已有反馈时 targeted_failures 不能为空"
             meta = {
+                "dsl_revision": DSL_REVISION,
+                "original_proposal_expression": original_expression,
+                "semantic_normalizations": (["new_proposal_ts_corr_upgraded_to_pearson_v2"]
+                    if expr != original_expression else []),
                 "request_id": request_id,
                 "reflection": reflection,
                 "targeted_failures": targeted,
